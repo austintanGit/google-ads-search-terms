@@ -1,0 +1,32 @@
+{
+  "name": "google-ads-search-terms",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"nodemon app.js\" \"cd frontend && npm run dev\" --names \"api,ui\" --prefix-colors \"cyan,magenta\"",
+    "start": "node app.js",
+    "build": "cd frontend && npm run build",
+    "build:frontend": "cd frontend && npm run build",
+    "dev:frontend": "cd frontend && npm run dev",
+    "postinstall": "cd frontend && npm ci && npm run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1003.0",
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "google-ads-api": "^23.0.0",
+    "googleapis": "^144.0.0",
+    "node-fetch": "^3.3.2",
+    "nodemon": "^3.1.9",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
