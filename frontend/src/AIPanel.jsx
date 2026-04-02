@@ -6,6 +6,12 @@ const MATCH_TYPE_OPTIONS = [
   { value: 'BROAD', label: 'Broad' },
 ]
 
+const DESTINATION_OPTIONS = [
+  { value: 'CAMPAIGN', label: 'Campaign level' },
+  { value: 'ADGROUP', label: 'Ad group level' },
+  { value: 'NEGATIVE_LIST', label: 'Negative keyword list' },
+]
+
 function formatLastScanned(date) {
   if (!date) return null
   return date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) +
@@ -23,6 +29,8 @@ export default function AIPanel({
   sharedSets,
   selectedSharedSetId,
   setSelectedSharedSetId,
+  campaigns,
+  adGroupsByCampaign,
   lastScannedAt,
   onRescan,
   onAddManualNegative,
@@ -34,9 +42,15 @@ export default function AIPanel({
   setSubmitError,
   submissionHistory,
 }) {
+  const [expandedRows, setExpandedRows] = useState(new Set())
   const [bulkMatchType, setBulkMatchType] = useState('EXACT')
+  const [bulkDestination, setBulkDestination] = useState('CAMPAIGN')
+  const [bulkCampaignId, setBulkCampaignId] = useState(null)
+  const [bulkCampaignName, setBulkCampaignName] = useState(null)
+  const [bulkAdGroupId, setBulkAdGroupId] = useState(null)
+  const [bulkAdGroupName, setBulkAdGroupName] = useState(null)
+  const [bulkSharedSetId, setBulkSharedSetId] = useState(null)
   const [manualKeyword, setManualKeyword] = useState('')
-  const [manualMatchType, setManualMatchType] = useState('EXACT')
   const [showSpecificPage, setShowSpecificPage] = useState(false)
   const [specificPageUrl, setSpecificPageUrl] = useState('')
   const [showManualAdd, setShowManualAdd] = useState(false)
@@ -64,9 +78,71 @@ export default function AIPanel({
     )
   }
 
-  function handleApplyBulkMatchType() {
+  function toggleRowExpand(keyword) {
+    setExpandedRows(prev => {
+      const next = new Set(prev)
+      next.has(keyword) ? next.delete(keyword) : next.add(keyword)
+      return next
+    })
+  }
+
+  function handleBulkDestinationChange(dest) {
+    setBulkDestination(dest)
+    setBulkCampaignId(null)
+    setBulkCampaignName(null)
+    setBulkAdGroupId(null)
+    setBulkAdGroupName(null)
+    setBulkSharedSetId(null)
+  }
+
+  function handleDestinationChange(keyword, destination) {
     setPendingNegatives(prev =>
-      prev.map(item => item.selected ? { ...item, matchType: bulkMatchType } : item)
+      prev.map(item => {
+        if (item.keyword !== keyword) return item
+        return { ...item, destination, campaignId: null, campaignName: null, adGroupId: null, adGroupName: null, sharedSetId: null }
+      })
+    )
+  }
+
+  function handleCampaignChange(keyword, campaignId, campaignName) {
+    setPendingNegatives(prev =>
+      prev.map(item =>
+        item.keyword === keyword
+          ? { ...item, campaignId, campaignName, adGroupId: null, adGroupName: null }
+          : item
+      )
+    )
+  }
+
+  function handleAdGroupChange(keyword, adGroupId, adGroupName) {
+    setPendingNegatives(prev =>
+      prev.map(item =>
+        item.keyword === keyword ? { ...item, adGroupId, adGroupName } : item
+      )
+    )
+  }
+
+  function handleKeywordSharedSetChange(keyword, sharedSetId) {
+    setPendingNegatives(prev =>
+      prev.map(item => item.keyword === keyword ? { ...item, sharedSetId } : item)
+    )
+  }
+
+  function handleApplyBulk() {
+    setPendingNegatives(prev =>
+      prev.map(item => {
+        if (!item.selected || item.alreadyInGoogle) return item
+        return {
+          ...item,
+          matchType: bulkMatchType,
+          destination: bulkDestination,
+          campaignId: bulkCampaignId,
+          campaignName: bulkCampaignName,
+          adGroupId: bulkAdGroupId,
+          adGroupName: bulkAdGroupName,
+          sharedSetId: bulkSharedSetId,
+        }
+      })
     )
   }
 
@@ -74,7 +150,7 @@ export default function AIPanel({
     e.preventDefault()
     const kw = manualKeyword.trim()
     if (!kw) return
-    onAddManualNegative(kw, manualMatchType)
+    onAddManualNegative(kw, 'EXACT')
     setManualKeyword('')
     setSubmitSuccess('')
   }
@@ -103,7 +179,6 @@ export default function AIPanel({
   function copyHistoryEntry(entry) {
     const keywords = Array.isArray(entry.keywords) ? entry.keywords : []
     const text = keywords.map(k => typeof k === 'string' ? k : k.keyword).join('\n')
-
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
     } else {
@@ -125,9 +200,9 @@ export default function AIPanel({
   function exportNegatives() {
     if (pendingNegatives.length === 0) return
     const rows = pendingNegatives.map(item =>
-      `"${item.keyword}","${item.matchType}","${item.source}"`
+      `"${item.keyword}","${item.matchType}","${item.source}","${item.destination || 'CAMPAIGN'}"`
     )
-    const csv = `"Keyword","Match Type","Source"\n${rows.join('\n')}`
+    const csv = `"Keyword","Match Type","Source","Destination"\n${rows.join('\n')}`
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -135,6 +210,113 @@ export default function AIPanel({
     a.download = 'negative-keywords.csv'
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // Text-only summary shown below keyword name
+  function renderDestinationResult(item) {
+    if (item.alreadyInGoogle) return null
+    const parts = []
+    if (item.campaignName) parts.push({ label: 'Campaign', value: item.campaignName })
+    if (item.adGroupName) parts.push({ label: 'Ad group', value: item.adGroupName })
+    const dest = item.destination || 'CAMPAIGN'
+    if (dest === 'NEGATIVE_LIST' && item.sharedSetId) {
+      const listName = sharedSets.find(s => s.id === item.sharedSetId)?.name
+      if (listName) parts.push({ label: 'List', value: listName })
+    }
+    if (parts.length === 0) return null
+    return (
+      <div className="kw-dest-result">
+        {parts.map((p, i) => (
+          <span key={i} className="kw-dest-result-item">
+            {i > 0 && <span className="kw-dest-result-sep">›</span>}
+            <span className="kw-dest-result-label">{p.label}:</span>
+            <span className="kw-dest-result-val">{p.value}</span>
+          </span>
+        ))}
+      </div>
+    )
+  }
+
+  // Interactive cascade pickers rendered inside the Destination column cell
+  function renderDestinationCell(item) {
+    if (item.alreadyInGoogle) return null
+    const dest = item.destination || 'CAMPAIGN'
+    const isExpanded = expandedRows.has(item.keyword)
+    const adGroups = (adGroupsByCampaign || {})[item.campaignId] || []
+    return (
+      <div className="dest-cell">
+        {/* Destination type + expand toggle on one row */}
+        <div className="dest-type-row">
+          <select
+            className="matchtype-select dest-type-select"
+            value={dest}
+            onChange={e => handleDestinationChange(item.keyword, e.target.value)}
+          >
+            {DESTINATION_OPTIONS.map(opt => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+          <button
+            className="dest-expand-btn"
+            onClick={() => toggleRowExpand(item.keyword)}
+            title={isExpanded ? 'Collapse' : 'Configure destination'}
+          >
+            <i className={`fas fa-chevron-${isExpanded ? 'up' : 'down'}`} />
+          </button>
+        </div>
+
+        {/* Cascade pickers — only shown when expanded */}
+        {isExpanded && (
+          <>
+            <div className="dest-cascade-row">
+              <span className="dest-cascade-label">Campaign</span>
+              <select
+                className="dest-cascade-select"
+                value={item.campaignId || ''}
+                onChange={e => {
+                  const c = campaigns.find(c => c.id === e.target.value)
+                  handleCampaignChange(item.keyword, c?.id || null, c?.name || null)
+                }}
+              >
+                <option value="">Select…</option>
+                {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </div>
+
+            {(dest === 'ADGROUP' || dest === 'NEGATIVE_LIST') && item.campaignId && (
+              <div className="dest-cascade-row">
+                <span className="dest-cascade-label">Ad group</span>
+                <select
+                  className="dest-cascade-select"
+                  value={item.adGroupId || ''}
+                  onChange={e => {
+                    const ag = adGroups.find(ag => ag.id === e.target.value)
+                    handleAdGroupChange(item.keyword, ag?.id || null, ag?.name || null)
+                  }}
+                >
+                  <option value="">Select…</option>
+                  {adGroups.map(ag => <option key={ag.id} value={ag.id}>{ag.name}</option>)}
+                </select>
+              </div>
+            )}
+
+            {dest === 'NEGATIVE_LIST' && item.adGroupId && (
+              <div className="dest-cascade-row">
+                <span className="dest-cascade-label">List</span>
+                <select
+                  className="dest-cascade-select"
+                  value={item.sharedSetId || ''}
+                  onChange={e => handleKeywordSharedSetChange(item.keyword, e.target.value)}
+                >
+                  <option value="">Select…</option>
+                  {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -254,106 +436,99 @@ export default function AIPanel({
 
       {/* Pending negative keywords section */}
       <div className="pending-section mb-3">
-          <div className="pending-header">
-            <div className="pending-header-left">
-              <span className="pending-title">Pending negative keywords</span>
-              <span className="source-badge source-ai">AI-recommended</span>
-              <span className="source-badge source-manual">Manual</span>
-            </div>
-            <button className="btn btn-sm btn-outline-secondary" onClick={exportNegatives}>
-              <i className="fas fa-download me-1" />Export negatives
-            </button>
+
+        {/* Section header */}
+        <div className="pending-header">
+          <div className="pending-header-left">
+            <span className="pending-title">Pending negative keywords</span>
+            <span className="source-badge source-ai">AI-recommended</span>
+            <span className="source-badge source-manual">Manual</span>
           </div>
-          <div className="pending-table-container">
-            <a className="scroll-down-link" href="#search-terms-section">
-              Scroll down to "Review your search terms" to see the full search terms report and manually add others that our AI software didn't detect.
-              <i className="fas fa-chevron-down" />
-            </a>
-          </div>
-          <div className="pending-table-wrap">
-            <table className="pending-table">
-              <thead>
-                <tr>
-                  <th className="col-check">
-                    <input
-                      type="checkbox"
-                      checked={
-                        pendingNegatives.some(i => !i.alreadyInGoogle) &&
-                        pendingNegatives.filter(i => !i.alreadyInGoogle).every(i => i.selected)
-                      }
-                      onChange={e => handleToggleAll(e.target.checked)}
-                    />
-                  </th>
-                  <th className="col-keyword">KEYWORD</th>
-                  <th className="col-matchtype">MATCH TYPE</th>
-                  <th className="col-action" />
-                </tr>
-              </thead>
-              <tbody>
-                {pendingNegatives.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="pending-empty">
-                      No pending keywords — scan your website or select text in the table below to add negatives
-                    </td>
-                  </tr>
-                )}
-                {pendingNegatives.map(item => (
-                  <tr
-                    key={item.keyword}
-                    className={
-                      item.alreadyInGoogle ? 'row-in-google' :
-                      item.selected ? '' : 'row-unchecked'
-                    }
-                  >
-                    <td className="col-check">
-                      <input
-                        type="checkbox"
-                        checked={item.selected}
-                        disabled={item.alreadyInGoogle}
-                        onChange={() => handleToggleItem(item.keyword)}
-                      />
-                    </td>
-                    <td className="col-keyword">
-                      <span className="kw-text">{item.keyword}</span>
-                      {item.alreadyInGoogle
-                        ? <span className="source-badge source-in-google">In Google</span>
-                        : item.source === 'ai'
-                          ? <span className="source-badge source-ai">AI</span>
-                          : <span className="source-badge source-manual">Manual</span>
-                      }
-                    </td>
-                    <td className="col-matchtype">
-                      <select
-                        className="matchtype-select"
-                        value={item.matchType}
-                        disabled={item.alreadyInGoogle}
-                        onChange={e => handleMatchTypeChange(item.keyword, e.target.value)}
-                      >
-                        {MATCH_TYPE_OPTIONS.map(opt => (
-                          <option key={opt.value} value={opt.value}>{opt.label}</option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="col-action">
-                      {!item.alreadyInGoogle && (
-                        <button
-                          className="btn-remove-kw"
-                          onClick={() => onRemoveNegative(item.keyword)}
-                          title="Remove"
-                        >
-                          ×
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <button className="btn btn-sm btn-outline-secondary" onClick={exportNegatives}>
+            <i className="fas fa-download me-1" />Export negatives
+          </button>
+        </div>
+
+        {/* Scroll hint */}
+        <div className="pending-table-container">
+          <a className="scroll-down-link" href="#search-terms-section">
+            Scroll down to "Review your search terms" to see the full search terms report and manually add others that our AI software didn't detect.
+            <i className="fas fa-chevron-down" />
+          </a>
+        </div>
+
+        {/* Bulk apply row — progressive cascade: Destination → Campaign → Ad Group → List | Match Type | Apply */}
+        <div className="pending-bulk-top">
+          <div className="bulk-col">
+            <label className="bulk-col-label">DESTINATION</label>
+            <select
+              className="matchtype-select"
+              value={bulkDestination}
+              onChange={e => handleBulkDestinationChange(e.target.value)}
+            >
+              {DESTINATION_OPTIONS.map(opt => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
           </div>
 
-          {/* Bulk match type apply */}
-          <div className="pending-bulk-row">
-            <span className="text-muted small">Apply match type to selected:</span>
+          <div className="bulk-col">
+            <label className="bulk-col-label">CAMPAIGN</label>
+            <select
+              className="matchtype-select"
+              value={bulkCampaignId || ''}
+              onChange={e => {
+                const c = campaigns.find(c => c.id === e.target.value)
+                setBulkCampaignId(c?.id || null)
+                setBulkCampaignName(c?.name || null)
+                setBulkAdGroupId(null)
+                setBulkAdGroupName(null)
+                setBulkSharedSetId(null)
+              }}
+            >
+              <option value="">Select campaign…</option>
+              {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+
+          {(bulkDestination === 'ADGROUP' || bulkDestination === 'NEGATIVE_LIST') && bulkCampaignId && (
+            <div className="bulk-col">
+              <label className="bulk-col-label">AD GROUP</label>
+              <select
+                className="matchtype-select"
+                value={bulkAdGroupId || ''}
+                onChange={e => {
+                  const ags = (adGroupsByCampaign || {})[bulkCampaignId] || []
+                  const ag = ags.find(ag => ag.id === e.target.value)
+                  setBulkAdGroupId(ag?.id || null)
+                  setBulkAdGroupName(ag?.name || null)
+                  setBulkSharedSetId(null)
+                }}
+              >
+                <option value="">Select ad group…</option>
+                {((adGroupsByCampaign || {})[bulkCampaignId] || []).map(ag => (
+                  <option key={ag.id} value={ag.id}>{ag.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {bulkDestination === 'NEGATIVE_LIST' && bulkAdGroupId && (
+            <div className="bulk-col">
+              <label className="bulk-col-label">LIST</label>
+              <select
+                className="matchtype-select"
+                value={bulkSharedSetId || ''}
+                onChange={e => setBulkSharedSetId(e.target.value || null)}
+              >
+                <option value="">Select list…</option>
+                {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+          )}
+
+          <div className="bulk-col">
+            <label className="bulk-col-label">MATCH TYPE</label>
             <select
               className="matchtype-select"
               value={bulkMatchType}
@@ -363,141 +538,209 @@ export default function AIPanel({
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>
+          </div>
+
+          <div className="bulk-col bulk-col-btn">
             <button
-              className="btn btn-sm btn-outline-secondary"
-              onClick={handleApplyBulkMatchType}
+              className="btn btn-sm btn-primary"
+              onClick={handleApplyBulk}
               disabled={selectedCount === 0}
             >
-              Apply all
+              Apply to selected
             </button>
           </div>
+        </div>
 
-          {/* Manual add toggle */}
-          <div className="pending-manual-toggle-row">
-            <button
-              className="btn-manual-toggle"
-              onClick={() => setShowManualAdd(v => !v)}
-            >
-              <i className={`fas fa-chevron-${showManualAdd ? 'down' : 'right'} me-1`} />
-              Add keyword manually
-            </button>
-          </div>
+        {/* Keywords table */}
+        <div className="pending-table-wrap">
+          <table className="pending-table">
+            <thead>
+              <tr>
+                <th className="col-check">
+                  <input
+                    type="checkbox"
+                    checked={
+                      pendingNegatives.some(i => !i.alreadyInGoogle) &&
+                      pendingNegatives.filter(i => !i.alreadyInGoogle).every(i => i.selected)
+                    }
+                    onChange={e => handleToggleAll(e.target.checked)}
+                  />
+                </th>
+                <th className="col-keyword">KEYWORD</th>
+                <th className="col-matchtype">MATCH TYPE</th>
+                <th className="col-destination">DESTINATION</th>
+                <th className="col-action" />
+              </tr>
+            </thead>
+            <tbody>
+              {pendingNegatives.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="pending-empty">
+                    No pending keywords — scan your website or select text in the table below to add negatives
+                  </td>
+                </tr>
+              )}
+              {pendingNegatives.map(item => (
+                <tr
+                  key={item.keyword}
+                  className={
+                    item.alreadyInGoogle ? 'row-in-google' :
+                    item.selected ? '' : 'row-unchecked'
+                  }
+                >
+                  <td className="col-check">
+                    <input
+                      type="checkbox"
+                      checked={item.selected}
+                      disabled={item.alreadyInGoogle}
+                      onChange={() => handleToggleItem(item.keyword)}
+                    />
+                  </td>
+                  <td className="col-keyword">
+                    <div className="kw-main-row">
+                      <span className="kw-text">{item.keyword}</span>
+                      {item.alreadyInGoogle
+                        ? <span className="source-badge source-in-google">In Google</span>
+                        : item.source === 'ai'
+                          ? <span className="source-badge source-ai">AI</span>
+                          : <span className="source-badge source-manual">Manual</span>
+                      }
+                    </div>
+                    {renderDestinationResult(item)}
+                  </td>
+                  <td className="col-matchtype">
+                    <select
+                      className="matchtype-select"
+                      value={item.matchType}
+                      disabled={item.alreadyInGoogle}
+                      onChange={e => handleMatchTypeChange(item.keyword, e.target.value)}
+                    >
+                      {MATCH_TYPE_OPTIONS.map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="col-destination">
+                    {renderDestinationCell(item)}
+                  </td>
+                  <td className="col-action">
+                    {!item.alreadyInGoogle && (
+                      <button
+                        className="btn-remove-kw"
+                        onClick={() => onRemoveNegative(item.keyword)}
+                        title="Remove"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
 
-          {showManualAdd && (
-            <div className="pending-manual-row">
-              <div className="manual-label-col">
-                <label className="manual-label">KEYWORD</label>
-                <input
-                  type="text"
-                  className="form-control form-control-sm"
-                  placeholder="e.g. marketing jobs"
-                  value={manualKeyword}
-                  onChange={e => setManualKeyword(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleAddManual(e)}
-                />
-              </div>
-              <div className="manual-type-col">
-                <label className="manual-label">MATCH TYPE</label>
-                <select
-                  className="form-select form-select-sm"
-                  value={manualMatchType}
-                  onChange={e => setManualMatchType(e.target.value)}
-                >
-                  {MATCH_TYPE_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="manual-add-col">
-                <label className="manual-label">&nbsp;</label>
-                <button
-                  className="btn btn-sm btn-outline-primary"
-                  onClick={handleAddManual}
-                  disabled={!manualKeyword.trim()}
-                >
-                  + Add
-                </button>
-              </div>
+        {/* Manual add toggle */}
+        <div className="pending-manual-toggle-row">
+          <button
+            className="btn-manual-toggle"
+            onClick={() => setShowManualAdd(v => !v)}
+          >
+            <i className={`fas fa-chevron-${showManualAdd ? 'down' : 'right'} me-1`} />
+            Add keyword manually
+          </button>
+        </div>
+
+        {showManualAdd && (
+          <div className="pending-manual-row">
+            <div className="manual-label-col">
+              <label className="manual-label">KEYWORD</label>
+              <input
+                type="text"
+                className="form-control form-control-sm"
+                placeholder="e.g. marketing jobs"
+                value={manualKeyword}
+                onChange={e => setManualKeyword(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleAddManual(e)}
+              />
             </div>
-          )}
-
-          {/* Keyword list selector + submit */}
-          <div className="pending-submit-row">
-            <div className="keyword-list-group">
-              <label className="manual-label">KEYWORD LIST</label>
-              <div className="keyword-list-controls">
-                <select
-                  className="form-select form-select-sm"
-                  value={selectedSharedSetId}
-                  onChange={e => setSelectedSharedSetId(e.target.value)}
-                >
-                  {sharedSets.length === 0 && (
-                    <option value="">No lists available</option>
-                  )}
-                  {sharedSets.map(s => (
-                    <option key={s.id} value={s.id}>{s.name}</option>
-                  ))}
-                </select>
-                <button
-                  className="btn btn-primary btn-submit-kw"
-                  disabled={selectedCount === 0 || !selectedSharedSetId}
-                  onClick={onSubmitNegatives}
-                >
-                  Submit {selectedCount > 0 ? `${selectedCount} ` : ''}keywords to Google Ads →
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Submission history — inside the pending panel */}
-          {submissionHistory && submissionHistory.length > 0 && (
-            <div className="submission-history-wrap">
+            <div className="manual-add-col">
+              <label className="manual-label">&nbsp;</label>
               <button
-                className="submission-history-toggle"
-                onClick={() => setShowHistory(v => !v)}
+                className="btn btn-sm btn-outline-primary"
+                onClick={handleAddManual}
+                disabled={!manualKeyword.trim()}
               >
-                <i className="fas fa-history me-1" />
-                View submission history
-                <i className={`fas fa-chevron-${showHistory ? 'up' : 'down'} ms-1`} />
+                + Add
               </button>
+            </div>
+          </div>
+        )}
 
-              {showHistory && (
-                <div className="submission-history-panel">
-                  <div className="submission-history-heading">SUBMISSION HISTORY</div>
-                  {submissionHistory.map(entry => (
-                    <div key={entry.id} className="submission-history-row">
-                      <div className="submission-history-info">
-                        <div className="submission-history-date">{formatHistoryDate(entry.submitted_at)}</div>
-                        <div className="submission-history-meta">
-                          {entry.keyword_count} {entry.keyword_count === 1 ? 'keyword' : 'keywords'}
-                          {entry.list_name ? ` · ${entry.list_name}` : ''}
-                          {entry.match_types ? ` · ${entry.match_types}` : ''}
-                        </div>
-                      </div>
-                      <div className="submission-history-actions">
-                        <button
-                          className="btn btn-sm btn-outline-secondary"
-                          onClick={() => downloadHistoryEntry(entry)}
-                          title="Download as CSV"
-                        >
-                          <i className="fas fa-download me-1" />Download
-                        </button>
-                        <button
-                          className="btn btn-sm btn-outline-secondary"
-                          onClick={() => copyHistoryEntry(entry)}
-                          title="Copy keywords to clipboard"
-                        >
-                          <i className="fas fa-copy me-1" />Copy
-                        </button>
+        {/* Submit row */}
+        <div className="pending-submit-row">
+          <div className="keyword-list-group">
+            <div className="keyword-list-controls">
+              <button
+                className="btn btn-primary btn-submit-kw"
+                disabled={selectedCount === 0}
+                onClick={onSubmitNegatives}
+              >
+                Submit {selectedCount > 0 ? `${selectedCount} ` : ''}keywords to Google Ads →
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Submission history */}
+        {submissionHistory && submissionHistory.length > 0 && (
+          <div className="submission-history-wrap">
+            <button
+              className="submission-history-toggle"
+              onClick={() => setShowHistory(v => !v)}
+            >
+              <i className="fas fa-history me-1" />
+              View submission history
+              <i className={`fas fa-chevron-${showHistory ? 'up' : 'down'} ms-1`} />
+            </button>
+
+            {showHistory && (
+              <div className="submission-history-panel">
+                <div className="submission-history-heading">SUBMISSION HISTORY</div>
+                {submissionHistory.map(entry => (
+                  <div key={entry.id} className="submission-history-row">
+                    <div className="submission-history-info">
+                      <div className="submission-history-date">{formatHistoryDate(entry.submitted_at)}</div>
+                      <div className="submission-history-meta">
+                        {entry.keyword_count} {entry.keyword_count === 1 ? 'keyword' : 'keywords'}
+                        {entry.list_name ? ` · ${entry.list_name}` : ''}
+                        {entry.match_types ? ` · ${entry.match_types}` : ''}
                       </div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+                    <div className="submission-history-actions">
+                      <button
+                        className="btn btn-sm btn-outline-secondary"
+                        onClick={() => downloadHistoryEntry(entry)}
+                        title="Download as CSV"
+                      >
+                        <i className="fas fa-download me-1" />Download
+                      </button>
+                      <button
+                        className="btn btn-sm btn-outline-secondary"
+                        onClick={() => copyHistoryEntry(entry)}
+                        title="Copy keywords to clipboard"
+                      >
+                        <i className="fas fa-copy me-1" />Copy
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
-        </div>
+      </div>
     </>
   )
 }

@@ -164,9 +164,10 @@ app.get('/api/search-terms', async (req, res) => {
                 metrics.conversions,
                 metrics.ctr,
                 metrics.average_cpc,
+                campaign.id,
                 campaign.name,
-                ad_group.name,
-                ad_group.id
+                ad_group.id,
+                ad_group.name
             FROM search_term_view
             WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
             ORDER BY metrics.clicks DESC
@@ -178,7 +179,9 @@ app.get('/api/search-terms', async (req, res) => {
         // Transform the data
         const transformedData = searchTermResponse.map(row => ({
             searchTerm: row.search_term_view.search_term,
+            campaignId: String(row.campaign.id),
             campaign: row.campaign.name,
+            adGroupId: String(row.ad_group.id),
             adGroup: row.ad_group.name,
             clicks: row.metrics.clicks,
             impressions: row.metrics.impressions,
@@ -764,6 +767,124 @@ app.get('/api/submission-history', async (req, res) => {
     } catch (err) {
         console.error('Error fetching submission history:', err);
         res.status(500).json({ error: 'Failed to fetch submission history', details: err.message });
+    }
+});
+
+// ── Campaigns ─────────────────────────────────────────────────────────────────
+app.get('/api/campaigns', async (req, res) => {
+    const { clientId } = req.query;
+    if (!clientId) return res.status(400).json({ error: 'Client ID required' });
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+        const rows = await customer.query(`
+            SELECT campaign.id, campaign.name, campaign.resource_name, campaign.status
+            FROM campaign
+            WHERE campaign.status != REMOVED
+            ORDER BY campaign.name
+        `);
+        res.json(rows.map(row => ({
+            id: String(row.campaign.id),
+            name: row.campaign.name,
+            resourceName: row.campaign.resource_name,
+            status: row.campaign.status,
+        })));
+    } catch (err) {
+        console.error('Error fetching campaigns:', err.message);
+        res.status(500).json({ error: 'Failed to fetch campaigns', details: err.message });
+    }
+});
+
+// ── Ad Groups ─────────────────────────────────────────────────────────────────
+app.get('/api/adgroups', async (req, res) => {
+    const { clientId, campaignId } = req.query;
+    if (!clientId) return res.status(400).json({ error: 'Client ID required' });
+    if (!campaignId) return res.status(400).json({ error: 'Campaign ID required' });
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+        const rows = await customer.query(`
+            SELECT ad_group.id, ad_group.name, ad_group.resource_name, ad_group.status
+            FROM ad_group
+            WHERE campaign.id = '${campaignId}'
+            AND ad_group.status != REMOVED
+            ORDER BY ad_group.name
+        `);
+        res.json(rows.map(row => ({
+            id: String(row.ad_group.id),
+            name: row.ad_group.name,
+            resourceName: row.ad_group.resource_name,
+            status: row.ad_group.status,
+        })));
+    } catch (err) {
+        console.error('Error fetching ad groups:', err.message);
+        res.status(500).json({ error: 'Failed to fetch ad groups', details: err.message });
+    }
+});
+
+// ── Campaign-level negative keywords ──────────────────────────────────────────
+app.post('/api/add-campaign-negative', async (req, res) => {
+    const { negativeKeywords, campaignId, clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID required' });
+    if (!campaignId) return res.status(400).json({ error: 'Campaign ID required' });
+    if (!negativeKeywords || !negativeKeywords.length) return res.status(400).json({ error: 'No keywords provided' });
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+        const criteria = negativeKeywords.map(item => ({
+            campaign: `customers/${clientId}/campaigns/${campaignId}`,
+            negative: true,
+            keyword: {
+                text: typeof item === 'string' ? item : item.keyword,
+                match_type: typeof item === 'string' ? 'EXACT' : (item.matchType || 'EXACT'),
+            },
+        }));
+        const response = await customer.campaignCriteria.create(criteria);
+        console.log(`Campaign-level negatives submitted: ${negativeKeywords.length} keywords to campaign ${campaignId}`);
+        res.json({ success: true, response });
+    } catch (err) {
+        console.error('Error adding campaign-level negatives:', err.message);
+        const details = err.errors?.[0]?.message || err.message || 'Unknown error';
+        res.status(500).json({ error: 'Failed to add campaign-level negative keywords', details });
+    }
+});
+
+// ── Ad group-level negative keywords ──────────────────────────────────────────
+app.post('/api/add-adgroup-negative', async (req, res) => {
+    const { negativeKeywords, adGroupId, clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID required' });
+    if (!adGroupId) return res.status(400).json({ error: 'Ad group ID required' });
+    if (!negativeKeywords || !negativeKeywords.length) return res.status(400).json({ error: 'No keywords provided' });
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+        const criteria = negativeKeywords.map(item => ({
+            ad_group: `customers/${clientId}/adGroups/${adGroupId}`,
+            negative: true,
+            keyword: {
+                text: typeof item === 'string' ? item : item.keyword,
+                match_type: typeof item === 'string' ? 'EXACT' : (item.matchType || 'EXACT'),
+            },
+        }));
+        const response = await customer.adGroupCriteria.create(criteria);
+        console.log(`Ad group-level negatives submitted: ${negativeKeywords.length} keywords to ad group ${adGroupId}`);
+        res.json({ success: true, response });
+    } catch (err) {
+        console.error('Error adding ad group-level negatives:', err.message);
+        const details = err.errors?.[0]?.message || err.message || 'Unknown error';
+        res.status(500).json({ error: 'Failed to add ad group-level negative keywords', details });
     }
 });
 

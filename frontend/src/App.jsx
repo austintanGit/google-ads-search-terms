@@ -51,6 +51,8 @@ function NegativeKeywordsPage({
   sharedSets,
   selectedSharedSetId,
   setSelectedSharedSetId,
+  campaigns,
+  adGroupsByCampaign,
   lastScannedAt,
   onRescan,
   onAddManualNegative,
@@ -154,6 +156,8 @@ function NegativeKeywordsPage({
           sharedSets={sharedSets}
           selectedSharedSetId={selectedSharedSetId}
           setSelectedSharedSetId={setSelectedSharedSetId}
+          campaigns={campaigns}
+          adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={onRescan}
           onAddManualNegative={onAddManualNegative}
@@ -238,6 +242,36 @@ export default function App() {
   const [submitSuccess, setSubmitSuccess] = useState('')
   const [submitError, setSubmitError] = useState('')
 
+  // Campaigns derived from the already-client-scoped search terms data (guaranteed client-specific)
+  const campaigns = useMemo(() => {
+    const map = new Map()
+    searchTerms.forEach(t => {
+      if (t.campaignId && !map.has(t.campaignId)) {
+        map.set(t.campaignId, { id: t.campaignId, name: t.campaign })
+      }
+    })
+    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name))
+  }, [searchTerms])
+
+  // Ad groups per campaign, derived from the same search terms data
+  const adGroupsByCampaign = useMemo(() => {
+    const map = {}
+    searchTerms.forEach(t => {
+      if (!t.campaignId || !t.adGroupId) return
+      if (!map[t.campaignId]) map[t.campaignId] = new Map()
+      if (!map[t.campaignId].has(t.adGroupId)) {
+        map[t.campaignId].set(t.adGroupId, { id: t.adGroupId, name: t.adGroup })
+      }
+    })
+    // Convert inner Maps to sorted arrays
+    return Object.fromEntries(
+      Object.entries(map).map(([cid, agMap]) => [
+        cid,
+        [...agMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
+      ])
+    )
+  }, [searchTerms])
+
   // rowNegatives: Map<searchTerm, Set<prefixed-phrase>>
   const rowNegatives = useMemo(() => {
     const map = new Map()
@@ -312,7 +346,7 @@ export default function App() {
         const googleNegLower = new Set((googleNegs || existingNegatives).map(k => k.toLowerCase()))
         const pendingFromDb = dbNegs
           .filter(kw => !googleNegLower.has(kw.toLowerCase()))
-          .map(kw => ({ keyword: kw, matchType: 'EXACT', source: 'manual', selected: true }))
+          .map(kw => ({ keyword: kw, matchType: 'EXACT', source: 'manual', selected: true, destination: 'CAMPAIGN', sharedSetId: null }))
         setPendingNegatives(pendingFromDb)
       }
       return terms
@@ -392,7 +426,7 @@ export default function App() {
                 .filter(kw => !existingKws.has(kw.toLowerCase()))
                 .map(kw => {
                   const inGoogle = googleNegLower.has(kw.toLowerCase())
-                  return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle }
+                  return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
                 })
               return [...prev, ...newItems]
             })
@@ -459,7 +493,7 @@ export default function App() {
 
     setPendingNegatives(prev => {
       if (prev.some(item => item.keyword.toLowerCase() === kwLower)) return prev
-      return [...prev, { keyword, matchType, source: 'manual', selected: true }]
+      return [...prev, { keyword, matchType, source: 'manual', selected: true, destination: 'CAMPAIGN', sharedSetId: null }]
     })
     setAiStats(prev => prev || {})
     setSubmitSuccess('')
@@ -488,7 +522,7 @@ export default function App() {
         .filter(kw => !existingKws.has(kw.toLowerCase()))
         .map(kw => {
           const inGoogle = googleNegLower.has(kw.toLowerCase())
-          return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle }
+          return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
         })
       return [...prev, ...newItems]
     })
@@ -528,65 +562,157 @@ export default function App() {
     if (!currentClientId) { setSubmitError('Please select a client first.'); return }
     const toSubmit = pendingNegatives.filter(item => item.selected && !item.alreadyInGoogle)
     if (toSubmit.length === 0) { setSubmitError('No negative keywords selected.'); return }
-    if (!selectedSharedSetId) { setSubmitError('Please select a keyword list.'); return }
+
+    // Partition by destination
+    const listKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'NEGATIVE_LIST')
+    const campaignKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'CAMPAIGN')
+    const adGroupKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'ADGROUP')
+
+    // Validate selections
+    const missingCampaign = campaignKeywords.filter(item => !item.campaignId)
+    const missingAdGroup = adGroupKeywords.filter(item => !item.adGroupId)
+    const missingList = listKeywords.filter(item => !item.sharedSetId)
+
+    if (missingCampaign.length > 0) {
+      setSubmitError(`${missingCampaign.length} keyword(s) with "Campaign level" destination need a campaign selected.`)
+      return
+    }
+    if (missingAdGroup.length > 0) {
+      setSubmitError(`${missingAdGroup.length} keyword(s) with "Ad group level" destination need a campaign and ad group selected.`)
+      return
+    }
+    if (missingList.length > 0) {
+      setSubmitError(`${missingList.length} keyword(s) with "Negative keyword list" destination need a list selected.`)
+      return
+    }
 
     setSubmitError('')
     setSubmitSuccess('')
 
+    const submittedKeywords = []
+    const summaryParts = []
+
     try {
-      const selectedSet = sharedSets.find(s => s.id === selectedSharedSetId)
-      const r = await fetch('/api/add-to-exclusion-list', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          negativeKeywords: toSubmit.map(item => ({ keyword: item.keyword, matchType: item.matchType })),
-          sharedSetId: selectedSharedSetId,
-          sharedSetResourceName: selectedSet?.resourceName,
-          clientId: currentClientId,
-        }),
-      })
-      const d = await r.json()
-      if (!r.ok) {
-        throw new Error(d.details || d.error || 'Failed to submit to Google Ads')
-      }
-      const listName = sharedSets.find(s => s.id === selectedSharedSetId)?.name || selectedSharedSetId
-
-      // Summarise match types for history label
-      const uniqueTypes = [...new Set(toSubmit.map(item => item.matchType))]
-      const matchTypeLabel = uniqueTypes.length === 1
-        ? ({ EXACT: 'Exact match', PHRASE: 'Phrase match', BROAD: 'Broad match' }[uniqueTypes[0]] || uniqueTypes[0])
-        : 'Mixed match types'
-
-      const submittedKeywords = toSubmit.map(item => item.keyword)
-      setExistingNegatives(prev => [...prev, ...submittedKeywords])
-      setSubmitSuccess(`Keywords submitted with individual match types to "${listName}"`)
-      setPendingNegatives([])
-
-      // Save to submission history
-      const historyRecord = {
-        clientId: currentClientId,
-        keywords: toSubmit.map(item => ({ keyword: item.keyword, matchType: item.matchType })),
-        listName,
-        matchTypes: matchTypeLabel,
-      }
-      fetch('/api/submission-history', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(historyRecord),
-      })
-        .then(r => r.json())
-        .then(() => {
-          // Prepend optimistically to local history
-          setSubmissionHistory(prev => [{
-            id: Date.now(),
-            submitted_at: new Date().toISOString(),
-            keyword_count: toSubmit.length,
-            list_name: listName,
-            match_types: matchTypeLabel,
-            keywords: toSubmit.map(item => ({ keyword: item.keyword, matchType: item.matchType })),
-          }, ...prev])
+      // ── 1. Negative keyword list submissions (grouped by sharedSetId) ──────
+      if (listKeywords.length > 0) {
+        const byList = {}
+        listKeywords.forEach(item => {
+          if (!byList[item.sharedSetId]) byList[item.sharedSetId] = []
+          byList[item.sharedSetId].push(item)
         })
-        .catch(console.error)
+        const listResults = await Promise.all(
+          Object.entries(byList).map(async ([sid, items]) => {
+            const selectedSet = sharedSets.find(s => s.id === sid)
+            const r = await fetch('/api/add-to-exclusion-list', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+                sharedSetId: sid,
+                sharedSetResourceName: selectedSet?.resourceName,
+                clientId: currentClientId,
+              }),
+            })
+            const d = await r.json()
+            if (!r.ok) throw new Error(d.details || d.error || 'Failed to submit to keyword list')
+            return selectedSet?.name || sid
+          })
+        )
+        listKeywords.forEach(item => submittedKeywords.push(item.keyword))
+        const listNames = [...new Set(listResults)]
+        summaryParts.push(`${listKeywords.length} to list${listNames.length > 1 ? 's' : ''}: ${listNames.join(', ')}`)
+      }
+
+      // ── 2. Campaign-level submissions (grouped by campaignId) ─────────────
+      if (campaignKeywords.length > 0) {
+        const byCampaign = {}
+        campaignKeywords.forEach(item => {
+          if (!byCampaign[item.campaignId]) byCampaign[item.campaignId] = []
+          byCampaign[item.campaignId].push(item)
+        })
+        await Promise.all(
+          Object.entries(byCampaign).map(async ([campaignId, items]) => {
+            const r = await fetch('/api/add-campaign-negative', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+                campaignId,
+                clientId: currentClientId,
+              }),
+            })
+            const d = await r.json()
+            if (!r.ok) throw new Error(d.details || d.error || 'Failed to submit campaign-level negatives')
+          })
+        )
+        campaignKeywords.forEach(item => submittedKeywords.push(item.keyword))
+        const campaignNames = [...new Set(campaignKeywords.map(i => i.campaignName || i.campaignId))]
+        summaryParts.push(`${campaignKeywords.length} at campaign level (${campaignNames.join(', ')})`)
+      }
+
+      // ── 3. Ad group-level submissions (grouped by adGroupId) ─────────────
+      if (adGroupKeywords.length > 0) {
+        const byAdGroup = {}
+        adGroupKeywords.forEach(item => {
+          if (!byAdGroup[item.adGroupId]) byAdGroup[item.adGroupId] = []
+          byAdGroup[item.adGroupId].push(item)
+        })
+        await Promise.all(
+          Object.entries(byAdGroup).map(async ([adGroupId, items]) => {
+            const r = await fetch('/api/add-adgroup-negative', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+                adGroupId,
+                clientId: currentClientId,
+              }),
+            })
+            const d = await r.json()
+            if (!r.ok) throw new Error(d.details || d.error || 'Failed to submit ad group-level negatives')
+          })
+        )
+        adGroupKeywords.forEach(item => submittedKeywords.push(item.keyword))
+        const agNames = [...new Set(adGroupKeywords.map(i => i.adGroupName || i.adGroupId))]
+        summaryParts.push(`${adGroupKeywords.length} at ad group level (${agNames.join(', ')})`)
+      }
+
+      setExistingNegatives(prev => [...prev, ...submittedKeywords])
+      setSubmitSuccess(`Keywords submitted — ${summaryParts.join(' · ')}`)
+
+      const submittedSet = new Set(submittedKeywords.map(k => k.toLowerCase()))
+      setPendingNegatives(prev => prev.filter(item => !submittedSet.has(item.keyword.toLowerCase())))
+
+      // Save history for list submissions
+      if (listKeywords.length > 0) {
+        const uniqueTypes = [...new Set(listKeywords.map(item => item.matchType))]
+        const matchTypeLabel = uniqueTypes.length === 1
+          ? ({ EXACT: 'Exact match', PHRASE: 'Phrase match', BROAD: 'Broad match' }[uniqueTypes[0]] || uniqueTypes[0])
+          : 'Mixed match types'
+        const listNames = [...new Set(listKeywords.map(i => sharedSets.find(s => s.id === i.sharedSetId)?.name || i.sharedSetId))]
+        fetch('/api/submission-history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            clientId: currentClientId,
+            keywords: listKeywords.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+            listName: listNames.join(', '),
+            matchTypes: matchTypeLabel,
+          }),
+        })
+          .then(r => r.json())
+          .then(() => {
+            setSubmissionHistory(prev => [{
+              id: Date.now(),
+              submitted_at: new Date().toISOString(),
+              keyword_count: listKeywords.length,
+              list_name: listNames.join(', '),
+              match_types: matchTypeLabel,
+              keywords: listKeywords.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+            }, ...prev])
+          })
+          .catch(console.error)
+      }
     } catch (err) {
       const isManagerList =
         /manager/i.test(err.message) ||
@@ -624,6 +750,8 @@ export default function App() {
           sharedSets={sharedSets}
           selectedSharedSetId={selectedSharedSetId}
           setSelectedSharedSetId={setSelectedSharedSetId}
+          campaigns={campaigns}
+          adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={handleRescan}
           onAddManualNegative={handleAddManualNegative}
