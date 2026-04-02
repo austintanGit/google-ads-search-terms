@@ -78,6 +78,8 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
   const [searchFilter, setSearchFilter] = useState('')
   const [campaignFilter, setCampaignFilter] = useState('')
   const [hoveredRow, setHoveredRow] = useState(null)
+  const [videoOpen, setVideoOpen] = useState(false)
+  const videoRef = useRef(null)
 
   // Selection toolbar state (text selection)
   const [toolbar, setToolbar] = useState({ visible: false, x: 0, y: 0 })
@@ -171,117 +173,151 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
         </div>
       )}
 
-      {/* Keyword status key */}
-      <div className="status-key mb-3">
-        <div className="status-key-title">KEYWORD STATUS KEY</div>
-        <div className="status-key-items">
-          <div className="status-key-item">
-            <span className="neg-badge neg-badge-google">keyword</span>
-            <span className="status-key-desc">Already a negative in Google Ads — no action needed</span>
-          </div>
-          <div className="status-key-item">
-            <span className="neg-badge neg-badge-ai">keyword <span className="neg-badge-remove-demo">×</span></span>
-            <span className="status-key-desc">AI-recommended negative — not yet submitted to Google</span>
-          </div>
-          <div className="status-key-item">
-            <span className="neg-badge neg-badge-manual">keyword <span className="neg-badge-remove-demo">×</span></span>
-            <span className="status-key-desc">Manually flagged negative — not yet submitted to Google</span>
+      {/* Instructional video modal */}
+      {videoOpen && (
+        <div className="video-modal-backdrop" onClick={() => { setVideoOpen(false); videoRef.current?.pause() }}>
+          <div className="video-modal-box" onClick={e => e.stopPropagation()}>
+            <div className="video-modal-header">
+              <span className="video-modal-title">How to flag negative keywords</span>
+              <button className="video-modal-close" onClick={() => { setVideoOpen(false); videoRef.current?.pause() }}>
+                <i className="fas fa-times" />
+              </button>
+            </div>
+            <video
+              ref={videoRef}
+              src="/assets/video.mov"
+              autoPlay
+              controls
+              playsInline
+              className="video-modal-player"
+            />
           </div>
         </div>
-      </div>
+      )}
 
-      {/* Hover hint */}
-      <div className="hover-hint mb-2">
-        <i className="fas fa-info-circle me-1" />
-        Hover over a search term row and click <strong>+ Flag</strong> to add the whole term, or <strong>select any word/phrase</strong> to add just that part as a negative keyword
-      </div>
+      <div className="search-terms-panel">
+        {/* Panel header: legend + hint */}
+        <div className="search-terms-panel-header-container">
+          <span className="search-terms-panel-header-title">Review your search terms</span>
+        </div>
+        <div className="search-terms-panel-header">
+          <div className="status-key">
+            <div className="status-key-items">
+              <div className="status-key-item status-key-item-google">
+                <span className="status-key-item-label">Already a Negative</span>
+                <span className="status-key-item-sub">No Action</span>
+              </div>
+              <div className="status-key-item status-key-item-ai">
+                <span className="status-key-item-label">AI-Recommended</span>
+                <span className="status-key-item-sub">Not Yet Submitted</span>
+              </div>
+              <div className="status-key-item status-key-item-manual">
+                <span className="status-key-item-label">Manual</span>
+                <span className="status-key-item-sub">Not Yet Submitted</span>
+              </div>
+            </div>
+          </div>
+        </div>
 
-      {/* Search + Campaign filter */}
-      <div className="d-flex gap-2 mb-2 align-items-center flex-wrap">
-        <input
-          type="text"
-          className="form-control form-control-sm"
-          placeholder="Filter search terms…"
-          value={searchFilter}
-          onChange={e => setSearchFilter(e.target.value)}
-          style={{ maxWidth: 260 }}
-        />
-        <select
-          className="form-select form-select-sm"
-          value={campaignFilter}
-          onChange={e => setCampaignFilter(e.target.value)}
-          style={{ maxWidth: 220 }}
-        >
-          <option value="">All campaigns</option>
-          {campaigns.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <span className="text-muted small ms-auto">
-          Showing {sorted.length} of {searchTerms.length} terms
-        </span>
-      </div>
+        {/* Hover hint */}
+        <div className="hover-hint search-terms-hint">
+          <span>
+            <i className="fas fa-info-circle me-1" />
+            Hover over any word to flag it individually, or hover over the full row to flag the entire search term as a negative
+          </span>
+          <button className="hint-video-btn" onClick={() => setVideoOpen(true)}>
+            <i className="fas fa-play-circle me-1" />Watch how it works
+          </button>
+        </div>
 
-      <div className="table-wrapper border rounded">
-        <table
-          ref={tableRef}
-          className="table table-hover table-sm mb-0 search-terms-table"
-        >
-          <thead>
-            <tr>
-              {COLUMNS.map(col => (
-                <th
-                  key={col.key}
-                  className={col.sortable ? 'sortable-th' : ''}
-                  onClick={col.sortable ? () => handleSort(col.key) : undefined}
-                >
-                  {col.label}
-                  {col.sortable && <SortIcon col={col.key} />}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map(term => {
-              const negatives = rowNegatives.get(term.searchTerm)
-              const isHovered = hoveredRow === term.searchTerm
-              return (
-                <tr
-                  key={`${term.searchTerm}__${term.campaign}__${term.adGroup}`}
-                  onMouseEnter={() => setHoveredRow(term.searchTerm)}
-                  onMouseLeave={() => setHoveredRow(null)}
-                >
-                  <td>
-                    <span className="search-term-cell">
-                      <HighlightedSearchTerm text={term.searchTerm} negatives={negatives} />
-                      {isHovered && (
-                        <button
-                          className="flag-btn"
-                          title="Flag as negative keyword"
-                          onClick={() => onAddNegative(term.searchTerm)}
-                        >
-                          + Flag
-                        </button>
-                      )}
-                    </span>
-                  </td>
-                  <td className="text-muted">{term.matchingKeyword}</td>
-                  <td>{term.campaign}</td>
-                  <td className="text-end">{Number(term.clicks).toLocaleString()}</td>
-                  <td className="text-end">{Number(term.conversions).toFixed(1)}</td>
-                  <td>
-                    <NegativeBadges negatives={negatives} onRemove={onRemoveNegative} />
+        {/* Search + Campaign filter */}
+        <div className="search-terms-filters">
+          <input
+            type="text"
+            className="form-control form-control-sm"
+            placeholder="Filter search terms…"
+            value={searchFilter}
+            onChange={e => setSearchFilter(e.target.value)}
+            style={{ maxWidth: 260 }}
+          />
+          <select
+            className="form-select form-select-sm"
+            value={campaignFilter}
+            onChange={e => setCampaignFilter(e.target.value)}
+            style={{ maxWidth: 220 }}
+          >
+            <option value="">All campaigns</option>
+            {campaigns.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <span className="text-muted small ms-auto">
+            Showing {sorted.length} of {searchTerms.length} terms
+          </span>
+        </div>
+
+        {/* Table */}
+        <div className="table-wrapper">
+          <table
+            ref={tableRef}
+            className="table table-hover table-sm mb-0 search-terms-table"
+          >
+            <thead>
+              <tr>
+                {COLUMNS.map(col => (
+                  <th
+                    key={col.key}
+                    className={col.sortable ? 'sortable-th' : ''}
+                    onClick={col.sortable ? () => handleSort(col.key) : undefined}
+                  >
+                    {col.label}
+                    {col.sortable && <SortIcon col={col.key} />}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(term => {
+                const negatives = rowNegatives.get(term.searchTerm)
+                const isHovered = hoveredRow === term.searchTerm
+                return (
+                  <tr
+                    key={`${term.searchTerm}__${term.campaign}__${term.adGroup}`}
+                    onMouseEnter={() => setHoveredRow(term.searchTerm)}
+                    onMouseLeave={() => setHoveredRow(null)}
+                  >
+                    <td>
+                      <span className="search-term-cell">
+                        <HighlightedSearchTerm text={term.searchTerm} negatives={negatives} />
+                        {isHovered && (
+                          <button
+                            className="flag-btn"
+                            title="Flag as negative keyword"
+                            onClick={() => onAddNegative(term.searchTerm)}
+                          >
+                            + Flag
+                          </button>
+                        )}
+                      </span>
+                    </td>
+                    <td className="text-muted">{term.matchingKeyword}</td>
+                    <td>{term.campaign}</td>
+                    <td className="text-end">{Number(term.clicks).toLocaleString()}</td>
+                    <td className="text-end">{Number(term.conversions).toFixed(1)}</td>
+                    <td>
+                      <NegativeBadges negatives={negatives} onRemove={onRemoveNegative} />
+                    </td>
+                  </tr>
+                )
+              })}
+              {sorted.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="text-center text-muted py-3">
+                    No matching records found
                   </td>
                 </tr>
-              )
-            })}
-            {sorted.length === 0 && (
-              <tr>
-                <td colSpan={6} className="text-center text-muted py-3">
-                  No matching records found
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </>
   )

@@ -40,6 +40,17 @@ async function initDB() {
                 UNIQUE(client_id, keyword)
             )
         `);
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS submission_history (
+                id SERIAL PRIMARY KEY,
+                client_id VARCHAR(30) NOT NULL,
+                submitted_at TIMESTAMP DEFAULT NOW(),
+                keyword_count INTEGER NOT NULL,
+                list_name TEXT,
+                match_types TEXT,
+                keywords JSONB NOT NULL
+            )
+        `);
         console.log('DB tables initialized');
     } catch (err) {
         console.error('DB init error:', err.message);
@@ -262,21 +273,31 @@ app.get('/api/shared-sets', async (req, res) => {
                 shared_set.type = NEGATIVE_KEYWORDS
                 AND shared_set.status = ENABLED`;
 
-        // Query 1: client-owned lists (regardless of campaign linkage)
-        // Query 2: lists applied to campaigns (catches manager-owned lists)
-        const [ownedResponse, campaignResponse] = await Promise.all([
+        // Query client lists AND manager's own lists in parallel so we can exclude
+        // any list that exists in the manager account (user cannot write to those)
+        const managerCustomer = client.Customer({
+            customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+
+        const [ownedResponse, managerResponse] = await Promise.all([
             customer.query(`SELECT ${sharedSetFields} FROM shared_set WHERE ${whereClause}`),
-            customer.query(`SELECT ${sharedSetFields} FROM campaign_shared_set WHERE ${whereClause}`)
+            managerCustomer.query(`SELECT shared_set.id FROM shared_set WHERE ${whereClause}`).catch(() => [])
         ]);
 
-        // Merge and deduplicate by shared_set.id
+        // Build a set of IDs that belong to the manager account
+        const managerSetIds = new Set(managerResponse.map(r => String(r.shared_set.id)));
+        console.log('[shared-sets] manager set IDs:', [...managerSetIds]);
+
         const seen = new Set();
-        const sharedSets = [...ownedResponse, ...campaignResponse]
+        const sharedSets = ownedResponse
             .filter(row => {
                 const id = String(row.shared_set.id);
                 if (seen.has(id)) return false;
                 seen.add(id);
-                return true;
+                // Exclude any list that also exists in the manager account
+                return !managerSetIds.has(id);
             })
             .map(row => ({
                 id: String(row.shared_set.id),
@@ -489,24 +510,50 @@ ${pagesText}`;
             }
         }
 
+        const uniqueWords = [...new Set(
+            searchTerms.flatMap(st => st.searchTerm.toLowerCase().split(/\s+/))
+        )].join(', ');
+
         const prompt = `You are a Google Ads specialist helping identify negative keywords to add to a campaign.
 
-Your ONLY job is to find words that signal a search is clearly NOT from a potential customer of this business. You will return a SHORT list of specific negative keywords — typically 5–15 words or phrases, never more than 20.
+Your ONLY job is to find words or phrases that signal a search is clearly NOT from a potential customer of this business. Return a SHORT list — typically 5–15 items, never more than 20.
+
+BEFORE YOU BEGIN — SCAN THE WEBSITE:
+Before evaluating any search terms, scan the provided website URL to fully understand:
+- Every product and service this business offers
+- What geographic area(s) they serve, if any
+- Use this knowledge as the foundation for every decision below
 
 ABSOLUTE RULES (violating any of these is a critical error):
-1. NEVER add geographic terms (city names, state names, country names, regions) as negatives — ever.
+1. GEOGRAPHIC TERMS: Scan the website to determine service area. If the business serves a specific local or regional area, terms coming in from outside that area are negatives. Extract only the out-of-area location word — not the other words in the phrase. If the business serves nationally or the service area is unclear, do NOT add geographic terms as negatives.
 2. NEVER add the business's own industry terms as negatives (e.g. for a marketing agency: "marketing", "agency", "digital", "seo", "advertising", "branding", "media").
 3. NEVER add generic descriptor words like "company", "firm", "services", "best", "top", "near me", "local" — these are valuable qualifiers, not negatives.
-4. ONLY recommend a keyword if it actually appears in one or more of the search terms listed above. Do NOT invent keywords based on general logic — every keyword you return must be a word or phrase found in the data.
+4. CRITICAL — DATA ONLY: Every keyword you return MUST be a word or phrase taken verbatim from the search terms list below. Do NOT use general advertising knowledge. Do NOT invent negatives that seem reasonable. If a word is not literally present in the search terms data, you CANNOT include it.
 5. ONLY flag a word if it clearly signals a completely different intent — e.g. a competitor's brand name, an unrelated industry, job-seeking intent, or DIY/free intent.
-6. When a search term contains a competitor name alongside valid words, ONLY extract the competitor name — not the other words.
-7. If you are not 100% sure a word is irrelevant, leave it out.
-8. Aim for a quality percentage above 70%. If your negativeCount exceeds 15% of total terms, you are being too aggressive — reduce the list.
+6. EXTRACTION RULE — always extract the smallest offending unit, never the full phrase:
+   - Competitor name in a phrase → extract only the competitor name
+   - Out-of-area location in a phrase → extract only the location
+   - Unrelated intent word in a phrase → extract only that word
+   Examples:
+   - "mobile fuel delivery franchise" → add "franchise" (not the full phrase)
+   - "John Ford Plumbing Company" → add "John Ford" (competitor name only)
+   - "best Chicago plumber near me" (local Columbus business) → add "Chicago" (location only)
+7. COMPETITORS: Treat all competitor brand names found in the search terms as negative keywords. Scan the website and use your knowledge to identify competitors in this industry.
+8. If you are not 100% sure a word is irrelevant to this specific business, leave it out.
+9. Aim for a quality percentage above 70%. If your negativeCount exceeds 15% of total terms, you are being too aggressive — reduce the list.
 
 ${websiteContext}
 
 Search Terms (format: term | clicks | conversions | campaign):
 ${searchTermsTable}
+
+Every unique word present across all search terms (your negatives MUST come only from this set):
+${uniqueWords}
+
+FINAL VERIFICATION — before writing your JSON, check each keyword you plan to include:
+- Does it appear word-for-word in the search terms list above? If NO, remove it.
+- Is it the smallest possible unit (not a full phrase when only one word is the problem)? If NO, trim it.
+- Are you 100% confident it is irrelevant to this business? If NO, remove it.
 
 Respond ONLY with a valid JSON object in this exact format, with no additional text before or after:
 {
@@ -536,6 +583,23 @@ Respond ONLY with a valid JSON object in this exact format, with no additional t
 
         const jsonText = text.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
         const parsed = JSON.parse(jsonText);
+
+        // Hard filter: remove any keyword the AI invented that isn't present in the actual search terms
+        const searchTermsLower = searchTerms.map(st => st.searchTerm.toLowerCase());
+        parsed.negativeKeywords = (parsed.negativeKeywords || []).filter(kw => {
+            const kwLower = kw.toLowerCase().trim();
+            const escaped = kwLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i');
+            return searchTermsLower.some(term => re.test(term));
+        });
+
+        // Recalculate summary counts based on validated keywords
+        if (parsed.summary) {
+            parsed.summary.negativeCount = parsed.negativeKeywords.length;
+            parsed.summary.qualityPercentage = parsed.summary.totalSearchTerms > 0
+                ? Math.round(((parsed.summary.totalSearchTerms - parsed.negativeKeywords.length) / parsed.summary.totalSearchTerms) * 100)
+                : 100;
+        }
 
         res.json(parsed);
     } catch (error) {
@@ -660,6 +724,46 @@ app.delete('/api/client-saved-negatives', async (req, res) => {
     } catch (err) {
         console.error('Error deleting negative keyword:', err);
         res.status(500).json({ error: 'Failed to delete negative keyword', details: err.message });
+    }
+});
+
+// Save a submission record
+app.post('/api/submission-history', async (req, res) => {
+    const { clientId, keywords, listName, matchTypes } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
+    if (!keywords || !keywords.length) return res.status(400).json({ error: 'Keywords are required' });
+
+    try {
+        await dbPool.query(
+            `INSERT INTO submission_history (client_id, keyword_count, list_name, match_types, keywords)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [clientId, keywords.length, listName || '', matchTypes || '', JSON.stringify(keywords)]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error saving submission history:', err);
+        res.status(500).json({ error: 'Failed to save submission history', details: err.message });
+    }
+});
+
+// Get submission history for a client
+app.get('/api/submission-history', async (req, res) => {
+    const { clientId } = req.query;
+    if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
+
+    try {
+        const result = await dbPool.query(
+            `SELECT id, submitted_at, keyword_count, list_name, match_types, keywords
+             FROM submission_history
+             WHERE client_id = $1
+             ORDER BY submitted_at DESC
+             LIMIT 30`,
+            [clientId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching submission history:', err);
+        res.status(500).json({ error: 'Failed to fetch submission history', details: err.message });
     }
 });
 

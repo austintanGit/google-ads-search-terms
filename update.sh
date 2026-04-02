@@ -31,35 +31,29 @@ scp -i "$PEM_KEY" .env.production ubuntu@$EC2_IP:~/.env.production
 
 echo "🔄 Updating on EC2..."
 ssh -i "$PEM_KEY" ubuntu@$EC2_IP << 'EOF'
+  APP_DIR="/home/ubuntu/google-ads-search-terms"
+
   # Stop current app
   pm2 stop all || echo "No PM2 processes running"
-  
-  # Backup current version (optional)
-  sudo cp -r /opt/google-ads-app /opt/google-ads-app.backup.$(date +%Y%m%d_%H%M%S) || echo "No existing app to backup"
-  
-  # Clear old version
-  sudo rm -rf /opt/google-ads-app
-  sudo mkdir -p /opt/google-ads-app
-  sudo chown $USER:$USER /opt/google-ads-app
-  
-  # Extract new version
-  cd /opt/google-ads-app
+
+  # Extract new version over existing app
+  cd "$APP_DIR"
   tar -xzf ~/update.tar.gz
   cp ~/.env.production .env
-  
+
   # Install backend dependencies
   npm ci --only=production
-  
-  # Setup frontend (install deps and copy built files to public)
+
+  # Build frontend
   cd frontend
   npm ci
   npm run build
-  
+
   # Copy built frontend to public directory (if not done by build)
   cd ..
   mkdir -p public
   cp -r frontend/dist/* public/ 2>/dev/null || echo "Frontend build output already in correct location"
-  
+
   # Create/update PM2 ecosystem if doesn't exist
   if [ ! -f ecosystem.config.js ]; then
     cat > ecosystem.config.js << 'EOL'
@@ -84,14 +78,14 @@ module.exports = {
 }
 EOL
   fi
-  
+
   # Start the updated application
   pm2 start ecosystem.config.js --env production || pm2 restart google-ads-app
   pm2 save
-  
+
   # Cleanup
   rm ~/update.tar.gz ~/.env.production
-  
+
   echo "✅ Update complete!"
   echo "📊 App status:"
   pm2 status
