@@ -506,9 +506,8 @@
 }
 
 .col-destination {
-  width: 220px;
-  vertical-align: top;
-  padding-top: 10px !important;
+  width: 190px;
+  vertical-align: middle;
 }
 
 .col-action {
@@ -564,39 +563,14 @@
   min-width: 0;
 }
 
-/* Top row: destination type select + expand toggle */
-.dest-type-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
+/* Destination type select fills the cell */
 .dest-type-select {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
 }
 
-.dest-expand-btn {
-  flex-shrink: 0;
-  background: none;
-  border: 1px solid #e5e7eb;
-  border-radius: 4px;
-  color: #9ca3af;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 0.65rem;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  padding: 0;
-}
-
-.dest-expand-btn:hover {
-  color: #374151;
-  border-color: #9ca3af;
-  background: #f9fafb;
+/* List picker row shown below campaign/adgroup in keyword column */
+.kw-list-row {
+  margin-top: 4px;
 }
 
 /* Each cascade row: small label + select */
@@ -686,6 +660,43 @@
   outline: none;
   border-color: #6366f1;
   box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+/* Destination level color coding */
+.dest-select-campaign {
+  border-color: #3b82f6;
+  background-color: #eff6ff;
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+.dest-select-campaign:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.dest-select-adgroup {
+  border-color: #16a34a;
+  background-color: #f0fdf4;
+  color: #15803d;
+  font-weight: 600;
+}
+
+.dest-select-adgroup:focus {
+  border-color: #15803d;
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.2);
+}
+
+.dest-select-list {
+  border-color: #d97706;
+  background-color: #fffbeb;
+  color: #b45309;
+  font-weight: 600;
+}
+
+.dest-select-list:focus {
+  border-color: #b45309;
+  box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.2);
 }
 
 /* Remove keyword button */
@@ -959,30 +970,68 @@
   font-size: 0.72rem;
 }
 
-/* Bulk apply row — top of pending section, 3 columns */
+/* Bulk apply — two rows; match type + destination selects share one width */
 .pending-bulk-top {
   display: flex;
-  align-items: flex-end;
-  gap: 16px;
+  flex-direction: column;
+  gap: 10px;
   padding: 10px 16px;
   background: #b9dcff;
   border-top: 1px solid #e5e7eb;
   border-bottom: 1px solid #e5e7eb;
-  flex-wrap: wrap;
 }
 
+.bulk-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+}
+
+.bulk-col-label {
+  flex: 0 0 7.5rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #4b5563;
+  text-transform: uppercase;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+
+/* Same fixed width for Match type and Destination dropdowns */
+.bulk-match-dest-select {
+  width: 220px;
+  max-width: 100%;
+  box-sizing: border-box;
+  flex-shrink: 0;
+}
+
+.bulk-list-select {
+  width: 220px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.bulk-row-rest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bulk-hint {
+  font-size: 0.75rem;
+  color: #4b5563;
+  line-height: 1.35;
+}
+
+/* Keep for any legacy references */
 .bulk-col {
   display: flex;
   flex-direction: column;
   gap: 4px;
-}
-
-.bulk-col-label {
-  font-size: 0.68rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  color: #6b7280;
-  text-transform: uppercase;
 }
 
 .bulk-col-btn {
@@ -1015,6 +1064,12 @@
   flex: 1;
   min-width: 220px;
   max-width: 360px;
+}
+
+.manual-match-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
 }
 
 .manual-add-col {

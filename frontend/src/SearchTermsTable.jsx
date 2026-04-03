@@ -84,6 +84,7 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
   // Selection toolbar state (text selection)
   const [toolbar, setToolbar] = useState({ visible: false, x: 0, y: 0 })
   const pendingSelectionRef = useRef(null)
+  const pendingSelectionTermRef = useRef(null)
   const tableRef = useRef(null)
 
   const campaigns = [...new Set(searchTerms.map(t => t.campaign).filter(Boolean))].sort()
@@ -132,6 +133,14 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
         const cell = anchor?.parentElement?.closest('.search-term-cell')
         if (!cell || !tableRef.current.contains(cell)) return
 
+        const row = anchor?.parentElement?.closest('tr[data-campaign-id]')
+        pendingSelectionTermRef.current = row ? {
+          campaignId: row.dataset.campaignId || null,
+          campaignName: row.dataset.campaignName || null,
+          adGroupId: row.dataset.adGroupId || null,
+          adGroupName: row.dataset.adGroupName || null,
+        } : null
+
         pendingSelectionRef.current = selectedText
         setToolbar({ visible: true, x: e.clientX + 8, y: e.clientY + 8 })
       }, 0)
@@ -154,12 +163,16 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
 
   function handleAddAsNegative() {
     const text = pendingSelectionRef.current
+    const term = pendingSelectionTermRef.current
     if (text) {
-      onAddNegative(text)
+      const destination = term?.adGroupId ? 'ADGROUP' : 'CAMPAIGN'
+      // matchType is inferred in handleAddManualNegative; pass null so it auto-computes
+      onAddNegative(text, null, term?.campaignId, term?.campaignName, term?.adGroupId, term?.adGroupName, destination)
       window.getSelection()?.removeAllRanges()
     }
     setToolbar({ visible: false, x: 0, y: 0 })
     pendingSelectionRef.current = null
+    pendingSelectionTermRef.current = null
   }
 
   return (
@@ -281,6 +294,10 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
                 return (
                   <tr
                     key={`${term.searchTerm}__${term.campaign}__${term.adGroup}`}
+                    data-campaign-id={term.campaignId || ''}
+                    data-campaign-name={term.campaign || ''}
+                    data-adgroup-id={term.adGroupId || ''}
+                    data-adgroup-name={term.adGroup || ''}
                     onMouseEnter={() => setHoveredRow(term.searchTerm)}
                     onMouseLeave={() => setHoveredRow(null)}
                   >
@@ -291,7 +308,7 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
                           <button
                             className="flag-btn"
                             title="Flag as negative keyword"
-                            onClick={() => onAddNegative(term.searchTerm)}
+                            onClick={() => onAddNegative(term.searchTerm, null, term.campaignId, term.campaign, term.adGroupId, term.adGroup, term.adGroupId ? 'ADGROUP' : 'CAMPAIGN')}
                           >
                             + Flag
                           </button>

@@ -5,6 +5,48 @@ import { getDefaultDates, escapeRegex } from './utils'
 import SearchTermsTable from './SearchTermsTable'
 import AIPanel from './AIPanel'
 
+// Single word → Exact, multi-word → Phrase
+function inferMatchType(kw) {
+  return kw.trim().split(/\s+/).length > 1 ? 'PHRASE' : 'EXACT'
+}
+
+// Infer campaign/adgroup, destination type, and match type for a keyword based on search term data.
+// - 1 ad group  → ADGROUP (most targeted)
+// - 1 campaign, multiple ad groups → CAMPAIGN
+// - Multiple campaigns → NEGATIVE_LIST (can't target all campaigns at once)
+function inferKeywordDestination(kw, terms) {
+  const kwLower = kw.toLowerCase()
+  const matching = terms.filter(t => t.searchTerm.toLowerCase().includes(kwLower))
+  const matchType = inferMatchType(kw)
+
+  if (matching.length === 0) {
+    return { campaignId: null, campaignName: null, adGroupId: null, adGroupName: null, destination: 'CAMPAIGN', matchType }
+  }
+
+  const distinctCampaigns = new Set(matching.map(t => t.campaignId).filter(Boolean))
+  const distinctAdGroups = new Set(matching.map(t => t.adGroupId).filter(Boolean))
+
+  const best = [...matching].sort((a, b) => (b.clicks || 0) - (a.clicks || 0))[0]
+
+  let destination
+  if (distinctCampaigns.size > 1) {
+    destination = 'NEGATIVE_LIST'
+  } else if (distinctAdGroups.size === 1) {
+    destination = 'ADGROUP'
+  } else {
+    destination = 'CAMPAIGN'
+  }
+
+  return {
+    campaignId: best.campaignId || null,
+    campaignName: best.campaign || null,
+    adGroupId: best.adGroupId || null,
+    adGroupName: best.adGroup || null,
+    destination,
+    matchType,
+  }
+}
+
 function HomePage({ onNavigate }) {
   return (
     <div className="home-page">
@@ -52,8 +94,6 @@ function NegativeKeywordsPage({
   setSharedSets,
   selectedSharedSetId,
   setSelectedSharedSetId,
-  campaigns,
-  adGroupsByCampaign,
   lastScannedAt,
   onRescan,
   onCreateSharedSet,
@@ -161,8 +201,6 @@ function NegativeKeywordsPage({
           sharedSets={sharedSets}
           selectedSharedSetId={selectedSharedSetId}
           setSelectedSharedSetId={setSelectedSharedSetId}
-          campaigns={campaigns}
-          adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={onRescan}
           onCreateSharedSet={onCreateSharedSet}
@@ -427,7 +465,8 @@ export default function App() {
               .filter(kw => !existingKws.has(kw.toLowerCase()))
               .map(kw => {
                 const inGoogle = googleNegLower.has(kw.toLowerCase())
-                return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
+                const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, terms)
+                return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
               })
             return [...prev, ...newItems]
           })
@@ -481,11 +520,24 @@ export default function App() {
     }
   }
 
-  // Called when user text-selects a phrase or clicks hover-flag button
-  const handleAddManualNegative = useCallback((keyword, matchType = 'EXACT') => {
+  // Called when user text-selects a phrase, clicks hover-flag button, or manually adds a keyword.
+  // When no campaign context is provided (manual text input), auto-infers from search terms.
+  const handleAddManualNegative = useCallback((keyword, matchType = null, campaignId = null, campaignName = null, adGroupId = null, adGroupName = null, destination = null) => {
     const kwLower = keyword.toLowerCase()
     const googleNegLower = new Set(existingNegatives.map(k => k.toLowerCase()))
     if (googleNegLower.has(kwLower)) return
+
+    // Infer destination/campaign from search terms when no explicit context; match type from word count unless caller passes one (e.g. manual add)
+    const inferred = inferKeywordDestination(keyword, searchTerms)
+    let finalCampaignId = campaignId || inferred.campaignId
+    let finalCampaignName = campaignName || inferred.campaignName
+    let finalAdGroupId = adGroupId || inferred.adGroupId
+    let finalAdGroupName = adGroupName || inferred.adGroupName
+    let finalDestination = destination || inferred.destination || 'CAMPAIGN'
+    let finalMatchType = (matchType != null && matchType !== '') ? matchType : inferred.matchType
+    if ((finalDestination === 'CAMPAIGN' || finalDestination === 'ADGROUP') && finalMatchType === 'BROAD') {
+      finalMatchType = 'EXACT'
+    }
 
     if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(kwLower)) {
       setDbSavedNegatives(prev => [...prev, keyword])
@@ -498,11 +550,11 @@ export default function App() {
 
     setPendingNegatives(prev => {
       if (prev.some(item => item.keyword.toLowerCase() === kwLower)) return prev
-      return [...prev, { keyword, matchType, source: 'manual', selected: true, destination: 'CAMPAIGN', sharedSetId: null }]
+      return [...prev, { keyword, matchType: finalMatchType, source: 'manual', selected: true, destination: finalDestination, sharedSetId: null, campaignId: finalCampaignId, campaignName: finalCampaignName, adGroupId: finalAdGroupId, adGroupName: finalAdGroupName }]
     })
     setAiStats(prev => prev || {})
     setSubmitSuccess('')
-  }, [currentClientId, dbSavedNegatives, existingNegatives])
+  }, [currentClientId, dbSavedNegatives, existingNegatives, searchTerms])
 
   const handleRemoveNegativeFromRow = useCallback((keyword) => {
     const kwLower = keyword.toLowerCase()
@@ -529,7 +581,8 @@ export default function App() {
         .filter(kw => !existingKws.has(kw.toLowerCase()))
         .map(kw => {
           const inGoogle = googleNegLower.has(kw.toLowerCase())
-          return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
+          const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, searchTerms)
+          return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
         })
       return [...prev, ...newItems]
     })
@@ -542,7 +595,7 @@ export default function App() {
         : 100,
       explanation: result.explanation,
     } : {})
-  }, [existingNegatives])
+  }, [existingNegatives, searchTerms])
 
   async function handleCreateSharedSet(name) {
     if (!currentClientId) throw new Error('No client selected')
@@ -564,6 +617,7 @@ export default function App() {
     if (!urlToUse || searchTerms.length === 0) return
     setAiLoading(true)
     setSubmitSuccess('')
+    setSubmitError('')
     try {
       const r = await fetch('/api/ai-recommend-negatives', {
         method: 'POST',
@@ -572,13 +626,17 @@ export default function App() {
       })
       if (!r.ok) {
         const d = await r.json()
-        throw new Error(d.error || 'AI analysis failed')
+        throw new Error(d.details || d.error || 'AI analysis failed')
       }
       const result = await r.json()
       handleAiResults(result)
       setLastScannedAt(new Date())
+      if ((result.negativeKeywords || []).length === 0) {
+        setSubmitError('AI scan completed but found no new negative keywords for this account.')
+      }
     } catch (err) {
       console.error('Re-scan failed:', err.message)
+      setSubmitError('AI scan failed: ' + err.message)
     } finally {
       setAiLoading(false)
     }
@@ -777,8 +835,6 @@ export default function App() {
           setSharedSets={setSharedSets}
           selectedSharedSetId={selectedSharedSetId}
           setSelectedSharedSetId={setSelectedSharedSetId}
-          campaigns={campaigns}
-          adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={handleRescan}
           onCreateSharedSet={handleCreateSharedSet}

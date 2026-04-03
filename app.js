@@ -66,6 +66,28 @@ const bedrockClient = new BedrockRuntimeClient({
     }
 });
 
+// Retry helper for transient Google Ads API errors (e.g. CONCURRENT_MODIFICATION)
+async function withRetry(fn, maxAttempts = 3, delayMs = 1500) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const isConcurrent =
+                err.errors?.some(e =>
+                    e.error_code?.mutate_error === 'CONCURRENT_MODIFICATION' ||
+                    /concurrent/i.test(e.message || '')
+                ) || /concurrent/i.test(err.message || '');
+
+            if (isConcurrent && attempt < maxAttempts) {
+                console.log(`[retry] CONCURRENT_MODIFICATION on attempt ${attempt}, retrying in ${delayMs}ms...`);
+                await new Promise(r => setTimeout(r, delayMs));
+            } else {
+                throw err;
+            }
+        }
+    }
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -388,13 +410,13 @@ app.post('/api/add-to-exclusion-list', async (req, res) => {
         try {
             // First attempt: use the client account
             console.log(`Attempt 1: submitting via client account ${clientId}`);
-            response = await trySubmit(clientId);
+            response = await withRetry(() => trySubmit(clientId));
         } catch (firstErr) {
             const managerId = process.env.GOOGLE_ADS_MANAGER_ID;
             if (isNotFoundError(firstErr) && managerId && managerId !== clientId) {
                 // The list is likely owned by the manager account — retry with manager
                 console.log(`Client attempt failed (RESOURCE_NOT_FOUND). Retrying via manager account ${managerId}`);
-                response = await trySubmit(managerId);
+                response = await withRetry(() => trySubmit(managerId));
                 usedCustomerId = managerId;
             } else {
                 throw firstErr;
@@ -554,31 +576,29 @@ ${pagesText}`;
 
         const prompt = `You are a Google Ads specialist helping identify negative keywords to add to a campaign.
 
-Your ONLY job is to find words or phrases that signal a search is clearly NOT from a potential customer of this business. Return a SHORT list — typically 5–15 items, never more than 20.
+Your job is to find words or phrases that signal a search is NOT from a potential customer of this business. Be thorough — it is better to catch more negatives than to miss them.
 
 BEFORE YOU BEGIN — SCAN THE WEBSITE:
-Before evaluating any search terms, scan the provided website URL to fully understand:
+Before evaluating any search terms, read the provided website content to understand:
 - Every product and service this business offers
 - What geographic area(s) they serve, if any
-- Use this knowledge as the foundation for every decision below
+- Use this as the foundation for every decision below
 
-ABSOLUTE RULES (violating any of these is a critical error):
-1. GEOGRAPHIC TERMS: Scan the website to determine service area. If the business serves a specific local or regional area, terms coming in from outside that area are negatives. Extract only the out-of-area location word — not the other words in the phrase. If the business serves nationally or the service area is unclear, do NOT add geographic terms as negatives.
-2. NEVER add the business's own industry terms as negatives (e.g. for a marketing agency: "marketing", "agency", "digital", "seo", "advertising", "branding", "media").
-3. NEVER add generic descriptor words like "company", "firm", "services", "best", "top", "near me", "local" — these are valuable qualifiers, not negatives.
-4. CRITICAL — DATA ONLY: Every keyword you return MUST be a word or phrase taken verbatim from the search terms list below. Do NOT use general advertising knowledge. Do NOT invent negatives that seem reasonable. If a word is not literally present in the search terms data, you CANNOT include it.
-5. ONLY flag a word if it clearly signals a completely different intent — e.g. a competitor's brand name, an unrelated industry, job-seeking intent, or DIY/free intent.
-6. EXTRACTION RULE — always extract the smallest offending unit, never the full phrase:
+RULES:
+1. GEOGRAPHIC TERMS: If the business serves a specific local or regional area, add out-of-area location words as negatives. Extract only the location word, not the full phrase. If the business serves nationally or the area is unclear, skip geographic terms.
+2. NEVER add the business's own core industry terms as negatives (e.g. for a marketing agency: "marketing", "agency", "digital", "seo", "advertising").
+3. NEVER add generic descriptor words like "company", "firm", "services", "best", "top", "near me", "local".
+4. DATA ONLY: Every keyword you return MUST be a word or phrase that appears verbatim in the search terms list below. Do NOT invent negatives.
+5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking ("careers", "jobs", "hiring"), DIY/free intent ("free", "template", "diy"), or irrelevant proper nouns.
+6. EXTRACTION RULE — always extract the smallest offending unit:
    - Competitor name in a phrase → extract only the competitor name
-   - Out-of-area location in a phrase → extract only the location
-   - Unrelated intent word in a phrase → extract only that word
-   Examples:
-   - "mobile fuel delivery franchise" → add "franchise" (not the full phrase)
-   - "John Ford Plumbing Company" → add "John Ford" (competitor name only)
-   - "best Chicago plumber near me" (local Columbus business) → add "Chicago" (location only)
-7. COMPETITORS: Treat all competitor brand names found in the search terms as negative keywords. Scan the website and use your knowledge to identify competitors in this industry.
-8. If you are not 100% sure a word is irrelevant to this specific business, leave it out.
-9. Aim for a quality percentage above 70%. If your negativeCount exceeds 15% of total terms, you are being too aggressive — reduce the list.
+   - Out-of-area location in a phrase → extract only the location word
+   - Examples:
+     - "mobile fuel delivery franchise" → "franchise"
+     - "John Ford Plumbing Company" → "John Ford"
+     - "best Chicago plumber near me" (local Columbus business) → "Chicago"
+7. COMPETITORS: Identify all competitor brand names in the search terms using your industry knowledge and add them as negatives.
+8. Be reasonably confident a word is irrelevant — you don't need to be 100% certain. If it's probably wrong intent, include it.
 
 ${websiteContext}
 
@@ -588,10 +608,9 @@ ${searchTermsTable}
 Every unique word present across all search terms (your negatives MUST come only from this set):
 ${uniqueWords}
 
-FINAL VERIFICATION — before writing your JSON, check each keyword you plan to include:
-- Does it appear word-for-word in the search terms list above? If NO, remove it.
-- Is it the smallest possible unit (not a full phrase when only one word is the problem)? If NO, trim it.
-- Are you 100% confident it is irrelevant to this business? If NO, remove it.
+FINAL CHECK before writing JSON:
+- Does each keyword appear word-for-word in the search terms list? If NO, remove it.
+- Is it the smallest unit (not a full phrase when one word is the problem)? If NO, trim it.
 
 Respond ONLY with a valid JSON object in this exact format, with no additional text before or after:
 {
@@ -883,11 +902,11 @@ app.post('/api/add-campaign-negative', async (req, res) => {
                 match_type: typeof item === 'string' ? 'EXACT' : (item.matchType || 'EXACT'),
             },
         }));
-        const response = await customer.campaignCriteria.create(criteria);
+        const response = await withRetry(() => customer.campaignCriteria.create(criteria));
         console.log(`Campaign-level negatives submitted: ${negativeKeywords.length} keywords to campaign ${campaignId}`);
         res.json({ success: true, response });
     } catch (err) {
-        console.error('Error adding campaign-level negatives:', err.message);
+        console.error('Error adding campaign-level negatives:', err.errors || err.message);
         const details = err.errors?.[0]?.message || err.message || 'Unknown error';
         res.status(500).json({ error: 'Failed to add campaign-level negative keywords', details });
     }
@@ -913,11 +932,11 @@ app.post('/api/add-adgroup-negative', async (req, res) => {
                 match_type: typeof item === 'string' ? 'EXACT' : (item.matchType || 'EXACT'),
             },
         }));
-        const response = await customer.adGroupCriteria.create(criteria);
+        const response = await withRetry(() => customer.adGroupCriteria.create(criteria));
         console.log(`Ad group-level negatives submitted: ${negativeKeywords.length} keywords to ad group ${adGroupId}`);
         res.json({ success: true, response });
     } catch (err) {
-        console.error('Error adding ad group-level negatives:', err.message);
+        console.error('Error adding ad group-level negatives:', err.errors || err.message);
         const details = err.errors?.[0]?.message || err.message || 'Unknown error';
         res.status(500).json({ error: 'Failed to add ad group-level negative keywords', details });
     }

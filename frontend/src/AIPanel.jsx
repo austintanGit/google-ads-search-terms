@@ -12,6 +12,12 @@ const DESTINATION_OPTIONS = [
   { value: 'NEGATIVE_LIST', label: 'Negative keyword list' },
 ]
 
+const DEST_CLASS = {
+  CAMPAIGN: 'dest-select-campaign',
+  ADGROUP: 'dest-select-adgroup',
+  NEGATIVE_LIST: 'dest-select-list',
+}
+
 function formatLastScanned(date) {
   if (!date) return null
   return date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) +
@@ -29,8 +35,6 @@ export default function AIPanel({
   sharedSets,
   selectedSharedSetId,
   setSelectedSharedSetId,
-  campaigns,
-  adGroupsByCampaign,
   lastScannedAt,
   onRescan,
   onCreateSharedSet,
@@ -43,15 +47,11 @@ export default function AIPanel({
   setSubmitError,
   submissionHistory,
 }) {
-  const [expandedRows, setExpandedRows] = useState(new Set())
   const [bulkMatchType, setBulkMatchType] = useState('EXACT')
   const [bulkDestination, setBulkDestination] = useState('CAMPAIGN')
-  const [bulkCampaignId, setBulkCampaignId] = useState(null)
-  const [bulkCampaignName, setBulkCampaignName] = useState(null)
-  const [bulkAdGroupId, setBulkAdGroupId] = useState(null)
-  const [bulkAdGroupName, setBulkAdGroupName] = useState(null)
   const [bulkSharedSetId, setBulkSharedSetId] = useState(null)
   const [manualKeyword, setManualKeyword] = useState('')
+  const [manualMatchType, setManualMatchType] = useState('EXACT')
   const [showSpecificPage, setShowSpecificPage] = useState(false)
   const [specificPageUrl, setSpecificPageUrl] = useState('')
   const [showManualAdd, setShowManualAdd] = useState(false)
@@ -113,47 +113,28 @@ export default function AIPanel({
     )
   }
 
-  function toggleRowExpand(keyword) {
-    setExpandedRows(prev => {
-      const next = new Set(prev)
-      next.has(keyword) ? next.delete(keyword) : next.add(keyword)
-      return next
-    })
-  }
-
   function handleBulkDestinationChange(dest) {
     setBulkDestination(dest)
-    setBulkCampaignId(null)
-    setBulkCampaignName(null)
-    setBulkAdGroupId(null)
-    setBulkAdGroupName(null)
     setBulkSharedSetId(null)
+    if ((dest === 'CAMPAIGN' || dest === 'ADGROUP') && bulkMatchType === 'BROAD') {
+      setBulkMatchType('EXACT')
+    }
   }
 
   function handleDestinationChange(keyword, destination) {
     setPendingNegatives(prev =>
       prev.map(item => {
         if (item.keyword !== keyword) return item
-        return { ...item, destination, campaignId: null, campaignName: null, adGroupId: null, adGroupName: null, sharedSetId: null }
+        const matchType = (destination === 'CAMPAIGN' || destination === 'ADGROUP') && item.matchType === 'BROAD'
+          ? 'EXACT'
+          : item.matchType
+        return {
+          ...item,
+          destination,
+          matchType,
+          sharedSetId: destination === 'NEGATIVE_LIST' ? item.sharedSetId : null,
+        }
       })
-    )
-  }
-
-  function handleCampaignChange(keyword, campaignId, campaignName) {
-    setPendingNegatives(prev =>
-      prev.map(item =>
-        item.keyword === keyword
-          ? { ...item, campaignId, campaignName, adGroupId: null, adGroupName: null }
-          : item
-      )
-    )
-  }
-
-  function handleAdGroupChange(keyword, adGroupId, adGroupName) {
-    setPendingNegatives(prev =>
-      prev.map(item =>
-        item.keyword === keyword ? { ...item, adGroupId, adGroupName } : item
-      )
     )
   }
 
@@ -163,19 +144,27 @@ export default function AIPanel({
     )
   }
 
-  function handleApplyBulk() {
+  function handleApplyBulkMatchType() {
     setPendingNegatives(prev =>
       prev.map(item => {
         if (!item.selected || item.alreadyInGoogle) return item
+        return { ...item, matchType: bulkMatchType }
+      })
+    )
+  }
+
+  function handleApplyBulkDestination() {
+    setPendingNegatives(prev =>
+      prev.map(item => {
+        if (!item.selected || item.alreadyInGoogle) return item
+        const matchType = (bulkDestination === 'CAMPAIGN' || bulkDestination === 'ADGROUP') && item.matchType === 'BROAD'
+          ? 'EXACT'
+          : item.matchType
         return {
           ...item,
-          matchType: bulkMatchType,
           destination: bulkDestination,
-          campaignId: bulkCampaignId,
-          campaignName: bulkCampaignName,
-          adGroupId: bulkAdGroupId,
-          adGroupName: bulkAdGroupName,
-          sharedSetId: bulkSharedSetId,
+          matchType,
+          sharedSetId: bulkDestination === 'NEGATIVE_LIST' ? bulkSharedSetId : null,
         }
       })
     )
@@ -185,7 +174,7 @@ export default function AIPanel({
     e.preventDefault()
     const kw = manualKeyword.trim()
     if (!kw) return
-    onAddManualNegative(kw, 'EXACT')
+    onAddManualNegative(kw, manualMatchType)
     setManualKeyword('')
     setSubmitSuccess('')
   }
@@ -247,141 +236,98 @@ export default function AIPanel({
     URL.revokeObjectURL(url)
   }
 
-  // Text-only summary shown below keyword name
-  function renderDestinationResult(item) {
-    if (item.alreadyInGoogle) return null
-    const parts = []
-    if (item.campaignName) parts.push({ label: 'Campaign', value: item.campaignName })
-    if (item.adGroupName) parts.push({ label: 'Ad group', value: item.adGroupName })
-    const dest = item.destination || 'CAMPAIGN'
-    if (dest === 'NEGATIVE_LIST' && item.sharedSetId) {
-      const listName = sharedSets.find(s => s.id === item.sharedSetId)?.name
-      if (listName) parts.push({ label: 'List', value: listName })
-    }
-    if (parts.length === 0) return null
-    return (
-      <div className="kw-dest-result">
-        {parts.map((p, i) => (
-          <span key={i} className="kw-dest-result-item">
-            {i > 0 && <span className="kw-dest-result-sep">›</span>}
-            <span className="kw-dest-result-label">{p.label}:</span>
-            <span className="kw-dest-result-val">{p.value}</span>
-          </span>
-        ))}
-      </div>
-    )
-  }
-
-  // Interactive cascade pickers rendered inside the Destination column cell
-  function renderDestinationCell(item) {
+  // Shows campaign/adgroup context text + list picker (when NEGATIVE_LIST) under the keyword name
+  function renderKeywordDetails(item) {
     if (item.alreadyInGoogle) return null
     const dest = item.destination || 'CAMPAIGN'
-    const isExpanded = expandedRows.has(item.keyword)
-    const adGroups = (adGroupsByCampaign || {})[item.campaignId] || []
+    const hasCampaignInfo = item.campaignName || item.adGroupName
+
     return (
-      <div className="dest-cell">
-        {/* Destination type + expand toggle on one row */}
-        <div className="dest-type-row">
-          <select
-            className="matchtype-select dest-type-select"
-            value={dest}
-            onChange={e => handleDestinationChange(item.keyword, e.target.value)}
-          >
-            {DESTINATION_OPTIONS.map(opt => (
-              <option key={opt.value} value={opt.value}>{opt.label}</option>
-            ))}
-          </select>
-          <button
-            className="dest-expand-btn"
-            onClick={() => toggleRowExpand(item.keyword)}
-            title={isExpanded ? 'Collapse' : 'Configure destination'}
-          >
-            <i className={`fas fa-chevron-${isExpanded ? 'up' : 'down'}`} />
-          </button>
-        </div>
+      <>
+        {hasCampaignInfo && (
+          <div className="kw-dest-result">
+            {item.campaignName && (
+              <span className="kw-dest-result-item">
+                <span className="kw-dest-result-label">Campaign:</span>
+                <span className="kw-dest-result-val">{item.campaignName}</span>
+              </span>
+            )}
+            {item.adGroupName && (
+              <>
+                <span className="kw-dest-result-sep">›</span>
+                <span className="kw-dest-result-item">
+                  <span className="kw-dest-result-label">Ad group:</span>
+                  <span className="kw-dest-result-val">{item.adGroupName}</span>
+                </span>
+              </>
+            )}
+          </div>
+        )}
 
-        {/* Cascade pickers — only shown when expanded */}
-        {isExpanded && (
-          <>
-            <div className="dest-cascade-row">
-              <span className="dest-cascade-label">Campaign</span>
-              <select
-                className="dest-cascade-select"
-                value={item.campaignId || ''}
-                onChange={e => {
-                  const c = campaigns.find(c => c.id === e.target.value)
-                  handleCampaignChange(item.keyword, c?.id || null, c?.name || null)
-                }}
-              >
-                <option value="">Select…</option>
-                {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-            </div>
-
-            {(dest === 'ADGROUP' || dest === 'NEGATIVE_LIST') && item.campaignId && (
+        {dest === 'NEGATIVE_LIST' && (
+          <div className="kw-list-row">
+            {createListCtx === item.keyword ? (
+              <div className="dest-cascade-row create-list-kw-row">
+                <input
+                  type="text"
+                  className="dest-cascade-input"
+                  placeholder="New list name…"
+                  value={newListName}
+                  onChange={e => setNewListName(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
+                  autoFocus
+                />
+                <button
+                  className="btn-create-list-confirm"
+                  disabled={!newListName.trim() || createListLoading}
+                  onClick={() => handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
+                  title="Create"
+                >
+                  {createListLoading ? '…' : '✓'}
+                </button>
+                <button className="btn-cancel-create" onClick={closeCreateList} title="Cancel">×</button>
+                {createListError && <span className="create-list-error-sm">{createListError}</span>}
+              </div>
+            ) : (
               <div className="dest-cascade-row">
-                <span className="dest-cascade-label">Ad group</span>
+                <span className="dest-cascade-label">List</span>
                 <select
                   className="dest-cascade-select"
-                  value={item.adGroupId || ''}
+                  value={item.sharedSetId || ''}
                   onChange={e => {
-                    const ag = adGroups.find(ag => ag.id === e.target.value)
-                    handleAdGroupChange(item.keyword, ag?.id || null, ag?.name || null)
+                    if (e.target.value === '__create__') {
+                      openCreateList(item.keyword)
+                    } else {
+                      handleKeywordSharedSetChange(item.keyword, e.target.value || null)
+                    }
                   }}
                 >
                   <option value="">Select…</option>
-                  {adGroups.map(ag => <option key={ag.id} value={ag.id}>{ag.name}</option>)}
+                  {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  <option value="__create__">+ Create new list</option>
                 </select>
               </div>
             )}
-
-            {dest === 'NEGATIVE_LIST' && item.adGroupId && (
-              <>
-                {createListCtx === item.keyword ? (
-                  <div className="dest-cascade-row create-list-kw-row">
-                    <input
-                      type="text"
-                      className="dest-cascade-input"
-                      placeholder="New list name…"
-                      value={newListName}
-                      onChange={e => setNewListName(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
-                      autoFocus
-                    />
-                    <button
-                      className="btn-create-list-confirm"
-                      disabled={!newListName.trim() || createListLoading}
-                      onClick={() => handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
-                      title="Create"
-                    >
-                      {createListLoading ? '…' : '✓'}
-                    </button>
-                    <button className="btn-cancel-create" onClick={closeCreateList} title="Cancel">×</button>
-                    {createListError && <span className="create-list-error-sm">{createListError}</span>}
-                  </div>
-                ) : (
-                  <div className="dest-cascade-row">
-                    <span className="dest-cascade-label">List</span>
-                    <select
-                      className="dest-cascade-select"
-                      value={item.sharedSetId || ''}
-                      onChange={e => handleKeywordSharedSetChange(item.keyword, e.target.value)}
-                    >
-                      <option value="">Select…</option>
-                      {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                    <button
-                      className="btn-create-list-sm"
-                      onClick={() => openCreateList(item.keyword)}
-                      title="Create new list"
-                    >+</button>
-                  </div>
-                )}
-              </>
-            )}
-          </>
+          </div>
         )}
-      </div>
+      </>
+    )
+  }
+
+  // Destination column — just the type dropdown, color-coded by level
+  function renderDestinationCell(item) {
+    if (item.alreadyInGoogle) return null
+    const dest = item.destination || 'CAMPAIGN'
+    return (
+      <select
+        className={`matchtype-select ${DEST_CLASS[dest] || ''}`}
+        value={dest}
+        onChange={e => handleDestinationChange(item.keyword, e.target.value)}
+      >
+        {DESTINATION_OPTIONS.map(opt => (
+          <option key={opt.value} value={opt.value}>{opt.label}</option>
+        ))}
+      </select>
     )
   }
 
@@ -523,110 +469,12 @@ export default function AIPanel({
           </a>
         </div>
 
-        {/* Bulk apply row — progressive cascade: Destination → Campaign → Ad Group → List | Match Type | Apply */}
+        {/* Bulk apply — two rows: Match Type and Destination */}
         <div className="pending-bulk-top">
-          <div className="bulk-col">
-            <label className="bulk-col-label">DESTINATION</label>
+          <div className="bulk-row">
+            <span className="bulk-col-label">MATCH TYPE</span>
             <select
-              className="matchtype-select"
-              value={bulkDestination}
-              onChange={e => handleBulkDestinationChange(e.target.value)}
-            >
-              {DESTINATION_OPTIONS.map(opt => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="bulk-col">
-            <label className="bulk-col-label">CAMPAIGN</label>
-            <select
-              className="matchtype-select"
-              value={bulkCampaignId || ''}
-              onChange={e => {
-                const c = campaigns.find(c => c.id === e.target.value)
-                setBulkCampaignId(c?.id || null)
-                setBulkCampaignName(c?.name || null)
-                setBulkAdGroupId(null)
-                setBulkAdGroupName(null)
-                setBulkSharedSetId(null)
-              }}
-            >
-              <option value="">Select campaign…</option>
-              {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
-          </div>
-
-          {(bulkDestination === 'ADGROUP' || bulkDestination === 'NEGATIVE_LIST') && bulkCampaignId && (
-            <div className="bulk-col">
-              <label className="bulk-col-label">AD GROUP</label>
-              <select
-                className="matchtype-select"
-                value={bulkAdGroupId || ''}
-                onChange={e => {
-                  const ags = (adGroupsByCampaign || {})[bulkCampaignId] || []
-                  const ag = ags.find(ag => ag.id === e.target.value)
-                  setBulkAdGroupId(ag?.id || null)
-                  setBulkAdGroupName(ag?.name || null)
-                  setBulkSharedSetId(null)
-                }}
-              >
-                <option value="">Select ad group…</option>
-                {((adGroupsByCampaign || {})[bulkCampaignId] || []).map(ag => (
-                  <option key={ag.id} value={ag.id}>{ag.name}</option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {bulkDestination === 'NEGATIVE_LIST' && bulkAdGroupId && (
-            <div className="bulk-col">
-              <label className="bulk-col-label">LIST</label>
-              {createListCtx === 'bulk' ? (
-                <div className="create-list-inline">
-                  <input
-                    type="text"
-                    className="form-control form-control-sm create-list-input"
-                    placeholder="New list name…"
-                    value={newListName}
-                    onChange={e => setNewListName(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleCreateList(s => setBulkSharedSetId(s.id))}
-                    autoFocus
-                  />
-                  <button
-                    className="btn btn-sm btn-primary"
-                    disabled={!newListName.trim() || createListLoading}
-                    onClick={() => handleCreateList(s => setBulkSharedSetId(s.id))}
-                  >
-                    {createListLoading ? 'Creating…' : 'Create'}
-                  </button>
-                  <button className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
-                    Cancel
-                  </button>
-                  {createListError && <span className="create-list-error">{createListError}</span>}
-                </div>
-              ) : (
-                <>
-                  <select
-                    className="matchtype-select"
-                    value={bulkSharedSetId || ''}
-                    onChange={e => setBulkSharedSetId(e.target.value || null)}
-                  >
-                    <option value="">Select list…</option>
-                    {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  </select>
-                  <button className="btn-create-list" onClick={() => openCreateList('bulk')}>
-                    + Create new list
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-
-          <div className="bulk-col">
-            <label className="bulk-col-label">MATCH TYPE</label>
-            <select
-              className="matchtype-select"
+              className="matchtype-select bulk-match-dest-select"
               value={bulkMatchType}
               onChange={e => setBulkMatchType(e.target.value)}
             >
@@ -634,16 +482,81 @@ export default function AIPanel({
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>
-          </div>
-
-          <div className="bulk-col bulk-col-btn">
             <button
+              type="button"
               className="btn btn-sm btn-primary"
-              onClick={handleApplyBulk}
+              onClick={handleApplyBulkMatchType}
               disabled={selectedCount === 0}
             >
               Apply to selected
             </button>
+            <span className="bulk-hint">Check rows below to apply</span>
+          </div>
+
+          <div className="bulk-row">
+            <span className="bulk-col-label">DESTINATION</span>
+            <div className="bulk-row-rest">
+              <select
+                className={`matchtype-select bulk-match-dest-select ${DEST_CLASS[bulkDestination] || ''}`}
+                value={bulkDestination}
+                onChange={e => handleBulkDestinationChange(e.target.value)}
+              >
+                {DESTINATION_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+
+              {bulkDestination === 'NEGATIVE_LIST' && (
+                createListCtx === 'bulk' ? (
+                  <div className="create-list-inline">
+                    <input
+                      type="text"
+                      className="form-control form-control-sm create-list-input"
+                      placeholder="New list name…"
+                      value={newListName}
+                      onChange={e => setNewListName(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && handleCreateList(s => setBulkSharedSetId(s.id))}
+                      autoFocus
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-primary"
+                      disabled={!newListName.trim() || createListLoading}
+                      onClick={() => handleCreateList(s => setBulkSharedSetId(s.id))}
+                    >
+                      {createListLoading ? 'Creating…' : 'Create'}
+                    </button>
+                    <button type="button" className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
+                      Cancel
+                    </button>
+                    {createListError && <span className="create-list-error">{createListError}</span>}
+                  </div>
+                ) : (
+                  <>
+                    <select
+                      className="matchtype-select bulk-list-select"
+                      value={bulkSharedSetId || ''}
+                      onChange={e => setBulkSharedSetId(e.target.value || null)}
+                    >
+                      <option value="">Select list…</option>
+                      {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                    <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
+                      + Create new list
+                    </button>
+                  </>
+                )
+              )}
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={handleApplyBulkDestination}
+              disabled={selectedCount === 0}
+            >
+              Apply to selected
+            </button>
+            <span className="bulk-hint">Check rows below to apply</span>
           </div>
         </div>
 
@@ -702,7 +615,7 @@ export default function AIPanel({
                           : <span className="source-badge source-manual">Manual</span>
                       }
                     </div>
-                    {renderDestinationResult(item)}
+                    {renderKeywordDetails(item)}
                   </td>
                   <td className="col-matchtype">
                     <select
@@ -711,9 +624,11 @@ export default function AIPanel({
                       disabled={item.alreadyInGoogle}
                       onChange={e => handleMatchTypeChange(item.keyword, e.target.value)}
                     >
-                      {MATCH_TYPE_OPTIONS.map(opt => (
-                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                      ))}
+                      {MATCH_TYPE_OPTIONS
+                        .filter(opt => !(opt.value === 'BROAD' && (item.destination === 'CAMPAIGN' || item.destination === 'ADGROUP')))
+                        .map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
                     </select>
                   </td>
                   <td className="col-destination">
@@ -759,6 +674,18 @@ export default function AIPanel({
                 onChange={e => setManualKeyword(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleAddManual(e)}
               />
+            </div>
+            <div className="manual-match-col">
+              <label className="manual-label">MATCH TYPE</label>
+              <select
+                className="matchtype-select"
+                value={manualMatchType}
+                onChange={e => setManualMatchType(e.target.value)}
+              >
+                {MATCH_TYPE_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
             </div>
             <div className="manual-add-col">
               <label className="manual-label">&nbsp;</label>
