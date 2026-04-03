@@ -170,8 +170,9 @@ app.get('/api/search-terms', async (req, res) => {
                 ad_group.name
             FROM search_term_view
             WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
+                AND metrics.clicks > 0
             ORDER BY metrics.clicks DESC
-            LIMIT 100
+            LIMIT 500
         `;
 
         const searchTermResponse = await customer.query(searchTermQuery);
@@ -314,6 +315,40 @@ app.get('/api/shared-sets', async (req, res) => {
     } catch (error) {
         console.error('Error fetching shared sets:', error);
         res.status(500).json({ error: 'Failed to fetch shared sets', details: error.message });
+    }
+});
+
+app.post('/api/create-shared-set', async (req, res) => {
+    const { clientId, name } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
+    if (!name || !name.trim()) return res.status(400).json({ error: 'List name is required' });
+
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+
+        const response = await customer.sharedSets.create([{
+            name: name.trim(),
+            type: 'NEGATIVE_KEYWORDS',
+        }]);
+
+        const resourceName = response.results?.[0]?.resource_name || response[0]?.resource_name;
+        if (!resourceName) throw new Error('No resource name returned from Google Ads');
+
+        const id = resourceName.split('/').pop();
+
+        console.log(`Created shared set: ${name.trim()} (id: ${id}) for client ${clientId}`);
+        res.json({
+            success: true,
+            sharedSet: { id: String(id), name: name.trim(), resourceName, memberCount: 0 }
+        });
+    } catch (err) {
+        console.error('Error creating shared set:', err.message);
+        const details = err.errors?.[0]?.message || err.message || 'Unknown error';
+        res.status(500).json({ error: 'Failed to create shared set', details });
     }
 });
 

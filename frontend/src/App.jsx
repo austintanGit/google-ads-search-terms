@@ -49,12 +49,14 @@ function NegativeKeywordsPage({
   pendingNegatives,
   setPendingNegatives,
   sharedSets,
+  setSharedSets,
   selectedSharedSetId,
   setSelectedSharedSetId,
   campaigns,
   adGroupsByCampaign,
   lastScannedAt,
   onRescan,
+  onCreateSharedSet,
   onAddManualNegative,
   onRemoveNegative,
   onSubmitNegatives,
@@ -88,6 +90,9 @@ function NegativeKeywordsPage({
                     : null
                 }
                 onChange={opt => onClientChange(opt ? opt.value : '')}
+                onKeyDown={e => {
+                  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.stopPropagation()
+                }}
                 placeholder="Select a client"
                 isClearable
                 isSearchable
@@ -160,6 +165,7 @@ function NegativeKeywordsPage({
           adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={onRescan}
+          onCreateSharedSet={onCreateSharedSet}
           onAddManualNegative={onAddManualNegative}
           onRemoveNegative={onRemoveNegative}
           onSubmitNegatives={onSubmitNegatives}
@@ -406,35 +412,34 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ searchTerms: terms, websiteUrl: urlToUse.trim() }),
           })
-          if (r.ok) {
-            const result = await r.json()
-            const googleNegLower = new Set(googleNegatives.map(k => k.toLowerCase()))
-            const aiKeywords = result.negativeKeywords || []
-
-            // Hard filter
-            const termsLower = terms.map(st => st.searchTerm.toLowerCase())
-            const filtered = aiKeywords.filter(kw => {
-              const kwLower = kw.toLowerCase().trim()
-              const escaped = kwLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-              const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i')
-              return termsLower.some(t => re.test(t))
-            })
-
-            setPendingNegatives(prev => {
-              const existingKws = new Set(prev.map(i => i.keyword.toLowerCase()))
-              const newItems = filtered
-                .filter(kw => !existingKws.has(kw.toLowerCase()))
-                .map(kw => {
-                  const inGoogle = googleNegLower.has(kw.toLowerCase())
-                  return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
-                })
-              return [...prev, ...newItems]
-            })
-            setAiStats(result.summary
-              ? { ...result.summary, explanation: result.explanation }
-              : {})
-            setLastScannedAt(new Date())
+          if (!r.ok) {
+            const d = await r.json()
+            throw new Error(d.error || 'AI analysis failed')
           }
+          const result = await r.json()
+          const googleNegLower = new Set(googleNegatives.map(k => k.toLowerCase()))
+          const aiKeywords = result.negativeKeywords || []
+          const trueNewKeywords = aiKeywords.filter(kw => !googleNegLower.has(kw.toLowerCase()))
+
+          setPendingNegatives(prev => {
+            const existingKws = new Set(prev.map(i => i.keyword.toLowerCase()))
+            const newItems = aiKeywords
+              .filter(kw => !existingKws.has(kw.toLowerCase()))
+              .map(kw => {
+                const inGoogle = googleNegLower.has(kw.toLowerCase())
+                return { keyword: kw, matchType: 'EXACT', source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination: 'CAMPAIGN', sharedSetId: null }
+              })
+            return [...prev, ...newItems]
+          })
+          setAiStats(result.summary ? {
+            ...result.summary,
+            negativeCount: trueNewKeywords.length,
+            qualityPercentage: result.summary.totalSearchTerms > 0
+              ? Math.round(((result.summary.totalSearchTerms - trueNewKeywords.length) / result.summary.totalSearchTerms) * 100)
+              : 100,
+            explanation: result.explanation,
+          } : {})
+          setLastScannedAt(new Date())
         } catch (err) {
           console.error('Auto-scan failed:', err.message)
         } finally {
@@ -516,6 +521,8 @@ export default function App() {
     const googleNegLower = new Set(existingNegatives.map(k => k.toLowerCase()))
     const aiKeywords = result.negativeKeywords || []
 
+    const trueNewKeywords = aiKeywords.filter(kw => !googleNegLower.has(kw.toLowerCase()))
+
     setPendingNegatives(prev => {
       const existingKws = new Set(prev.map(item => item.keyword.toLowerCase()))
       const newItems = aiKeywords
@@ -527,10 +534,29 @@ export default function App() {
       return [...prev, ...newItems]
     })
 
-    setAiStats(result.summary
-      ? { ...result.summary, explanation: result.explanation }
-      : {})
+    setAiStats(result.summary ? {
+      ...result.summary,
+      negativeCount: trueNewKeywords.length,
+      qualityPercentage: result.summary.totalSearchTerms > 0
+        ? Math.round(((result.summary.totalSearchTerms - trueNewKeywords.length) / result.summary.totalSearchTerms) * 100)
+        : 100,
+      explanation: result.explanation,
+    } : {})
   }, [existingNegatives])
+
+  async function handleCreateSharedSet(name) {
+    if (!currentClientId) throw new Error('No client selected')
+    const r = await fetch('/api/create-shared-set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: currentClientId, name }),
+    })
+    const d = await r.json()
+    if (!r.ok) throw new Error(d.details || d.error || 'Failed to create list')
+    const newSet = d.sharedSet
+    setSharedSets(prev => [...prev, newSet].sort((a, b) => a.name.localeCompare(b.name)))
+    return newSet
+  }
 
   // Called by AIPanel Re-scan button (or Scan page button)
   async function handleRescan(specificUrl) {
@@ -748,12 +774,14 @@ export default function App() {
           pendingNegatives={pendingNegatives}
           setPendingNegatives={setPendingNegatives}
           sharedSets={sharedSets}
+          setSharedSets={setSharedSets}
           selectedSharedSetId={selectedSharedSetId}
           setSelectedSharedSetId={setSelectedSharedSetId}
           campaigns={campaigns}
           adGroupsByCampaign={adGroupsByCampaign}
           lastScannedAt={lastScannedAt}
           onRescan={handleRescan}
+          onCreateSharedSet={handleCreateSharedSet}
           onAddManualNegative={handleAddManualNegative}
           onRemoveNegative={handleRemoveNegativeFromRow}
           onSubmitNegatives={handleSubmitNegatives}

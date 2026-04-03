@@ -729,6 +729,134 @@
 }
 
 /* ============================================================
+   Create New List — Inline UI
+   ============================================================ */
+
+/* Bulk area — "+ Create new list" text link below the select */
+.btn-create-list {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 3px;
+  font-size: 0.75rem;
+  color: #6366f1;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.btn-create-list:hover {
+  color: #4338ca;
+  text-decoration: underline;
+}
+
+/* Bulk inline create row */
+.create-list-inline {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.create-list-input {
+  min-width: 130px;
+  flex: 1;
+}
+
+.create-list-error {
+  font-size: 0.72rem;
+  color: #dc2626;
+  width: 100%;
+  margin-top: 2px;
+}
+
+/* Per-keyword — small "+" button inline with the cascade row */
+.btn-create-list-sm {
+  background: none;
+  border: 1px solid #c7d2fe;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.75rem;
+  color: #6366f1;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.btn-create-list-sm:hover {
+  background: #ede9fe;
+  border-color: #a5b4fc;
+}
+
+/* Per-keyword inline create row */
+.create-list-kw-row {
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+.dest-cascade-input {
+  font-size: 0.78rem;
+  padding: 2px 5px;
+  border: 1px solid #6366f1;
+  border-radius: 4px;
+  background: white;
+  flex: 1;
+  min-width: 0;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.12);
+}
+
+.btn-create-list-confirm {
+  background: #6366f1;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: white;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.btn-create-list-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-create-list-confirm:not(:disabled):hover {
+  background: #4338ca;
+}
+
+.btn-cancel-create {
+  background: none;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.82rem;
+  color: #6b7280;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.btn-cancel-create:hover {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.create-list-error-sm {
+  font-size: 0.68rem;
+  color: #dc2626;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+
+/* ============================================================
    Submission History
    ============================================================ */
 .submission-history-wrap {
@@ -837,7 +965,7 @@
   align-items: flex-end;
   gap: 16px;
   padding: 10px 16px;
-  background: #f9fafb;
+  background: #b9dcff;
   border-top: 1px solid #e5e7eb;
   border-bottom: 1px solid #e5e7eb;
   flex-wrap: wrap;

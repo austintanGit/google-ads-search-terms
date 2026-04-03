@@ -33,6 +33,7 @@ export default function AIPanel({
   adGroupsByCampaign,
   lastScannedAt,
   onRescan,
+  onCreateSharedSet,
   onAddManualNegative,
   onRemoveNegative,
   onSubmitNegatives,
@@ -55,6 +56,40 @@ export default function AIPanel({
   const [specificPageUrl, setSpecificPageUrl] = useState('')
   const [showManualAdd, setShowManualAdd] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+
+  // Create-list inline state — ctx is 'bulk' | keyword-string | null
+  const [createListCtx, setCreateListCtx] = useState(null)
+  const [newListName, setNewListName] = useState('')
+  const [createListLoading, setCreateListLoading] = useState(false)
+  const [createListError, setCreateListError] = useState('')
+
+  function openCreateList(ctx) {
+    setCreateListCtx(ctx)
+    setNewListName('')
+    setCreateListError('')
+  }
+
+  function closeCreateList() {
+    setCreateListCtx(null)
+    setNewListName('')
+    setCreateListError('')
+  }
+
+  async function handleCreateList(onSuccess) {
+    const name = newListName.trim()
+    if (!name) return
+    setCreateListLoading(true)
+    setCreateListError('')
+    try {
+      const newSet = await onCreateSharedSet(name)
+      onSuccess(newSet)
+      closeCreateList()
+    } catch (err) {
+      setCreateListError(err.message || 'Failed to create list')
+    } finally {
+      setCreateListLoading(false)
+    }
+  }
 
   const selectedCount = pendingNegatives.filter(item => item.selected && !item.alreadyInGoogle).length
 
@@ -301,17 +336,48 @@ export default function AIPanel({
             )}
 
             {dest === 'NEGATIVE_LIST' && item.adGroupId && (
-              <div className="dest-cascade-row">
-                <span className="dest-cascade-label">List</span>
-                <select
-                  className="dest-cascade-select"
-                  value={item.sharedSetId || ''}
-                  onChange={e => handleKeywordSharedSetChange(item.keyword, e.target.value)}
-                >
-                  <option value="">Select…</option>
-                  {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
-              </div>
+              <>
+                {createListCtx === item.keyword ? (
+                  <div className="dest-cascade-row create-list-kw-row">
+                    <input
+                      type="text"
+                      className="dest-cascade-input"
+                      placeholder="New list name…"
+                      value={newListName}
+                      onChange={e => setNewListName(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
+                      autoFocus
+                    />
+                    <button
+                      className="btn-create-list-confirm"
+                      disabled={!newListName.trim() || createListLoading}
+                      onClick={() => handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
+                      title="Create"
+                    >
+                      {createListLoading ? '…' : '✓'}
+                    </button>
+                    <button className="btn-cancel-create" onClick={closeCreateList} title="Cancel">×</button>
+                    {createListError && <span className="create-list-error-sm">{createListError}</span>}
+                  </div>
+                ) : (
+                  <div className="dest-cascade-row">
+                    <span className="dest-cascade-label">List</span>
+                    <select
+                      className="dest-cascade-select"
+                      value={item.sharedSetId || ''}
+                      onChange={e => handleKeywordSharedSetChange(item.keyword, e.target.value)}
+                    >
+                      <option value="">Select…</option>
+                      {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                    <button
+                      className="btn-create-list-sm"
+                      onClick={() => openCreateList(item.keyword)}
+                      title="Create new list"
+                    >+</button>
+                  </div>
+                )}
+              </>
             )}
           </>
         )}
@@ -516,14 +582,44 @@ export default function AIPanel({
           {bulkDestination === 'NEGATIVE_LIST' && bulkAdGroupId && (
             <div className="bulk-col">
               <label className="bulk-col-label">LIST</label>
-              <select
-                className="matchtype-select"
-                value={bulkSharedSetId || ''}
-                onChange={e => setBulkSharedSetId(e.target.value || null)}
-              >
-                <option value="">Select list…</option>
-                {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
+              {createListCtx === 'bulk' ? (
+                <div className="create-list-inline">
+                  <input
+                    type="text"
+                    className="form-control form-control-sm create-list-input"
+                    placeholder="New list name…"
+                    value={newListName}
+                    onChange={e => setNewListName(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleCreateList(s => setBulkSharedSetId(s.id))}
+                    autoFocus
+                  />
+                  <button
+                    className="btn btn-sm btn-primary"
+                    disabled={!newListName.trim() || createListLoading}
+                    onClick={() => handleCreateList(s => setBulkSharedSetId(s.id))}
+                  >
+                    {createListLoading ? 'Creating…' : 'Create'}
+                  </button>
+                  <button className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
+                    Cancel
+                  </button>
+                  {createListError && <span className="create-list-error">{createListError}</span>}
+                </div>
+              ) : (
+                <>
+                  <select
+                    className="matchtype-select"
+                    value={bulkSharedSetId || ''}
+                    onChange={e => setBulkSharedSetId(e.target.value || null)}
+                  >
+                    <option value="">Select list…</option>
+                    {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                  <button className="btn-create-list" onClick={() => openCreateList('bulk')}>
+                    + Create new list
+                  </button>
+                </>
+              )}
             </div>
           )}
 
