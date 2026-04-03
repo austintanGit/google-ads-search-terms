@@ -6,6 +6,28 @@ const MATCH_TYPE_OPTIONS = [
   { value: 'BROAD', label: 'Broad' },
 ]
 
+// Helper function to get available match types for a keyword
+function getAvailableMatchTypes(keyword, existingNegatives) {
+  const existingMatchTypes = new Set()
+  
+  existingNegatives.forEach(existing => {
+    let existingKeyword, matchType
+    if (typeof existing === 'string') {
+      existingKeyword = existing
+      matchType = 'EXACT'
+    } else {
+      existingKeyword = existing.keyword
+      matchType = existing.matchType || 'EXACT'
+    }
+    
+    if (existingKeyword.toLowerCase() === keyword.toLowerCase()) {
+      existingMatchTypes.add(matchType)
+    }
+  })
+  
+  return MATCH_TYPE_OPTIONS.filter(option => !existingMatchTypes.has(option.value))
+}
+
 const DESTINATION_OPTIONS = [
   { value: 'CAMPAIGN', label: 'Campaign level' },
   { value: 'ADGROUP', label: 'Ad group level' },
@@ -46,6 +68,7 @@ export default function AIPanel({
   submitError,
   setSubmitError,
   submissionHistory,
+  existingNegatives,
 }) {
   const [bulkMatchType, setBulkMatchType] = useState('EXACT')
   const [bulkDestination, setBulkDestination] = useState('CAMPAIGN')
@@ -410,12 +433,14 @@ export default function AIPanel({
               </div>
               <div className="ai-stat-label">Quality keyword %</div>
             </div>
-            {aiStats.explanation && (
-              <div className="ai-explanation">
-                <i className="fas fa-robot me-1 text-primary" />
-                <strong>AI analysis:</strong> {aiStats.explanation}
-              </div>
-            )}
+          </div>
+        )}
+
+        {/* AI Analysis explanation row */}
+        {aiStats && aiStats.explanation && (
+          <div className="ai-explanation">
+            <i className="fas fa-robot me-1 text-primary" />
+            <strong>AI analysis:</strong> {aiStats.explanation}
           </div>
         )}
       </div>
@@ -469,35 +494,30 @@ export default function AIPanel({
           </a>
         </div>
 
-        {/* Bulk apply — two rows: Match Type and Destination */}
+        {/* Bulk apply — multiple rows */}
         <div className="pending-bulk-top">
-          <div className="bulk-row">
-            <span className="bulk-col-label">MATCH TYPE</span>
-            <select
-              className="matchtype-select bulk-match-dest-select"
-              value={bulkMatchType}
-              onChange={e => setBulkMatchType(e.target.value)}
-            >
-              {MATCH_TYPE_OPTIONS.map(opt => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
-            <button
-              type="button"
-              className="btn btn-sm btn-primary"
-              onClick={handleApplyBulkMatchType}
-              disabled={selectedCount === 0}
-            >
-              Apply to selected
-            </button>
-            <span className="bulk-hint">Check rows below to apply</span>
+          <div className="bulk-header-row">
+            <span className="bulk-header-label">Set all selected to:</span>
           </div>
-
-          <div className="bulk-row">
-            <span className="bulk-col-label">DESTINATION</span>
-            <div className="bulk-row-rest">
+          
+          <div className="bulk-settings-row">
+            <div className="bulk-setting-group">
+              <label className="bulk-setting-label">Match Type</label>
               <select
-                className={`matchtype-select bulk-match-dest-select ${DEST_CLASS[bulkDestination] || ''}`}
+                className="matchtype-select"
+                value={bulkMatchType}
+                onChange={e => setBulkMatchType(e.target.value)}
+              >
+                {MATCH_TYPE_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="bulk-setting-group">
+              <label className="bulk-setting-label">Destination</label>
+              <select
+                className={`matchtype-select ${DEST_CLASS[bulkDestination] || ''}`}
                 value={bulkDestination}
                 onChange={e => handleBulkDestinationChange(e.target.value)}
               >
@@ -505,9 +525,12 @@ export default function AIPanel({
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
+            </div>
 
-              {bulkDestination === 'NEGATIVE_LIST' && (
-                createListCtx === 'bulk' ? (
+            {bulkDestination === 'NEGATIVE_LIST' && (
+              <div className="bulk-setting-group">
+                <label className="bulk-setting-label">Negative keyword list</label>
+                {createListCtx === 'bulk' ? (
                   <div className="create-list-inline">
                     <input
                       type="text"
@@ -532,9 +555,9 @@ export default function AIPanel({
                     {createListError && <span className="create-list-error">{createListError}</span>}
                   </div>
                 ) : (
-                  <>
+                  <div className="bulk-list-controls">
                     <select
-                      className="matchtype-select bulk-list-select"
+                      className="matchtype-select"
                       value={bulkSharedSetId || ''}
                       onChange={e => setBulkSharedSetId(e.target.value || null)}
                     >
@@ -544,19 +567,24 @@ export default function AIPanel({
                     <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
                       + Create new list
                     </button>
-                  </>
-                )
-              )}
-            </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="bulk-apply-row">
             <button
               type="button"
-              className="btn btn-sm btn-primary"
-              onClick={handleApplyBulkDestination}
+              className="btn btn-sm btn-primary apply-to-selected-btn"
+              onClick={() => {
+                handleApplyBulkMatchType()
+                handleApplyBulkDestination()
+              }}
               disabled={selectedCount === 0}
             >
               Apply to selected
             </button>
-            <span className="bulk-hint">Check rows below to apply</span>
           </div>
         </div>
 

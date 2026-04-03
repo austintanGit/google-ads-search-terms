@@ -180,6 +180,8 @@ app.get('/api/search-terms', async (req, res) => {
         const searchTermQuery = `
             SELECT 
                 search_term_view.search_term,
+                segments.keyword.info.text,
+                segments.keyword.info.match_type,
                 metrics.clicks,
                 metrics.impressions,
                 metrics.cost_micros,
@@ -248,6 +250,7 @@ app.get('/api/negative-keywords', async (req, res) => {
         const negativeKeywordsQuery = `
             SELECT 
                 shared_criterion.keyword.text,
+                shared_criterion.keyword.match_type,
                 shared_set.name,
                 shared_set.status,
                 shared_set.type,
@@ -260,9 +263,24 @@ app.get('/api/negative-keywords', async (req, res) => {
 
         const response = await customer.query(negativeKeywordsQuery);
         
-        const negativeKeywords = response.map(row => 
-            row.shared_criterion?.keyword?.text || ''
-        ).filter(keyword => keyword !== '');
+        const negativeKeywords = response
+            .filter(row => row.shared_criterion?.keyword?.text)
+            .map(row => {
+                // Convert numeric match type to text
+                const numericMatchType = row.shared_criterion.keyword.match_type;
+                let matchType = 'EXACT'; // default
+                
+                // Google Ads API returns numeric values for match types
+                if (numericMatchType === 2) matchType = 'EXACT';
+                else if (numericMatchType === 3) matchType = 'PHRASE'; 
+                else if (numericMatchType === 4) matchType = 'BROAD';
+                else if (typeof numericMatchType === 'string') matchType = numericMatchType;
+                
+                return {
+                    keyword: row.shared_criterion.keyword.text,
+                    matchType: matchType
+                };
+            });
 
         const transformedData = { 
             "Global Negative Keywords": negativeKeywords

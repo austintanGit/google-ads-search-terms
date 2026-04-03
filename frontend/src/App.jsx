@@ -78,9 +78,9 @@ function NegativeKeywordsPage({
   currentClientId,
   onClientChange,
   startDate,
-  setStartDate,
   endDate,
-  setEndDate,
+  onStartDateChange,
+  onEndDateChange,
   today,
   onDateRangeSubmit,
   websiteUrl,
@@ -108,6 +108,13 @@ function NegativeKeywordsPage({
   rowNegatives,
   error,
   loading,
+  showUrlPopup,
+  tempWebsiteUrl,
+  setTempWebsiteUrl,
+  urlPopupLoading,
+  handleSaveWebsiteUrl,
+  handleSkipWebsiteUrl,
+  existingNegatives,
 }) {
   return (
     <>
@@ -163,7 +170,7 @@ function NegativeKeywordsPage({
                   className="form-control form-control-sm"
                   value={startDate}
                   max={endDate || today}
-                  onChange={e => setStartDate(e.target.value)}
+                  onChange={e => onStartDateChange(e.target.value)}
                   style={{ width: 130 }}
                 />
                 <span className="date-sep">to</span>
@@ -173,7 +180,7 @@ function NegativeKeywordsPage({
                   value={endDate}
                   min={startDate}
                   max={today}
-                  onChange={e => setEndDate(e.target.value)}
+                  onChange={e => onEndDateChange(e.target.value)}
                   style={{ width: 130 }}
                 />
                 <button
@@ -212,6 +219,7 @@ function NegativeKeywordsPage({
           submitError={submitError}
           setSubmitError={setSubmitError}
           submissionHistory={submissionHistory}
+          existingNegatives={existingNegatives}
         />
 
         {error && <div className="alert alert-danger mx-0 mb-3">{error}</div>}
@@ -239,10 +247,56 @@ function NegativeKeywordsPage({
               rowNegatives={rowNegatives}
               onAddNegative={onAddManualNegative}
               onRemoveNegative={onRemoveNegative}
+              existingNegatives={existingNegatives}
             />
           </>
         )}
       </div>
+
+      {/* Website URL Popup */}
+      {showUrlPopup && (
+        <div className="website-url-modal-backdrop">
+          <div className="website-url-modal-box">
+            <div className="website-url-modal-header">
+              <h3 className="website-url-modal-title">Website URL Required</h3>
+            </div>
+            <div className="website-url-modal-body">
+              <p>
+                We couldn't automatically detect your website URL from Google Ads. 
+                To analyze your search terms with AI, please enter your website URL below:
+              </p>
+              <div className="website-url-input-group">
+                <label className="website-url-label">Website URL</label>
+                <input
+                  type="url"
+                  className="form-control"
+                  placeholder="https://yourwebsite.com"
+                  value={tempWebsiteUrl}
+                  onChange={e => setTempWebsiteUrl(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleSaveWebsiteUrl()}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div className="website-url-modal-footer">
+              <button
+                className="btn btn-outline-secondary"
+                onClick={handleSkipWebsiteUrl}
+                disabled={urlPopupLoading}
+              >
+                Skip for now
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={handleSaveWebsiteUrl}
+                disabled={!tempWebsiteUrl.trim() || urlPopupLoading}
+              >
+                {urlPopupLoading ? 'Saving...' : 'Save & Scan'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   )
 }
@@ -285,6 +339,12 @@ export default function App() {
   const [error, setError] = useState('')
   const [submitSuccess, setSubmitSuccess] = useState('')
   const [submitError, setSubmitError] = useState('')
+  
+  // Website URL popup
+  const [showUrlPopup, setShowUrlPopup] = useState(false)
+  const [pendingClientId, setPendingClientId] = useState('')
+  const [tempWebsiteUrl, setTempWebsiteUrl] = useState('')
+  const [urlPopupLoading, setUrlPopupLoading] = useState(false)
 
   // Campaigns derived from the already-client-scoped search terms data (guaranteed client-specific)
   const campaigns = useMemo(() => {
@@ -319,24 +379,39 @@ export default function App() {
   // rowNegatives: Map<searchTerm, Set<prefixed-phrase>>
   const rowNegatives = useMemo(() => {
     const map = new Map()
-    const googleLower = existingNegatives.map(k => k.toLowerCase())
 
     searchTerms.forEach(term => {
       const termStr = term.searchTerm
       const negatives = new Set()
 
-      googleLower.forEach(neg => {
-        if (termStr.toLowerCase().includes(neg)) {
-          negatives.add('google:' + neg)
+      // Check existing Google negatives
+      existingNegatives.forEach(existing => {
+        let keyword, matchType
+        if (typeof existing === 'string') {
+          // Old format - just keyword text
+          keyword = existing.toLowerCase()
+          matchType = 'EXACT'
+        } else {
+          // New format - object with keyword and matchType
+          keyword = existing.keyword.toLowerCase()
+          matchType = convertMatchTypeToText(existing.matchType || 'EXACT')
+        }
+        
+        if (termStr.toLowerCase().includes(keyword)) {
+          // Use the original keyword case from existing negatives, not the lowercase version
+          const originalKeyword = typeof existing === 'string' ? existing : existing.keyword
+          negatives.add(`google:${originalKeyword} (${matchType})`)
         }
       })
 
+      // Check pending negatives
       pendingNegatives.forEach(item => {
         const kwLower = item.keyword.toLowerCase()
         const escaped = escapeRegex(kwLower)
         const regex = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i')
         if (regex.test(termStr)) {
-          negatives.add(item.source + ':' + item.keyword)
+          const matchType = convertMatchTypeToText(item.matchType)
+          negatives.add(`${item.source}:${item.keyword} (${matchType})`)
         }
       })
 
@@ -387,7 +462,9 @@ export default function App() {
       if (googleNegs !== undefined) setExistingNegatives(googleNegs)
       if (dbNegs !== undefined) {
         setDbSavedNegatives(dbNegs)
-        const googleNegLower = new Set((googleNegs || existingNegatives).map(k => k.toLowerCase()))
+        const googleNegLower = new Set((googleNegs || existingNegatives).map(k => 
+          typeof k === 'string' ? k.toLowerCase() : k.keyword.toLowerCase()
+        ))
         const pendingFromDb = dbNegs
           .filter(kw => !googleNegLower.has(kw.toLowerCase()))
           .map(kw => ({ keyword: kw, matchType: 'EXACT', source: 'manual', selected: true, destination: 'CAMPAIGN', sharedSetId: null }))
@@ -425,6 +502,15 @@ export default function App() {
       setSharedSets(sets)
       if (sets.length > 0) setSelectedSharedSetId(sets[0].id)
 
+      // Debug what format we're getting
+      if (googleNegatives.length > 0) {
+        console.log('Google negatives format:', googleNegatives.slice(0, 3))
+        console.log('First item type:', typeof googleNegatives[0])
+        if (typeof googleNegatives[0] === 'object') {
+          console.log('First item structure:', googleNegatives[0])
+        }
+      }
+
       // Determine website URL — await detection so we have it before scanning
       let urlToUse = settingsRes.websiteUrl || ''
       if (urlToUse) {
@@ -441,6 +527,13 @@ export default function App() {
 
       const terms = await loadSearchTerms(clientId, startDate, endDate, googleNegatives, savedNegatives)
 
+      // If no website URL found and we have search terms, show popup to ask user
+      if (!urlToUse && terms && terms.length > 0) {
+        setPendingClientId(clientId)
+        setShowUrlPopup(true)
+        return
+      }
+
       // Auto-scan immediately after loading — use local vars to avoid stale closure
       if (urlToUse && terms && terms.length > 0) {
         setAiLoading(true)
@@ -455,17 +548,26 @@ export default function App() {
             throw new Error(d.error || 'AI analysis failed')
           }
           const result = await r.json()
-          const googleNegLower = new Set(googleNegatives.map(k => k.toLowerCase()))
           const aiKeywords = result.negativeKeywords || []
-          const trueNewKeywords = aiKeywords.filter(kw => !googleNegLower.has(kw.toLowerCase()))
+          
+          // Only count truly new keywords (not existing in any match type)
+          const trueNewKeywords = aiKeywords.filter(kw => {
+            return !existingNegatives.some(existing => {
+              const existingKeyword = typeof existing === 'string' ? existing : existing.keyword
+              return existingKeyword.toLowerCase() === kw.toLowerCase()
+            })
+          })
 
           setPendingNegatives(prev => {
-            const existingKws = new Set(prev.map(i => i.keyword.toLowerCase()))
+            const existingKws = new Set(prev.map(i => `${i.keyword.toLowerCase()}:${i.matchType}`))
             const newItems = aiKeywords
-              .filter(kw => !existingKws.has(kw.toLowerCase()))
+              .filter(kw => {
+                const { matchType } = inferKeywordDestination(kw, terms)
+                return !existingKws.has(`${kw.toLowerCase()}:${matchType}`)
+              })
               .map(kw => {
-                const inGoogle = googleNegLower.has(kw.toLowerCase())
                 const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, terms)
+                const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, googleNegatives)
                 return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
               })
             return [...prev, ...newItems]
@@ -488,6 +590,69 @@ export default function App() {
     } catch (err) {
       setError('Error loading client data: ' + err.message)
     }
+  }
+
+  // Helper function to convert numeric match types to text
+  function convertMatchTypeToText(matchType) {
+    if (typeof matchType === 'string') return matchType;
+    if (matchType === 2) return 'EXACT';
+    if (matchType === 3) return 'PHRASE'; 
+    if (matchType === 4) return 'BROAD';
+    return 'EXACT'; // default
+  }
+
+  // Helper function to check if a keyword + match type combination already exists in Google
+  function isKeywordMatchTypeInGoogle(keyword, matchType, googleNegatives) {
+    return googleNegatives.some(existing => {
+      // Handle both old format (strings) and new format (objects with keyword/matchType)
+      if (typeof existing === 'string') {
+        return existing.toLowerCase() === keyword.toLowerCase()
+      } else {
+        return existing.keyword.toLowerCase() === keyword.toLowerCase() && 
+               existing.matchType === matchType
+      }
+    })
+  }
+
+  // Debug function to see what format the data is in
+  function debugExistingNegatives() {
+    console.log('existingNegatives format:', existingNegatives.slice(0, 3))
+    console.log('Sample item type:', typeof existingNegatives[0])
+    if (existingNegatives[0] && typeof existingNegatives[0] === 'object') {
+      console.log('Sample item structure:', existingNegatives[0])
+    }
+  }
+
+  // Helper functions for full month date ranges
+  function getFullMonth(dateStr) {
+    // Parse the date string
+    const [year, month, day] = dateStr.split('-').map(Number)
+    
+    // Get first day of the month
+    const startDate = `${year}-${String(month).padStart(2, '0')}-01`
+    
+    // Get last day of the month
+    // new Date(year, month, 0) gives last day of the previous month
+    // so we need new Date(year, month + 1, 0) to get last day of current month
+    const lastDay = new Date(year, month + 1, 0).getDate()
+    const endDate = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
+    
+    return {
+      startDate,
+      endDate
+    }
+  }
+
+  function handleStartDateChange(newStartDate) {
+    const { startDate: fullStartDate, endDate: fullEndDate } = getFullMonth(newStartDate)
+    setStartDate(fullStartDate)
+    setEndDate(fullEndDate)
+  }
+
+  function handleEndDateChange(newEndDate) {
+    const { startDate: fullStartDate, endDate: fullEndDate } = getFullMonth(newEndDate)
+    setStartDate(fullStartDate)
+    setEndDate(fullEndDate)
   }
 
   async function handleDateRangeSubmit(e) {
@@ -523,10 +688,6 @@ export default function App() {
   // Called when user text-selects a phrase, clicks hover-flag button, or manually adds a keyword.
   // When no campaign context is provided (manual text input), auto-infers from search terms.
   const handleAddManualNegative = useCallback((keyword, matchType = null, campaignId = null, campaignName = null, adGroupId = null, adGroupName = null, destination = null) => {
-    const kwLower = keyword.toLowerCase()
-    const googleNegLower = new Set(existingNegatives.map(k => k.toLowerCase()))
-    if (googleNegLower.has(kwLower)) return
-
     // Infer destination/campaign from search terms when no explicit context; match type from word count unless caller passes one (e.g. manual add)
     const inferred = inferKeywordDestination(keyword, searchTerms)
     let finalCampaignId = campaignId || inferred.campaignId
@@ -539,7 +700,12 @@ export default function App() {
       finalMatchType = 'EXACT'
     }
 
-    if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(kwLower)) {
+    // Check if this specific keyword + match type combination already exists in Google
+    if (isKeywordMatchTypeInGoogle(keyword, finalMatchType, existingNegatives)) {
+      return // Don't add if exact combination already exists
+    }
+
+    if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(keyword.toLowerCase())) {
       setDbSavedNegatives(prev => [...prev, keyword])
       fetch('/api/client-saved-negatives', {
         method: 'POST',
@@ -549,7 +715,8 @@ export default function App() {
     }
 
     setPendingNegatives(prev => {
-      if (prev.some(item => item.keyword.toLowerCase() === kwLower)) return prev
+      // Check if this exact keyword + match type combination already exists in pending
+      if (prev.some(item => item.keyword.toLowerCase() === keyword.toLowerCase() && item.matchType === finalMatchType)) return prev
       return [...prev, { keyword, matchType: finalMatchType, source: 'manual', selected: true, destination: finalDestination, sharedSetId: null, campaignId: finalCampaignId, campaignName: finalCampaignName, adGroupId: finalAdGroupId, adGroupName: finalAdGroupName }]
     })
     setAiStats(prev => prev || {})
@@ -558,6 +725,7 @@ export default function App() {
 
   const handleRemoveNegativeFromRow = useCallback((keyword) => {
     const kwLower = keyword.toLowerCase()
+    
     if (currentClientId && dbSavedNegatives.map(k => k.toLowerCase()).includes(kwLower)) {
       setDbSavedNegatives(prev => prev.filter(k => k.toLowerCase() !== kwLower))
       fetch('/api/client-saved-negatives', {
@@ -566,22 +734,34 @@ export default function App() {
         body: JSON.stringify({ clientId: currentClientId, keyword }),
       }).catch(console.error)
     }
-    setPendingNegatives(prev => prev.filter(item => item.keyword.toLowerCase() !== kwLower))
+    
+    setPendingNegatives(prev => {
+      const filtered = prev.filter(item => item.keyword.toLowerCase() !== kwLower);
+      return filtered;
+    });
   }, [currentClientId, dbSavedNegatives])
 
   const handleAiResults = useCallback((result) => {
-    const googleNegLower = new Set(existingNegatives.map(k => k.toLowerCase()))
     const aiKeywords = result.negativeKeywords || []
 
-    const trueNewKeywords = aiKeywords.filter(kw => !googleNegLower.has(kw.toLowerCase()))
+    // Only count truly new keywords (not existing in any match type)
+    const trueNewKeywords = aiKeywords.filter(kw => {
+      return !existingNegatives.some(existing => {
+        const existingKeyword = typeof existing === 'string' ? existing : existing.keyword
+        return existingKeyword.toLowerCase() === kw.toLowerCase()
+      })
+    })
 
     setPendingNegatives(prev => {
-      const existingKws = new Set(prev.map(item => item.keyword.toLowerCase()))
+      const existingKws = new Set(prev.map(item => `${item.keyword.toLowerCase()}:${item.matchType}`))
       const newItems = aiKeywords
-        .filter(kw => !existingKws.has(kw.toLowerCase()))
+        .filter(kw => {
+          const { matchType } = inferKeywordDestination(kw, searchTerms)
+          return !existingKws.has(`${kw.toLowerCase()}:${matchType}`)
+        })
         .map(kw => {
-          const inGoogle = googleNegLower.has(kw.toLowerCase())
           const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, searchTerms)
+          const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, existingNegatives)
           return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
         })
       return [...prev, ...newItems]
@@ -640,6 +820,63 @@ export default function App() {
     } finally {
       setAiLoading(false)
     }
+  }
+
+  // Handle website URL popup
+  async function handleSaveWebsiteUrl() {
+    if (!tempWebsiteUrl.trim()) return
+    
+    setUrlPopupLoading(true)
+    try {
+      // Save the website URL to the database
+      await fetch('/api/client-website-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId: pendingClientId,
+          websiteUrl: tempWebsiteUrl.trim()
+        })
+      })
+      
+      // Update local state
+      setWebsiteUrl(tempWebsiteUrl.trim())
+      
+      // Close popup
+      setShowUrlPopup(false)
+      setTempWebsiteUrl('')
+      
+      // Now trigger AI scan with the new URL
+      if (searchTerms.length > 0) {
+        setAiLoading(true)
+        try {
+          const r = await fetch('/api/ai-recommend-negatives', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ searchTerms, websiteUrl: tempWebsiteUrl.trim() }),
+          })
+          if (r.ok) {
+            const result = await r.json()
+            handleAiResults(result)
+            setLastScannedAt(new Date())
+          }
+        } catch (err) {
+          console.error('Auto-scan failed after URL save:', err.message)
+        } finally {
+          setAiLoading(false)
+        }
+      }
+    } catch (err) {
+      console.error('Failed to save website URL:', err)
+      setSubmitError('Failed to save website URL: ' + err.message)
+    } finally {
+      setUrlPopupLoading(false)
+    }
+  }
+
+  function handleSkipWebsiteUrl() {
+    setShowUrlPopup(false)
+    setTempWebsiteUrl('')
+    setPendingClientId('')
   }
 
   async function handleSubmitNegatives() {
@@ -819,9 +1056,9 @@ export default function App() {
           currentClientId={currentClientId}
           onClientChange={handleClientChange}
           startDate={startDate}
-          setStartDate={setStartDate}
           endDate={endDate}
-          setEndDate={setEndDate}
+          onStartDateChange={handleStartDateChange}
+          onEndDateChange={handleEndDateChange}
           today={today}
           onDateRangeSubmit={handleDateRangeSubmit}
           websiteUrl={websiteUrl}
@@ -849,6 +1086,13 @@ export default function App() {
           rowNegatives={rowNegatives}
           error={error}
           loading={loading}
+          showUrlPopup={showUrlPopup}
+          tempWebsiteUrl={tempWebsiteUrl}
+          setTempWebsiteUrl={setTempWebsiteUrl}
+          urlPopupLoading={urlPopupLoading}
+          handleSaveWebsiteUrl={handleSaveWebsiteUrl}
+          handleSkipWebsiteUrl={handleSkipWebsiteUrl}
+          existingNegatives={existingNegatives}
         />
       } />
     </Routes>
