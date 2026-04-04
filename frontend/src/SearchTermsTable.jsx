@@ -63,123 +63,125 @@ function HighlightedSearchTerm({ text, negatives }) {
 function NegativeBadges({ negatives, onRemove, existingNegatives, onAddNegative, searchTerm, campaignId, campaignName, adGroupId, adGroupName }) {
   if (!negatives || negatives.size === 0) return null
 
-  // Debug: log what's actually in negatives
-  // console.log('Negatives for search term:', searchTerm, [...negatives])
-
   const googlePhrases = new Set(
     [...negatives]
       .filter(p => p.startsWith('google:'))
       .map(p => p.replace('google:', '').toLowerCase())
   )
 
-  // Group Google keywords and their match type options
-  const googleKeywords = [...negatives]
-    .filter(p => p.startsWith('google:'))
-    .map(p => {
-      const display = p.replace('google:', '').split(' (')[0] // Remove match type info if present
-      return display
-    })
+  // Helper function to format keyword with Google Ads match type notation
+  function formatKeywordWithNotation(keyword, matchType) {
+    const normalizedMatchType = matchType.toUpperCase()
+    switch (normalizedMatchType) {
+      case 'EXACT':
+        return `[${keyword}]`
+      case 'PHRASE':
+        return `"${keyword}"`
+      case 'BROAD':
+        return keyword
+      default:
+        return `[${keyword}]` // Default to exact if unknown
+    }
+  }
+
+  // Group Google keywords by base keyword to show all match types together
+  const googleKeywordGroups = new Map()
   
-  const uniqueGoogleKeywords = [...new Set(googleKeywords)]
-  const processedKeywords = new Set()
+  ;[...negatives]
+    .filter(p => p.startsWith('google:'))
+    .forEach(phrase => {
+      const display = phrase.replace('google:', '')
+      let keywordOnly = display
+      let matchType = 'EXACT'
+      
+      if (display.includes('(') && display.includes(')')) {
+        const parts = display.split('(')
+        keywordOnly = parts[0].trim()
+        const matchTypePart = parts[1].replace(')', '').trim()
+        matchType = convertMatchTypeToText(isNaN(matchTypePart) ? matchTypePart : parseInt(matchTypePart))
+      }
+      
+      const key = keywordOnly.toLowerCase()
+      if (!googleKeywordGroups.has(key)) {
+        googleKeywordGroups.set(key, {
+          keyword: keywordOnly,
+          matchTypes: new Set()
+        })
+      }
+      googleKeywordGroups.get(key).matchTypes.add(matchType.toUpperCase())
+    })
 
   return (
     <span className="negative-badges">
+      {/* Google negatives with match type notation */}
+      {Array.from(googleKeywordGroups.entries()).map(([keyLower, group]) => {
+        // For existing Google negatives, allow all match types since user might want to add to negative lists
+        // We'll let the backend/validation handle whether broad match is appropriate for the chosen destination
+        const availableMatchTypes = getAvailableMatchTypes(group.keyword, existingNegatives, 'NEGATIVE_LIST')
+        
+        return (
+          <div key={`google-${keyLower}`} className="neg-badge-with-options neg-badge-google">
+            <div className="neg-badge-chips">
+              {Array.from(group.matchTypes).map(matchType => (
+                <span key={`${keyLower}-${matchType}`} className="neg-badge-chip">
+                  {formatKeywordWithNotation(group.keyword, matchType)}
+                </span>
+              ))}
+            </div>
+            {availableMatchTypes.length > 0 && (
+              <div className="negative-match-options">
+                {availableMatchTypes.map(matchType => (
+                  <button
+                    key={`${group.keyword}-${matchType.value}`}
+                    className="btn-add-match-type-table"
+                    onClick={() => onAddNegative(group.keyword, matchType.value, campaignId, campaignName, adGroupId, adGroupName, 'NEGATIVE_LIST')}
+                    title={`Add "${group.keyword}" as ${matchType.label} match to negative keyword list`}
+                  >
+                    +{matchType.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      {/* Non-Google negatives (AI/Manual) - only show if not covered by Google */}
       {[...negatives].map(phrase => {
         const isGoogle = phrase.startsWith('google:')
         const isAi = phrase.startsWith('ai:')
         const isManual = phrase.startsWith('manual:')
         const display = phrase.replace(/^(google:|ai:|manual:)/, '')
 
-        // Skip AI/manual badge if Google already covers it
-        if ((isAi || isManual) && googlePhrases.has(display.toLowerCase())) return null
+        // Skip Google badges (handled above) and skip AI/manual if Google already covers it
+        if (isGoogle || ((isAi || isManual) && googlePhrases.has(display.toLowerCase()))) return null
 
-        if (isGoogle) {
-          // Convert any numeric match types to text in the display
-          let keywordOnly = display
-          let matchTypeText = 'Exact'
-          
-          if (display.includes('(') && display.includes(')')) {
-            const parts = display.split('(')
-            keywordOnly = parts[0].trim()
-            const matchTypePart = parts[1].replace(')', '').trim()
-            const rawMatchType = convertMatchTypeToText(isNaN(matchTypePart) ? matchTypePart : parseInt(matchTypePart))
-            // Convert to proper case: EXACT -> Exact, PHRASE -> Phrase, BROAD -> Broad
-            matchTypeText = rawMatchType.charAt(0).toUpperCase() + rawMatchType.slice(1).toLowerCase()
-          }
-          
-          // Format as "keyword - MatchType" (e.g., "social media - Exact")
-          const displayText = `${keywordOnly} - ${matchTypeText}`
-          
-          const shouldShowOptions = !processedKeywords.has(keywordOnly.toLowerCase())
-          
-          if (shouldShowOptions) {
-            processedKeywords.add(keywordOnly.toLowerCase())
-          }
-          
-          return (
-            <React.Fragment key={phrase}>
-              <span className="neg-badge neg-badge-google neg-badge-with-options" title="Already a negative in Google Ads">
-                <span className="neg-badge-keyword">{displayText}</span>
-                {shouldShowOptions && (() => {
-                  const destination = adGroupId ? 'ADGROUP' : 'CAMPAIGN'
-                  const availableMatchTypes = getAvailableMatchTypes(keywordOnly, existingNegatives, destination)
-                  if (availableMatchTypes.length === 0) return null
-                  
-                  return (
-                    <span className="negative-match-options">
-                      {availableMatchTypes.map(matchType => (
-                        <button
-                          key={`${keywordOnly}-${matchType.value}`}
-                          className="btn-add-match-type-table"
-                          onClick={() => onAddNegative(keywordOnly, matchType.value, campaignId, campaignName, adGroupId, adGroupName, adGroupId ? 'ADGROUP' : 'CAMPAIGN')}
-                          title={`Add "${keywordOnly}" as ${matchType.label} match`}
-                        >
-                          + {matchType.label}
-                        </button>
-                      ))}
-                    </span>
-                  )
-                })()}
-              </span>
-            </React.Fragment>
-          )
-        }
+        let keywordOnly = display
+        let matchType = 'EXACT'
         
-        if (isAi) {
-          // Extract just the keyword part, removing match type if present
-          const keywordOnly = display.includes('(') ? display.split('(')[0].trim() : display;
-          return (
-            <span key={phrase} className="neg-badge neg-badge-ai" title="AI-recommended — not yet submitted">
-              {display}
-              <button 
-                className="neg-badge-remove" 
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  console.log('🔴 Removing AI keyword:', keywordOnly);
-                  onRemove(keywordOnly);
-                }}
-                style={{zIndex: 1000, position: 'relative', minWidth: '16px', minHeight: '16px'}}
-              >×</button>
-            </span>
-          )
+        if (display.includes('(') && display.includes(')')) {
+          const parts = display.split('(')
+          keywordOnly = parts[0].trim()
+          const matchTypePart = parts[1].replace(')', '').trim()
+          matchType = convertMatchTypeToText(isNaN(matchTypePart) ? matchTypePart : parseInt(matchTypePart))
         }
-        // manual
-        const keywordOnly = display.includes('(') ? display.split('(')[0].trim() : display;
+
+        const formattedKeyword = formatKeywordWithNotation(keywordOnly, matchType)
+
         return (
-          <span key={phrase} className="neg-badge neg-badge-manual" title="Manually flagged — not yet submitted">
-            {display}
+          <span key={phrase} className={`neg-badge ${isAi ? 'neg-badge-ai' : 'neg-badge-manual'}`} title={isAi ? "AI-recommended — not yet submitted" : "Manually flagged — not yet submitted"}>
+            {formattedKeyword}
             <button 
               className="neg-badge-remove" 
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('🔵 Removing manual keyword:', keywordOnly);
                 onRemove(keywordOnly);
               }}
               style={{zIndex: 1000, position: 'relative', minWidth: '16px', minHeight: '16px'}}
-            >×</button>
+            >
+              ×
+            </button>
           </span>
         )
       })}

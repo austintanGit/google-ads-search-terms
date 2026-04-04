@@ -2,4 +2,3 @@ https://ads.google.com/aw/negativekeywordlistdetails?ocid=98788879&ascid=9878887
 
 ./update.sh 3.137.119.68 tmc-search-term.pem
 
-testing
