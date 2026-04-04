@@ -262,7 +262,6 @@ export default function AIPanel({
   // Shows campaign/adgroup context text + list picker (when NEGATIVE_LIST) under the keyword name
   function renderKeywordDetails(item) {
     if (item.alreadyInGoogle) return null
-    const dest = item.destination || 'CAMPAIGN'
     const hasCampaignInfo = item.campaignName || item.adGroupName
 
     return (
@@ -286,53 +285,6 @@ export default function AIPanel({
             )}
           </div>
         )}
-
-        {dest === 'NEGATIVE_LIST' && (
-          <div className="kw-list-row">
-            {createListCtx === item.keyword ? (
-              <div className="dest-cascade-row create-list-kw-row">
-                <input
-                  type="text"
-                  className="dest-cascade-input"
-                  placeholder="New list name…"
-                  value={newListName}
-                  onChange={e => setNewListName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
-                  autoFocus
-                />
-                <button
-                  className="btn-create-list-confirm"
-                  disabled={!newListName.trim() || createListLoading}
-                  onClick={() => handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
-                  title="Create"
-                >
-                  {createListLoading ? '…' : '✓'}
-                </button>
-                <button className="btn-cancel-create" onClick={closeCreateList} title="Cancel">×</button>
-                {createListError && <span className="create-list-error-sm">{createListError}</span>}
-              </div>
-            ) : (
-              <div className="dest-cascade-row">
-                <span className="dest-cascade-label">List</span>
-                <select
-                  className="dest-cascade-select"
-                  value={item.sharedSetId || ''}
-                  onChange={e => {
-                    if (e.target.value === '__create__') {
-                      openCreateList(item.keyword)
-                    } else {
-                      handleKeywordSharedSetChange(item.keyword, e.target.value || null)
-                    }
-                  }}
-                >
-                  <option value="">Select…</option>
-                  {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  <option value="__create__">+ Create new list</option>
-                </select>
-              </div>
-            )}
-          </div>
-        )}
       </>
     )
   }
@@ -341,16 +293,63 @@ export default function AIPanel({
   function renderDestinationCell(item) {
     if (item.alreadyInGoogle) return null
     const dest = item.destination || 'CAMPAIGN'
+    
     return (
-      <select
-        className={`matchtype-select ${DEST_CLASS[dest] || ''}`}
-        value={dest}
-        onChange={e => handleDestinationChange(item.keyword, e.target.value)}
-      >
-        {DESTINATION_OPTIONS.map(opt => (
-          <option key={opt.value} value={opt.value}>{opt.label}</option>
-        ))}
-      </select>
+      <div className="destination-cell">
+        <select
+          className={`matchtype-select ${DEST_CLASS[dest] || ''}`}
+          value={dest}
+          onChange={e => handleDestinationChange(item.keyword, e.target.value)}
+        >
+          {DESTINATION_OPTIONS.map(opt => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+        
+        {dest === 'NEGATIVE_LIST' && (
+          <div className="inline-list-picker">
+            {createListCtx === item.keyword ? (
+              <div className="create-list-inline">
+                <input
+                  type="text"
+                  className="form-control form-control-sm create-list-input"
+                  placeholder="New list name…"
+                  value={newListName}
+                  onChange={e => setNewListName(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleSharedSetChange(item.keyword, s.id))}
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  disabled={!newListName.trim() || createListLoading}
+                  onClick={() => handleCreateList(s => handleSharedSetChange(item.keyword, s.id))}
+                >
+                  {createListLoading ? 'Creating…' : 'Create'}
+                </button>
+                <button type="button" className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
+                  Cancel
+                </button>
+                {createListError && <span className="create-list-error">{createListError}</span>}
+              </div>
+            ) : (
+              <div className="list-picker-controls">
+                <select
+                  className="matchtype-select"
+                  value={item.sharedSetId || ''}
+                  onChange={e => handleSharedSetChange(item.keyword, e.target.value || null)}
+                >
+                  <option value="">Select list…</option>
+                  {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+                <button type="button" className="btn-create-list" onClick={() => openCreateList(item.keyword)}>
+                  + Create new list
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -494,97 +493,109 @@ export default function AIPanel({
           </a>
         </div>
 
-        {/* Bulk apply — multiple rows */}
+        {/* Bulk apply — two separate rows */}
         <div className="pending-bulk-top">
-          <div className="bulk-header-row">
-            <span className="bulk-header-label">Set all selected to:</span>
-          </div>
-          
-          <div className="bulk-settings-row">
-            <div className="bulk-setting-group">
-              <label className="bulk-setting-label">Match Type</label>
-              <select
-                className="matchtype-select"
-                value={bulkMatchType}
-                onChange={e => setBulkMatchType(e.target.value)}
-              >
-                {MATCH_TYPE_OPTIONS.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="bulk-setting-group">
-              <label className="bulk-setting-label">Destination</label>
-              <select
-                className={`matchtype-select ${DEST_CLASS[bulkDestination] || ''}`}
-                value={bulkDestination}
-                onChange={e => handleBulkDestinationChange(e.target.value)}
-              >
-                {DESTINATION_OPTIONS.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </div>
-
-            {bulkDestination === 'NEGATIVE_LIST' && (
+          {/* Match Type Row */}
+          <div className="bulk-row">
+            <div className="bulk-row-content">
               <div className="bulk-setting-group">
-                <label className="bulk-setting-label">Negative keyword list</label>
-                {createListCtx === 'bulk' ? (
-                  <div className="create-list-inline">
-                    <input
-                      type="text"
-                      className="form-control form-control-sm create-list-input"
-                      placeholder="New list name…"
-                      value={newListName}
-                      onChange={e => setNewListName(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && handleCreateList(s => setBulkSharedSetId(s.id))}
-                      autoFocus
-                    />
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-primary"
-                      disabled={!newListName.trim() || createListLoading}
-                      onClick={() => handleCreateList(s => setBulkSharedSetId(s.id))}
-                    >
-                      {createListLoading ? 'Creating…' : 'Create'}
-                    </button>
-                    <button type="button" className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
-                      Cancel
-                    </button>
-                    {createListError && <span className="create-list-error">{createListError}</span>}
-                  </div>
-                ) : (
-                  <div className="bulk-list-controls">
-                    <select
-                      className="matchtype-select"
-                      value={bulkSharedSetId || ''}
-                      onChange={e => setBulkSharedSetId(e.target.value || null)}
-                    >
-                      <option value="">Select list…</option>
-                      {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                    <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
-                      + Create new list
-                    </button>
-                  </div>
-                )}
+                <label className="bulk-setting-label">Match Type</label>
+                <select
+                  className="matchtype-select"
+                  value={bulkMatchType}
+                  onChange={e => setBulkMatchType(e.target.value)}
+                >
+                  {MATCH_TYPE_OPTIONS
+                    .filter(opt => !(opt.value === 'BROAD' && (bulkDestination === 'CAMPAIGN' || bulkDestination === 'ADGROUP')))
+                    .map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                </select>
               </div>
-            )}
+            </div>
+            <div className="bulk-apply-cell">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary apply-to-selected-btn"
+                onClick={handleApplyBulkMatchType}
+                disabled={selectedCount === 0}
+              >
+                Apply to selected
+              </button>
+            </div>
           </div>
 
-          <div className="bulk-apply-row">
-            <button
-              type="button"
-              className="btn btn-sm btn-primary apply-to-selected-btn"
-              onClick={() => {
-                handleApplyBulkMatchType()
-                handleApplyBulkDestination()
-              }}
-              disabled={selectedCount === 0}
-            >
-              Apply to selected
-            </button>
+          {/* Destination Row */}
+          <div className="bulk-row">
+            <div className="bulk-row-content">
+              <div className="bulk-setting-group">
+                <label className="bulk-setting-label">Destination</label>
+                <select
+                  className={`matchtype-select ${DEST_CLASS[bulkDestination] || ''}`}
+                  value={bulkDestination}
+                  onChange={e => handleBulkDestinationChange(e.target.value)}
+                >
+                  {DESTINATION_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {bulkDestination === 'NEGATIVE_LIST' && (
+                <div className="bulk-setting-group">
+                  <label className="bulk-setting-label">List</label>
+                  {createListCtx === 'bulk' ? (
+                    <div className="create-list-inline">
+                      <input
+                        type="text"
+                        className="form-control form-control-sm create-list-input"
+                        placeholder="New list name…"
+                        value={newListName}
+                        onChange={e => setNewListName(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleCreateList(s => setBulkSharedSetId(s.id))}
+                        autoFocus
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        disabled={!newListName.trim() || createListLoading}
+                        onClick={() => handleCreateList(s => setBulkSharedSetId(s.id))}
+                      >
+                        {createListLoading ? 'Creating…' : 'Create'}
+                      </button>
+                      <button type="button" className="btn btn-sm btn-outline-secondary" onClick={closeCreateList}>
+                        Cancel
+                      </button>
+                      {createListError && <span className="create-list-error">{createListError}</span>}
+                    </div>
+                  ) : (
+                    <div className="bulk-list-controls">
+                      <select
+                        className="matchtype-select"
+                        value={bulkSharedSetId || ''}
+                        onChange={e => setBulkSharedSetId(e.target.value || null)}
+                      >
+                        <option value="">Select list…</option>
+                        {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                      </select>
+                      <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
+                        + Create new list
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="bulk-apply-cell">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary apply-to-selected-btn"
+                onClick={handleApplyBulkDestination}
+                disabled={selectedCount === 0}
+              >
+                Apply to selected
+              </button>
+            </div>
           </div>
         </div>
 

@@ -344,7 +344,6 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
             <div className="status-key-items">
               <div className="status-key-item status-key-item-google">
                 <span className="status-key-item-label">Already a Negative</span>
-                <span className="status-key-item-sub">No Action</span>
               </div>
               <div className="status-key-item status-key-item-ai">
                 <span className="status-key-item-label">AI-Recommended</span>

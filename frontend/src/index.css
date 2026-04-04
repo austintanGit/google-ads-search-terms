@@ -1045,29 +1045,36 @@
   font-size: 0.72rem;
 }
 
-/* Bulk apply — multiple rows layout */
+/* Bulk apply — two separate rows with individual Apply buttons */
 .pending-bulk-top {
-  padding: 16px;
-  background: #f1f5f9;
-  border-top: 1px solid #e5e7eb;
-  border-bottom: 1px solid #e5e7eb;
-}
-
-.bulk-header-row {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
   margin-bottom: 12px;
+  padding: 0;
 }
 
-.bulk-header-label {
-  font-size: 0.875rem;
-  font-weight: 600;
-  color: #374151;
-}
-
-.bulk-settings-row {
+.bulk-row {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.bulk-row:last-child {
+  border-bottom: none;
+}
+
+.bulk-row-content {
+  display: flex;
+  align-items: center;
   gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
+  flex: 1;
+}
+
+.bulk-apply-cell {
+  flex-shrink: 0;
 }
 
 .bulk-setting-group {
@@ -1091,20 +1098,32 @@
   gap: 4px;
 }
 
-.bulk-apply-row {
-  display: flex;
-  justify-content: flex-start;
-}
-
 .apply-to-selected-btn {
   font-weight: 600;
 }
 
-.bulk-row {
+/* Inline list picker in destination cells */
+.destination-cell {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px 12px;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inline-list-picker {
+  margin-top: 4px;
+}
+
+.list-picker-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Simple text display for keyword details */
+.kw-simple-text {
+  font-size: 0.8rem;
+  color: #6b7280;
+  margin-top: 2px;
 }
 
 .bulk-col-label {
@@ -1555,7 +1574,7 @@
 .neg-badge-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 0;
   margin-bottom: 2px;
 }
 

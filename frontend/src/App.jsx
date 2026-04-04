@@ -7,7 +7,7 @@ import AIPanel from './AIPanel'
 
 // Single word → Exact, multi-word → Phrase
 function inferMatchType(kw) {
-  return kw.trim().split(/\s+/).length > 1 ? 'PHRASE' : 'EXACT'
+  return 'PHRASE'
 }
 
 // Infer campaign/adgroup, destination type, and match type for a keyword based on search term data.
@@ -23,27 +23,17 @@ function inferKeywordDestination(kw, terms) {
     return { campaignId: null, campaignName: null, adGroupId: null, adGroupName: null, destination: 'CAMPAIGN', matchType }
   }
 
-  const distinctCampaigns = new Set(matching.map(t => t.campaignId).filter(Boolean))
-  const distinctAdGroups = new Set(matching.map(t => t.adGroupId).filter(Boolean))
-
+  // Find the best matching search term (highest clicks)
   const best = [...matching].sort((a, b) => (b.clicks || 0) - (a.clicks || 0))[0]
 
-  let destination
-  if (distinctCampaigns.size > 1) {
-    destination = 'NEGATIVE_LIST'
-  } else if (distinctAdGroups.size === 1) {
-    destination = 'ADGROUP'
-  } else {
-    destination = 'CAMPAIGN'
-  }
-
+  // Always default destination to CAMPAIGN as requested, but preserve campaign/adgroup context
   return {
-    campaignId: best.campaignId || null,
-    campaignName: best.campaign || null,
-    adGroupId: best.adGroupId || null,
-    adGroupName: best.adGroup || null,
-    destination,
-    matchType,
+    campaignId: best?.campaignId || null,
+    campaignName: best?.campaign || null,
+    adGroupId: best?.adGroupId || null,
+    adGroupName: best?.adGroup || null,
+    destination: 'CAMPAIGN', // Always default to CAMPAIGN level
+    matchType
   }
 }
 
@@ -303,6 +293,10 @@ function NegativeKeywordsPage({
 
 export default function App() {
   const { startDate: defaultStart, endDate: defaultEnd } = getDefaultDates()
+  
+  // Log the default dates to verify they're correct
+  // console.log('Default start date:', defaultStart)
+  // console.log('Default end date:', defaultEnd)
   const today = new Date().toISOString().split('T')[0]
 
   const navigate = useNavigate()
@@ -632,11 +626,10 @@ export default function App() {
     const startDate = `${year}-${String(month).padStart(2, '0')}-01`
     
     // Get last day of the month
-    // new Date(year, month, 0) gives last day of the previous month
-    // so we need new Date(year, month + 1, 0) to get last day of current month
-    const lastDay = new Date(year, month + 1, 0).getDate()
+    // Since month from dateStr is 1-indexed, we need to convert to 0-indexed for Date constructor
+    // new Date(year, month, 0) gives last day of the month (month is 1-indexed here after conversion)
+    const lastDay = new Date(year, month, 0).getDate()
     const endDate = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-    
     return {
       startDate,
       endDate

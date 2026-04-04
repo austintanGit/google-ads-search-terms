@@ -72,9 +72,15 @@ export function buildHighlightedParts(text, negatives) {
 
 export function getDefaultDates() {
   const today = new Date()
-  const firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1)
-  const lastOfPrevMonth = new Date(firstOfThisMonth - 1)
-  const firstOfPrevMonth = new Date(lastOfPrevMonth.getFullYear(), lastOfPrevMonth.getMonth(), 1)
+  const year = today.getFullYear()
+  const month = today.getMonth() // 0-indexed (0 = January, 3 = April)
+  
+  // Get first day of previous month
+  const firstOfPrevMonth = new Date(year, month - 1, 1)
+  
+  // Get last day of previous month using day 0 of current month
+  const lastOfPrevMonth = new Date(year, month, 0)
+  
   return {
     startDate: firstOfPrevMonth.toISOString().split('T')[0],
     endDate: lastOfPrevMonth.toISOString().split('T')[0],
