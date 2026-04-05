@@ -247,8 +247,10 @@ app.get('/api/negative-keywords', async (req, res) => {
             refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
         });
 
-        const negativeKeywordsQuery = `
-            SELECT 
+        // Fetch from all three sources: shared sets, campaign-level, and ad group-level
+        const queries = [
+            // 1. Shared set negative keywords (negative keyword lists)
+            `SELECT 
                 shared_criterion.keyword.text,
                 shared_criterion.keyword.match_type,
                 shared_set.name,
@@ -258,32 +260,113 @@ app.get('/api/negative-keywords', async (req, res) => {
             FROM shared_criterion
             WHERE 
                 shared_set.type = NEGATIVE_KEYWORDS 
-                AND shared_set.status = ENABLED
-        `;
+                AND shared_set.status = ENABLED`,
+            
+            // 2. Campaign-level negative keywords
+            `SELECT 
+                campaign_criterion.keyword.text,
+                campaign_criterion.keyword.match_type,
+                campaign.name,
+                campaign.id
+            FROM campaign_criterion
+            WHERE 
+                campaign_criterion.negative = true
+                AND campaign_criterion.status = ENABLED`,
+            
+            // 3. Ad group-level negative keywords  
+            `SELECT 
+                ad_group_criterion.keyword.text,
+                ad_group_criterion.keyword.match_type,
+                ad_group.name,
+                ad_group.id,
+                campaign.name,
+                campaign.id
+            FROM ad_group_criterion
+            WHERE 
+                ad_group_criterion.negative = true
+                AND ad_group_criterion.status = ENABLED`
+        ];
 
-        const response = await customer.query(negativeKeywordsQuery);
+        const [sharedResponse, campaignResponse, adGroupResponse] = await Promise.all(
+            queries.map(query => customer.query(query).catch(() => []))
+        );
         
-        const negativeKeywords = response
+        const allNegatives = [];
+
+        // Process shared set keywords
+        sharedResponse
             .filter(row => row.shared_criterion?.keyword?.text)
-            .map(row => {
-                // Convert numeric match type to text
+            .forEach(row => {
                 const numericMatchType = row.shared_criterion.keyword.match_type;
-                let matchType = 'EXACT'; // default
-                
-                // Google Ads API returns numeric values for match types
+                let matchType = 'EXACT';
                 if (numericMatchType === 2) matchType = 'EXACT';
                 else if (numericMatchType === 3) matchType = 'PHRASE'; 
                 else if (numericMatchType === 4) matchType = 'BROAD';
                 else if (typeof numericMatchType === 'string') matchType = numericMatchType;
                 
-                return {
+                allNegatives.push({
                     keyword: row.shared_criterion.keyword.text,
-                    matchType: matchType
-                };
+                    matchType: matchType,
+                    source: 'SHARED_SET',
+                    location: row.shared_set.name
+                });
             });
 
+        // Process campaign-level keywords
+        campaignResponse
+            .filter(row => row.campaign_criterion?.keyword?.text)
+            .forEach(row => {
+                const numericMatchType = row.campaign_criterion.keyword.match_type;
+                let matchType = 'EXACT';
+                if (numericMatchType === 2) matchType = 'EXACT';
+                else if (numericMatchType === 3) matchType = 'PHRASE'; 
+                else if (numericMatchType === 4) matchType = 'BROAD';
+                else if (typeof numericMatchType === 'string') matchType = numericMatchType;
+                
+                allNegatives.push({
+                    keyword: row.campaign_criterion.keyword.text,
+                    matchType: matchType,
+                    source: 'CAMPAIGN',
+                    location: row.campaign.name
+                });
+            });
+
+        // Process ad group-level keywords
+        adGroupResponse
+            .filter(row => row.ad_group_criterion?.keyword?.text)
+            .forEach(row => {
+                const numericMatchType = row.ad_group_criterion.keyword.match_type;
+                let matchType = 'EXACT';
+                if (numericMatchType === 2) matchType = 'EXACT';
+                else if (numericMatchType === 3) matchType = 'PHRASE'; 
+                else if (numericMatchType === 4) matchType = 'BROAD';
+                else if (typeof numericMatchType === 'string') matchType = numericMatchType;
+                
+                allNegatives.push({
+                    keyword: row.ad_group_criterion.keyword.text,
+                    matchType: matchType,
+                    source: 'AD_GROUP',
+                    location: `${row.campaign.name} › ${row.ad_group.name}`
+                });
+            });
+
+        console.log(`Fetched ${allNegatives.length} total negatives: ${sharedResponse.length} shared, ${campaignResponse.length} campaign, ${adGroupResponse.length} ad group`);
+
+        // Debug: Log sample keywords from each source
+        if (sharedResponse.length > 0) {
+            console.log('Sample shared set keywords:', sharedResponse.slice(0, 3).map(r => r.shared_criterion?.keyword?.text));
+        }
+        if (campaignResponse.length > 0) {
+            console.log('Sample campaign keywords:', campaignResponse.slice(0, 3).map(r => r.campaign_criterion?.keyword?.text));
+            console.log('From campaigns:', campaignResponse.slice(0, 3).map(r => r.campaign?.name));
+        }
+        if (adGroupResponse.length > 0) {
+            console.log('Sample ad group keywords:', adGroupResponse.slice(0, 3).map(r => r.ad_group_criterion?.keyword?.text));
+            console.log('From ad groups:', adGroupResponse.slice(0, 3).map(r => `${r.campaign?.name} › ${r.ad_group?.name}`));
+        }
+
         const transformedData = { 
-            "Global Negative Keywords": negativeKeywords
+            "Global Negative Keywords": allNegatives
         };
 
         res.json(transformedData);
@@ -960,11 +1043,117 @@ app.post('/api/add-adgroup-negative', async (req, res) => {
     }
 });
 
+// Apply negative keyword list to campaigns
+app.post('/api/apply-list-to-campaigns', async (req, res) => {
+    const { sharedSetId, campaignIds, clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
+    if (!sharedSetId) return res.status(400).json({ error: 'Shared set ID is required' });
+    if (!campaignIds || !campaignIds.length) return res.status(400).json({ error: 'Campaign IDs are required' });
+
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+
+        // Create campaign shared set associations
+        const associations = campaignIds.map(campaignId => ({
+            campaign: `customers/${clientId}/campaigns/${campaignId}`,
+            shared_set: `customers/${clientId}/sharedSets/${sharedSetId}`,
+            status: 'ENABLED'
+        }));
+
+        const response = await withRetry(() => customer.campaignSharedSets.create(associations));
+        
+        console.log(`Applied shared set ${sharedSetId} to ${campaignIds.length} campaigns for client ${clientId}`);
+        res.json({ 
+            success: true, 
+            response,
+            appliedTo: campaignIds.length,
+            sharedSetId,
+            campaignIds 
+        });
+    } catch (err) {
+        console.error('Error applying shared set to campaigns:', err.errors || err.message);
+        const details = err.errors?.[0]?.message || err.message || 'Unknown error';
+        res.status(500).json({ 
+            error: 'Failed to apply negative keyword list to campaigns', 
+            details,
+            sharedSetId,
+            campaignIds 
+        });
+    }
+});
+
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         clientInitialized: !!client
     });
+});
+
+// Add diagnostic endpoint to check API access level
+app.get('/api/debug/access-level', async (req, res) => {
+    try {
+        const managerCustomer = client.Customer({
+            customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+
+        // Try to get account info which should work with any access level
+        const accountInfo = await managerCustomer.query(`
+            SELECT customer.id, customer.descriptive_name, customer.manager
+            FROM customer
+        `);
+
+        // Check what APIs we can access by testing different operations
+        const accessTests = {
+            canReadCustomers: false,
+            canReadCampaigns: false,
+            canReadSharedSets: false,
+            canCreateSharedSet: false,
+            canCreateCampaignCriteria: false,
+            errorDetails: {}
+        };
+
+        try {
+            await managerCustomer.query('SELECT customer.id FROM customer LIMIT 1');
+            accessTests.canReadCustomers = true;
+        } catch (err) {
+            accessTests.errorDetails.readCustomers = err.message;
+        }
+
+        try {
+            await managerCustomer.query('SELECT campaign.id FROM campaign LIMIT 1');
+            accessTests.canReadCampaigns = true;
+        } catch (err) {
+            accessTests.errorDetails.readCampaigns = err.message;
+        }
+
+        try {
+            await managerCustomer.query('SELECT shared_set.id FROM shared_set LIMIT 1');
+            accessTests.canReadSharedSets = true;
+        } catch (err) {
+            accessTests.errorDetails.readSharedSets = err.message;
+        }
+
+        res.json({
+            managerAccountId: process.env.GOOGLE_ADS_MANAGER_ID,
+            accountInfo: accountInfo[0],
+            accessTests,
+            interpretation: {
+                likelyAccessLevel: accessTests.canCreateSharedSet ? 'STANDARD' : 'BASIC',
+                explanation: 'Standard access allows full CRUD operations, Basic access is mostly read-only with limited write permissions'
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Failed to check access level',
+            details: error.message,
+            errors: error.errors
+        });
+    }
 });
 
 // Fallback to React app for client-side routing

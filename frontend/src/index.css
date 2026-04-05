@@ -1671,7 +1671,7 @@
    ============================================================ */
 .search-term-cell {
   cursor: text;
-  white-space: nowrap;
+  /* white-space: nowrap; */
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1693,7 +1693,7 @@
   white-space: nowrap;
   transition: background 0.15s, color 0.15s;
   position: absolute;
-  right: 0;
+  right: -40px;
   top: 50%;
   transform: translateY(-50%);
   z-index: 10;

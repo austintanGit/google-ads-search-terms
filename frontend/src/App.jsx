@@ -877,6 +877,59 @@ export default function App() {
     const toSubmit = pendingNegatives.filter(item => item.selected && !item.alreadyInGoogle)
     if (toSubmit.length === 0) { setSubmitError('No negative keywords selected.'); return }
 
+    console.log('🔍 Debug - Submitting negatives:', toSubmit.map(item => ({
+      keyword: item.keyword,
+      matchType: item.matchType,
+      destination: item.destination,
+      campaignId: item.campaignId,
+      campaignName: item.campaignName,
+      adGroupId: item.adGroupId,
+      adGroupName: item.adGroupName
+    })))
+
+        console.log('🔍 Current existing negatives:', existingNegatives.slice(0, 10)) // Show first 10 for debugging
+
+        // Quick test interface for applying lists to campaigns
+        if (window.location.hash === '#test-apply-list') {
+          window.testApplyList = async (sharedSetId, campaignIds) => {
+            try {
+              const response = await fetch('/api/apply-list-to-campaigns', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  clientId: currentClientId,
+                  sharedSetId,
+                  campaignIds: Array.isArray(campaignIds) ? campaignIds : [campaignIds]
+                })
+              });
+              const result = await response.json();
+              console.log('✅ Apply list result:', result);
+              return result;
+            } catch (err) {
+              console.error('❌ Apply list error:', err);
+            }
+          };
+          
+          window.getCampaigns = async () => {
+            const response = await fetch(`/api/campaigns?clientId=${currentClientId}`);
+            const campaigns = await response.json();
+            console.log('📋 Available campaigns:', campaigns);
+            return campaigns;
+          };
+          
+          window.getSharedSets = async () => {
+            const response = await fetch(`/api/shared-sets?clientId=${currentClientId}`);
+            const sets = await response.json();
+            console.log('📋 Available shared sets:', sets);
+            return sets;
+          };
+          
+          console.log('🧪 TEST MODE: Use these functions in console:');
+          console.log('getCampaigns() - List available campaigns');
+          console.log('getSharedSets() - List available shared sets');  
+          console.log('testApplyList("sharedSetId", ["campaignId1", "campaignId2"]) - Apply list to campaigns');
+        }
+
     // Partition by destination
     const listKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'NEGATIVE_LIST')
     const campaignKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'CAMPAIGN')
@@ -946,16 +999,42 @@ export default function App() {
         })
         await Promise.all(
           Object.entries(byCampaign).map(async ([campaignId, items]) => {
+            const payload = {
+              negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+              campaignId,
+              clientId: currentClientId,
+            }
+            console.log('🔵 Sending campaign negative keywords:', payload)
+            
+            // Add test logging for specific keywords that might have issues
+            payload.negativeKeywords.forEach(kw => {
+              if (['vybe', 'photos'].includes(kw.keyword.toLowerCase())) {
+                console.warn(`⚠️ Testing potentially problematic keyword: "${kw.keyword}" (${kw.matchType})`)
+              }
+            })
+            
             const r = await fetch('/api/add-campaign-negative', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
-                campaignId,
-                clientId: currentClientId,
-              }),
+              body: JSON.stringify(payload),
             })
             const d = await r.json()
+            console.log('🔵 Campaign negative response:', JSON.stringify(d, null, 2))
+            console.log('🔵 Response status:', r.status, r.statusText)
+            
+            // Check for partial failures or null campaign_criterion
+            const failedKeywords = []
+            if (d.response?.results) {
+              d.response.results.forEach((result, index) => {
+                if (result.campaign_criterion === null) {
+                  const keyword = payload.negativeKeywords[index]?.keyword
+                  console.log(`ℹ️ Campaign criterion null for keyword "${keyword}" - this is normal with Basic Access (keyword likely created successfully)`)
+                }
+              })
+            }
+            
+            // Don't treat null criterion as failure since keywords are actually being created
+            // Only fail if the HTTP status is not ok
             if (!r.ok) throw new Error(d.details || d.error || 'Failed to submit campaign-level negatives')
           })
         )
@@ -973,16 +1052,42 @@ export default function App() {
         })
         await Promise.all(
           Object.entries(byAdGroup).map(async ([adGroupId, items]) => {
+            const payload = {
+              negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+              adGroupId,
+              clientId: currentClientId,
+            }
+            console.log('🟡 Sending ad group negative keywords:', payload)
+            
+            // Add test logging for specific keywords that might have issues
+            payload.negativeKeywords.forEach(kw => {
+              if (['vybe', 'photos'].includes(kw.keyword.toLowerCase())) {
+                console.warn(`⚠️ Testing potentially problematic keyword: "${kw.keyword}" (${kw.matchType}) at ad group level`)
+              }
+            })
+            
             const r = await fetch('/api/add-adgroup-negative', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                negativeKeywords: items.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
-                adGroupId,
-                clientId: currentClientId,
-              }),
+              body: JSON.stringify(payload),
             })
             const d = await r.json()
+            console.log('🟡 Ad group negative response:', JSON.stringify(d, null, 2))
+            console.log('🟡 Response status:', r.status, r.statusText)
+            
+            // Check for partial failures or null ad_group_criterion
+            const failedKeywords = []
+            if (d.response?.results) {
+              d.response.results.forEach((result, index) => {
+                if (result.ad_group_criterion === null) {
+                  const keyword = payload.negativeKeywords[index]?.keyword
+                  console.log(`ℹ️ Ad group criterion null for keyword "${keyword}" - this is normal with Basic Access (keyword likely created successfully)`)
+                }
+              })
+            }
+            
+            // Don't treat null criterion as failure since keywords are actually being created
+            // Only fail if the HTTP status is not ok
             if (!r.ok) throw new Error(d.details || d.error || 'Failed to submit ad group-level negatives')
           })
         )

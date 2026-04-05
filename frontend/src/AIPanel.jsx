@@ -316,14 +316,14 @@ export default function AIPanel({
                   placeholder="New list name…"
                   value={newListName}
                   onChange={e => setNewListName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleSharedSetChange(item.keyword, s.id))}
+                  onKeyDown={e => e.key === 'Enter' && handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
                   autoFocus
                 />
                 <button
                   type="button"
                   className="btn btn-sm btn-primary"
                   disabled={!newListName.trim() || createListLoading}
-                  onClick={() => handleCreateList(s => handleSharedSetChange(item.keyword, s.id))}
+                  onClick={() => handleCreateList(s => handleKeywordSharedSetChange(item.keyword, s.id))}
                 >
                   {createListLoading ? 'Creating…' : 'Create'}
                 </button>
@@ -337,7 +337,7 @@ export default function AIPanel({
                 <select
                   className="matchtype-select"
                   value={item.sharedSetId || ''}
-                  onChange={e => handleSharedSetChange(item.keyword, e.target.value || null)}
+                  onChange={e => handleKeywordSharedSetChange(item.keyword, e.target.value || null)}
                 >
                   <option value="">Select list…</option>
                   {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -628,9 +628,9 @@ export default function AIPanel({
                   </td>
                 </tr>
               )}
-              {pendingNegatives.map(item => (
+              {pendingNegatives.map((item, index) => (
                 <tr
-                  key={item.keyword}
+                  key={`${item.keyword}-${item.destination}-${item.matchType}-${index}`}
                   className={
                     item.alreadyInGoogle ? 'row-in-google' :
                     item.selected ? '' : 'row-unchecked'
