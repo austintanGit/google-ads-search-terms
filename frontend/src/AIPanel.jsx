@@ -139,22 +139,15 @@ export default function AIPanel({
   function handleBulkDestinationChange(dest) {
     setBulkDestination(dest)
     setBulkSharedSetId(null)
-    if ((dest === 'CAMPAIGN' || dest === 'ADGROUP') && bulkMatchType === 'BROAD') {
-      setBulkMatchType('EXACT')
-    }
   }
 
   function handleDestinationChange(keyword, destination) {
     setPendingNegatives(prev =>
       prev.map(item => {
         if (item.keyword !== keyword) return item
-        const matchType = (destination === 'CAMPAIGN' || destination === 'ADGROUP') && item.matchType === 'BROAD'
-          ? 'EXACT'
-          : item.matchType
         return {
           ...item,
           destination,
-          matchType,
           sharedSetId: destination === 'NEGATIVE_LIST' ? item.sharedSetId : null,
         }
       })
@@ -180,13 +173,9 @@ export default function AIPanel({
     setPendingNegatives(prev =>
       prev.map(item => {
         if (!item.selected || item.alreadyInGoogle) return item
-        const matchType = (bulkDestination === 'CAMPAIGN' || bulkDestination === 'ADGROUP') && item.matchType === 'BROAD'
-          ? 'EXACT'
-          : item.matchType
         return {
           ...item,
           destination: bulkDestination,
-          matchType,
           sharedSetId: bulkDestination === 'NEGATIVE_LIST' ? bulkSharedSetId : null,
         }
       })
@@ -505,11 +494,9 @@ export default function AIPanel({
                   value={bulkMatchType}
                   onChange={e => setBulkMatchType(e.target.value)}
                 >
-                  {MATCH_TYPE_OPTIONS
-                    .filter(opt => !(opt.value === 'BROAD' && (bulkDestination === 'CAMPAIGN' || bulkDestination === 'ADGROUP')))
-                    .map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
+                  {MATCH_TYPE_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -570,6 +557,9 @@ export default function AIPanel({
                     </div>
                   ) : (
                     <div className="bulk-list-controls">
+                      <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
+                        + Create new list
+                      </button>
                       <select
                         className="matchtype-select"
                         value={bulkSharedSetId || ''}
@@ -578,9 +568,6 @@ export default function AIPanel({
                         <option value="">Select list…</option>
                         {sharedSets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                       </select>
-                      <button type="button" className="btn-create-list" onClick={() => openCreateList('bulk')}>
-                        + Create new list
-                      </button>
                     </div>
                   )}
                 </div>
@@ -663,11 +650,9 @@ export default function AIPanel({
                       disabled={item.alreadyInGoogle}
                       onChange={e => handleMatchTypeChange(item.keyword, e.target.value)}
                     >
-                      {MATCH_TYPE_OPTIONS
-                        .filter(opt => !(opt.value === 'BROAD' && (item.destination === 'CAMPAIGN' || item.destination === 'ADGROUP')))
-                        .map(opt => (
-                          <option key={opt.value} value={opt.value}>{opt.label}</option>
-                        ))}
+                      {MATCH_TYPE_OPTIONS.map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
                     </select>
                   </td>
                   <td className="col-destination">
