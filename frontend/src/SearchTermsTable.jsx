@@ -413,12 +413,14 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
               </tr>
             </thead>
             <tbody>
-              {sorted.map(term => {
+              {sorted.map((term, index) => {
                 const negatives = rowNegatives.get(term.searchTerm)
                 const isHovered = hoveredRow === term.searchTerm
+                // Create a more robust unique key using IDs and other stable properties
+                const uniqueKey = `${term.searchTerm}__${term.campaignId || 'no-campaign'}__${term.adGroupId || 'no-adgroup'}__${term.matchingKeyword || 'no-keyword'}__${index}`
                 return (
                   <tr
-                    key={`${term.searchTerm}__${term.campaign}__${term.adGroup}`}
+                    key={uniqueKey}
                     data-campaign-id={term.campaignId || ''}
                     data-campaign-name={term.campaign || ''}
                     data-adgroup-id={term.adGroupId || ''}

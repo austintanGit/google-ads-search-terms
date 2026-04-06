@@ -294,9 +294,6 @@ function NegativeKeywordsPage({
 export default function App() {
   const { startDate: defaultStart, endDate: defaultEnd } = getDefaultDates()
   
-  // Log the default dates to verify they're correct
-  // console.log('Default start date:', defaultStart)
-  // console.log('Default end date:', defaultEnd)
   const today = new Date().toISOString().split('T')[0]
 
   const navigate = useNavigate()
@@ -445,7 +442,8 @@ export default function App() {
     setLoading(true)
     setError('')
     try {
-      const r = await fetch(`/api/search-terms?clientId=${clientId}&startDate=${start}&endDate=${end}`)
+      const url = `/api/search-terms?clientId=${clientId}&startDate=${start}&endDate=${end}`;
+      const r = await fetch(url)
       if (!r.ok) {
         const d = await r.json()
         throw new Error(d.error || 'Failed to fetch data')
@@ -495,15 +493,6 @@ export default function App() {
       setExistingNegatives(googleNegatives)
       setSharedSets(sets)
       if (sets.length > 0) setSelectedSharedSetId(sets[0].id)
-
-      // Debug what format we're getting
-      if (googleNegatives.length > 0) {
-        console.log('Google negatives format:', googleNegatives.slice(0, 3))
-        console.log('First item type:', typeof googleNegatives[0])
-        if (typeof googleNegatives[0] === 'object') {
-          console.log('First item structure:', googleNegatives[0])
-        }
-      }
 
       // Determine website URL — await detection so we have it before scanning
       let urlToUse = settingsRes.websiteUrl || ''
@@ -606,15 +595,6 @@ export default function App() {
                existing.matchType === matchType
       }
     })
-  }
-
-  // Debug function to see what format the data is in
-  function debugExistingNegatives() {
-    console.log('existingNegatives format:', existingNegatives.slice(0, 3))
-    console.log('Sample item type:', typeof existingNegatives[0])
-    if (existingNegatives[0] && typeof existingNegatives[0] === 'object') {
-      console.log('Sample item structure:', existingNegatives[0])
-    }
   }
 
   // Helper functions for full month date ranges
@@ -877,59 +857,6 @@ export default function App() {
     const toSubmit = pendingNegatives.filter(item => item.selected && !item.alreadyInGoogle)
     if (toSubmit.length === 0) { setSubmitError('No negative keywords selected.'); return }
 
-    console.log('🔍 Debug - Submitting negatives:', toSubmit.map(item => ({
-      keyword: item.keyword,
-      matchType: item.matchType,
-      destination: item.destination,
-      campaignId: item.campaignId,
-      campaignName: item.campaignName,
-      adGroupId: item.adGroupId,
-      adGroupName: item.adGroupName
-    })))
-
-        console.log('🔍 Current existing negatives:', existingNegatives.slice(0, 10)) // Show first 10 for debugging
-
-        // Quick test interface for applying lists to campaigns
-        if (window.location.hash === '#test-apply-list') {
-          window.testApplyList = async (sharedSetId, campaignIds) => {
-            try {
-              const response = await fetch('/api/apply-list-to-campaigns', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  clientId: currentClientId,
-                  sharedSetId,
-                  campaignIds: Array.isArray(campaignIds) ? campaignIds : [campaignIds]
-                })
-              });
-              const result = await response.json();
-              console.log('✅ Apply list result:', result);
-              return result;
-            } catch (err) {
-              console.error('❌ Apply list error:', err);
-            }
-          };
-          
-          window.getCampaigns = async () => {
-            const response = await fetch(`/api/campaigns?clientId=${currentClientId}`);
-            const campaigns = await response.json();
-            console.log('📋 Available campaigns:', campaigns);
-            return campaigns;
-          };
-          
-          window.getSharedSets = async () => {
-            const response = await fetch(`/api/shared-sets?clientId=${currentClientId}`);
-            const sets = await response.json();
-            console.log('📋 Available shared sets:', sets);
-            return sets;
-          };
-          
-          console.log('🧪 TEST MODE: Use these functions in console:');
-          console.log('getCampaigns() - List available campaigns');
-          console.log('getSharedSets() - List available shared sets');  
-          console.log('testApplyList("sharedSetId", ["campaignId1", "campaignId2"]) - Apply list to campaigns');
-        }
-
     // Partition by destination
     const listKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'NEGATIVE_LIST')
     const campaignKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'CAMPAIGN')
@@ -1004,14 +931,6 @@ export default function App() {
               campaignId,
               clientId: currentClientId,
             }
-            console.log('🔵 Sending campaign negative keywords:', payload)
-            
-            // Add test logging for specific keywords that might have issues
-            payload.negativeKeywords.forEach(kw => {
-              if (['vybe', 'photos'].includes(kw.keyword.toLowerCase())) {
-                console.warn(`⚠️ Testing potentially problematic keyword: "${kw.keyword}" (${kw.matchType})`)
-              }
-            })
             
             const r = await fetch('/api/add-campaign-negative', {
               method: 'POST',
@@ -1019,16 +938,13 @@ export default function App() {
               body: JSON.stringify(payload),
             })
             const d = await r.json()
-            console.log('🔵 Campaign negative response:', JSON.stringify(d, null, 2))
-            console.log('🔵 Response status:', r.status, r.statusText)
             
             // Check for partial failures or null campaign_criterion
             const failedKeywords = []
             if (d.response?.results) {
               d.response.results.forEach((result, index) => {
                 if (result.campaign_criterion === null) {
-                  const keyword = payload.negativeKeywords[index]?.keyword
-                  console.log(`ℹ️ Campaign criterion null for keyword "${keyword}" - this is normal with Basic Access (keyword likely created successfully)`)
+                  // This is normal with Basic Access - keyword likely created successfully
                 }
               })
             }
@@ -1057,14 +973,6 @@ export default function App() {
               adGroupId,
               clientId: currentClientId,
             }
-            console.log('🟡 Sending ad group negative keywords:', payload)
-            
-            // Add test logging for specific keywords that might have issues
-            payload.negativeKeywords.forEach(kw => {
-              if (['vybe', 'photos'].includes(kw.keyword.toLowerCase())) {
-                console.warn(`⚠️ Testing potentially problematic keyword: "${kw.keyword}" (${kw.matchType}) at ad group level`)
-              }
-            })
             
             const r = await fetch('/api/add-adgroup-negative', {
               method: 'POST',
@@ -1072,16 +980,13 @@ export default function App() {
               body: JSON.stringify(payload),
             })
             const d = await r.json()
-            console.log('🟡 Ad group negative response:', JSON.stringify(d, null, 2))
-            console.log('🟡 Response status:', r.status, r.statusText)
             
             // Check for partial failures or null ad_group_criterion
             const failedKeywords = []
             if (d.response?.results) {
               d.response.results.forEach((result, index) => {
                 if (result.ad_group_criterion === null) {
-                  const keyword = payload.negativeKeywords[index]?.keyword
-                  console.log(`ℹ️ Ad group criterion null for keyword "${keyword}" - this is normal with Basic Access (keyword likely created successfully)`)
+                  // This is normal with Basic Access - keyword likely created successfully
                 }
               })
             }

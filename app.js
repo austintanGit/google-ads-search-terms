@@ -169,6 +169,8 @@ app.get('/api/search-terms', async (req, res) => {
         const endDate = req.query.endDate || lastOfPrevMonth.toISOString().split('T')[0];
         const startDate = req.query.startDate || firstOfPrevMonth.toISOString().split('T')[0];
 
+       
+
         // Initialize customer with selected client ID
         const customer = client.Customer({
             customer_id: clientId,
@@ -176,7 +178,7 @@ app.get('/api/search-terms', async (req, res) => {
             refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
         });
 
-        // Query for search terms
+        // Query for search terms - back to clicks > 0 filter
         const searchTermQuery = `
             SELECT 
                 search_term_view.search_term,
@@ -196,12 +198,17 @@ app.get('/api/search-terms', async (req, res) => {
             WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
                 AND metrics.clicks > 0
             ORDER BY metrics.clicks DESC
-            LIMIT 500
+            LIMIT 5000
         `;
 
         const searchTermResponse = await customer.query(searchTermQuery);
+        // Log totals to compare with UI
+        const totalClicks = searchTermResponse.reduce((sum, row) => sum + (row.metrics.clicks || 0), 0);
+        const totalImpressions = searchTermResponse.reduce((sum, row) => sum + (row.metrics.impressions || 0), 0);
+        console.log(`API returned: ${searchTermResponse.length} rows | ${totalClicks} clicks | ${totalImpressions} impressions`);
 
-        // Transform the data
+
+        // Transform the data - simple mapping like original
         const transformedData = searchTermResponse.map(row => ({
             searchTerm: row.search_term_view.search_term,
             campaignId: String(row.campaign.id),
