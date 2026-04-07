@@ -232,6 +232,7 @@ function NegativeKeywordsPage({
                 <div className="step-heading-sub">Flag irrelevant terms directly from your search term report</div>
               </div>
             </div>
+            
             <SearchTermsTable
               searchTerms={searchTerms}
               rowNegatives={rowNegatives}
@@ -448,7 +449,9 @@ export default function App() {
         const d = await r.json()
         throw new Error(d.error || 'Failed to fetch data')
       }
-      const terms = await r.json()
+      const data = await r.json()
+      // Handle new response structure with searchTerms and summary
+      const terms = data.searchTerms || data // Fallback for backward compatibility
       setSearchTerms(terms)
 
       if (googleNegs !== undefined) setExistingNegatives(googleNegs)
@@ -597,35 +600,12 @@ export default function App() {
     })
   }
 
-  // Helper functions for full month date ranges
-  function getFullMonth(dateStr) {
-    // Parse the date string
-    const [year, month, day] = dateStr.split('-').map(Number)
-    
-    // Get first day of the month
-    const startDate = `${year}-${String(month).padStart(2, '0')}-01`
-    
-    // Get last day of the month
-    // Since month from dateStr is 1-indexed, we need to convert to 0-indexed for Date constructor
-    // new Date(year, month, 0) gives last day of the month (month is 1-indexed here after conversion)
-    const lastDay = new Date(year, month, 0).getDate()
-    const endDate = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-    return {
-      startDate,
-      endDate
-    }
-  }
-
   function handleStartDateChange(newStartDate) {
-    const { startDate: fullStartDate, endDate: fullEndDate } = getFullMonth(newStartDate)
-    setStartDate(fullStartDate)
-    setEndDate(fullEndDate)
+    setStartDate(newStartDate)
   }
 
   function handleEndDateChange(newEndDate) {
-    const { startDate: fullStartDate, endDate: fullEndDate } = getFullMonth(newEndDate)
-    setStartDate(fullStartDate)
-    setEndDate(fullEndDate)
+    setEndDate(newEndDate)
   }
 
   async function handleDateRangeSubmit(e) {
