@@ -66,6 +66,10 @@ const Register = ({ onSwitchToLogin, onRegistrationSuccess }) => {
       <div className="auth-form">
         <h2>Create Your Account</h2>
         
+        <div className="alert alert-info">
+          <strong>Account Approval Required:</strong> After registration, your account will need to be approved by an administrator before you can access the system. You will receive an email confirmation once approved.
+        </div>
+        
         {error && <div className="alert alert-danger">{error}</div>}
         
         <form onSubmit={handleSubmit}>

@@ -7,11 +7,13 @@ const Login = ({ onSwitchToRegister, onForgotPassword }) => {
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [errorType, setErrorType] = useState('danger'); // 'danger', 'warning', 'info'
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError('');
+    setErrorType('danger');
 
     try {
       const response = await fetch('/api/auth/login', {
@@ -32,9 +34,26 @@ const Login = ({ onSwitchToRegister, onForgotPassword }) => {
         // Reload the page to trigger app refresh
         window.location.reload();
       } else {
-        setError(data.error || 'Login failed');
+        const errorMessage = data.details || data.error || 'Login failed';
+        
+        // Check if it's an approval-related error and provide helpful guidance
+        if (errorMessage.toLowerCase().includes('pending approval')) {
+          setErrorType('warning');
+          setError(
+            '⏳ Your account is pending administrator approval. Please wait for an administrator to review and approve your access. You will receive an email notification when approved.'
+          );
+        } else if (errorMessage.toLowerCase().includes('rejected')) {
+          setErrorType('danger');
+          setError(
+            '❌ Your account has been rejected by an administrator. Please contact support for more information.'
+          );
+        } else {
+          setErrorType('danger');
+          setError(errorMessage);
+        }
       }
     } catch (err) {
+      setErrorType('danger');
       setError('Network error. Please try again.');
     } finally {
       setLoading(false);
@@ -53,7 +72,7 @@ const Login = ({ onSwitchToRegister, onForgotPassword }) => {
       <div className="auth-form">
         <h2>Sign In</h2>
         
-        {error && <div className="alert alert-danger">{error}</div>}
+        {error && <div className={`alert alert-${errorType}`}>{error}</div>}
         
         <form onSubmit={handleSubmit}>
           <div className="mb-3">
