@@ -763,6 +763,12 @@ export default function AIPanel({
                         {entry.list_name ? ` · ${entry.list_name}` : ''}
                         {entry.match_types ? ` · ${entry.match_types}` : ''}
                       </div>
+                      {(entry.submitted_by_email || entry.submitted_by_name) && (
+                        <div className="submission-history-user">
+                          <i className="fas fa-user me-1"></i>
+                          {entry.submitted_by_name || entry.submitted_by_email}
+                        </div>
+                      )}
                     </div>
                     <div className="submission-history-actions">
                       <button

@@ -9,6 +9,19 @@ const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-be
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const cheerio = require('cheerio');
 
+// Import authentication functions
+const { 
+    authenticateToken,
+    requireSuperUser,
+    loginUser, 
+    registerUser, 
+    confirmRegistration, 
+    forgotPassword, 
+    resetPassword,
+    createUserInDB,
+    getUserByEmail
+} = require('./auth');
+
 // PostgreSQL connection pool
 const sslCertPath = process.env.DB_SSL_CERT || '/certs/global-bundle.pem';
 const dbPool = new Pool({
@@ -24,6 +37,20 @@ const dbPool = new Pool({
 
 async function initDB() {
     try {
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                name VARCHAR(255),
+                cognito_sub VARCHAR(255),
+                status VARCHAR(20) DEFAULT 'pending',
+                is_super_user BOOLEAN DEFAULT FALSE,
+                approved_by VARCHAR(255),
+                approved_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
         await dbPool.query(`
             CREATE TABLE IF NOT EXISTS client_website_urls (
                 client_id VARCHAR(30) PRIMARY KEY,
@@ -48,9 +75,27 @@ async function initDB() {
                 keyword_count INTEGER NOT NULL,
                 list_name TEXT,
                 match_types TEXT,
-                keywords JSONB NOT NULL
+                keywords JSONB NOT NULL,
+                submitted_by_email VARCHAR(255),
+                submitted_by_name VARCHAR(255)
             )
         `);
+        
+        // Migration: Add new columns if they don't exist
+        try {
+            await dbPool.query(`
+                ALTER TABLE submission_history 
+                ADD COLUMN IF NOT EXISTS submitted_by_email VARCHAR(255)
+            `);
+            await dbPool.query(`
+                ALTER TABLE submission_history 
+                ADD COLUMN IF NOT EXISTS submitted_by_name VARCHAR(255)
+            `);
+            console.log('Database migration completed: added user tracking columns');
+        } catch (migrationError) {
+            console.log('Migration note:', migrationError.message);
+        }
+        
         console.log('DB tables initialized');
     } catch (err) {
         console.error('DB init error:', err.message);
@@ -110,6 +155,337 @@ try {
     console.error('Error initializing Google Ads API:', error);
     process.exit(1);
 }
+
+// ===== AUTHENTICATION ROUTES =====
+
+// Login endpoint
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+
+        const result = await loginUser(email, password, dbPool);
+        res.json(result);
+    } catch (error) {
+        console.error('Login error:', error);
+        
+        if (error.name === 'NotAuthorizedException') {
+            res.status(401).json({ error: 'Invalid email or password' });
+        } else if (error.name === 'UserNotConfirmedException') {
+            res.status(401).json({ error: 'Please confirm your email address first' });
+        } else {
+            res.status(500).json({ error: 'Login failed', details: error.message });
+        }
+    }
+});
+
+// Register endpoint
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { email, password, name } = req.body;
+        
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password are required' });
+        }
+
+        const result = await registerUser(email, password, name);
+        
+        // Create user record in database after successful Cognito registration
+        if (result.success) {
+            await createUserInDB(email, name, result.userSub, dbPool);
+        }
+        
+        res.json(result);
+    } catch (error) {
+        console.error('Registration error:', error);
+        
+        if (error.name === 'UsernameExistsException') {
+            res.status(400).json({ error: 'An account with this email already exists' });
+        } else if (error.name === 'InvalidPasswordException') {
+            res.status(400).json({ error: 'Password does not meet requirements' });
+        } else {
+            res.status(500).json({ error: 'Registration failed', details: error.message });
+        }
+    }
+});
+
+// Confirm registration endpoint
+app.post('/api/auth/confirm', async (req, res) => {
+    try {
+        const { email, confirmationCode } = req.body;
+        
+        if (!email || !confirmationCode) {
+            return res.status(400).json({ error: 'Email and confirmation code are required' });
+        }
+
+        const result = await confirmRegistration(email, confirmationCode);
+        res.json(result);
+    } catch (error) {
+        console.error('Confirmation error:', error);
+        
+        if (error.name === 'CodeMismatchException') {
+            res.status(400).json({ error: 'Invalid confirmation code' });
+        } else if (error.name === 'ExpiredCodeException') {
+            res.status(400).json({ error: 'Confirmation code has expired' });
+        } else {
+            res.status(500).json({ error: 'Confirmation failed', details: error.message });
+        }
+    }
+});
+
+// Forgot password endpoint
+app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' });
+        }
+
+        const result = await forgotPassword(email);
+        res.json(result);
+    } catch (error) {
+        console.error('Forgot password error:', error);
+        res.status(500).json({ error: 'Failed to send reset code', details: error.message });
+    }
+});
+
+// Reset password endpoint
+app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+        const { email, confirmationCode, newPassword } = req.body;
+        
+        if (!email || !confirmationCode || !newPassword) {
+            return res.status(400).json({ error: 'Email, confirmation code, and new password are required' });
+        }
+
+        const result = await resetPassword(email, confirmationCode, newPassword);
+        res.json(result);
+    } catch (error) {
+        console.error('Reset password error:', error);
+        
+        if (error.name === 'CodeMismatchException') {
+            res.status(400).json({ error: 'Invalid confirmation code' });
+        } else if (error.name === 'ExpiredCodeException') {
+            res.status(400).json({ error: 'Confirmation code has expired' });
+        } else {
+            res.status(500).json({ error: 'Password reset failed', details: error.message });
+        }
+    }
+});
+
+// Logout endpoint
+app.post('/api/auth/logout', authenticateToken, (req, res) => {
+    // Since JWTs are stateless, logout is handled client-side by removing the token
+    res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Get current user info
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+    res.json({ 
+        success: true, 
+        user: { 
+            email: req.user.email,
+            name: req.user.name || ''
+        } 
+    });
+});
+
+// ===== END AUTHENTICATION ROUTES =====
+
+// ===== ADMIN ROUTES (Super User Only) =====
+
+// Get pending users
+app.get('/api/admin/pending-users', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const result = await dbPool.query(
+            `SELECT id, email, name, status, created_at 
+             FROM users 
+             WHERE status = 'pending' 
+             ORDER BY created_at ASC`
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching pending users:', error);
+        res.status(500).json({ error: 'Failed to fetch pending users', details: error.message });
+    }
+});
+
+// Get all users
+app.get('/api/admin/users', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const result = await dbPool.query(
+            `SELECT id, email, name, status, is_super_user, approved_by, approved_at, created_at 
+             FROM users 
+             ORDER BY created_at DESC`
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching users:', error);
+        res.status(500).json({ error: 'Failed to fetch users', details: error.message });
+    }
+});
+
+// Approve user
+app.post('/api/admin/approve-user', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const { userId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        const result = await dbPool.query(
+            `UPDATE users 
+             SET status = 'approved', approved_by = $1, approved_at = NOW(), updated_at = NOW()
+             WHERE id = $2 
+             RETURNING id, email, name, status`,
+            [req.user.email, userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        console.log(`User ${result.rows[0].email} approved by ${req.user.email}`);
+        res.json({ 
+            success: true, 
+            message: `User ${result.rows[0].email} has been approved`,
+            user: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Error approving user:', error);
+        res.status(500).json({ error: 'Failed to approve user', details: error.message });
+    }
+});
+
+// Reject user
+app.post('/api/admin/reject-user', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const { userId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        const result = await dbPool.query(
+            `UPDATE users 
+             SET status = 'rejected', approved_by = $1, approved_at = NOW(), updated_at = NOW()
+             WHERE id = $2 
+             RETURNING id, email, name, status`,
+            [req.user.email, userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        console.log(`User ${result.rows[0].email} rejected by ${req.user.email}`);
+        res.json({ 
+            success: true, 
+            message: `User ${result.rows[0].email} has been rejected`,
+            user: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Error rejecting user:', error);
+        res.status(500).json({ error: 'Failed to reject user', details: error.message });
+    }
+});
+
+// Make user super user
+app.post('/api/admin/make-super-user', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const { userId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        const result = await dbPool.query(
+            `UPDATE users 
+             SET is_super_user = true, updated_at = NOW()
+             WHERE id = $1 
+             RETURNING id, email, name, is_super_user`,
+            [userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        console.log(`User ${result.rows[0].email} granted super user by ${req.user.email}`);
+        res.json({ 
+            success: true, 
+            message: `User ${result.rows[0].email} is now a super user`,
+            user: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Error making user super user:', error);
+        res.status(500).json({ error: 'Failed to make user super user', details: error.message });
+    }
+});
+
+// Remove super user status
+app.post('/api/admin/remove-super-user', authenticateToken, requireSuperUser, async (req, res) => {
+    try {
+        const { userId } = req.body;
+        
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        // Prevent removing super user status from self
+        if (parseInt(userId) === req.user.userId) {
+            return res.status(400).json({ error: 'Cannot remove super user status from yourself' });
+        }
+
+        const result = await dbPool.query(
+            `UPDATE users 
+             SET is_super_user = false, updated_at = NOW()
+             WHERE id = $1 
+             RETURNING id, email, name, is_super_user`,
+            [userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        console.log(`Super user status removed from ${result.rows[0].email} by ${req.user.email}`);
+        res.json({ 
+            success: true, 
+            message: `Super user status removed from ${result.rows[0].email}`,
+            user: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Error removing super user:', error);
+        res.status(500).json({ error: 'Failed to remove super user status', details: error.message });
+    }
+});
+
+// ===== END ADMIN ROUTES =====
+
+// Protected API routes - require authentication
+app.use('/api/clients', authenticateToken);
+app.use('/api/search-terms', authenticateToken);
+app.use('/api/negative-keywords', authenticateToken);
+app.use('/api/shared-sets', authenticateToken);
+app.use('/api/create-shared-set', authenticateToken);
+app.use('/api/add-to-exclusion-list', authenticateToken);
+app.use('/api/ai-recommend-negatives', authenticateToken);
+app.use('/api/detect-website', authenticateToken);
+app.use('/api/client-settings', authenticateToken);
+app.use('/api/client-website-url', authenticateToken);
+app.use('/api/client-saved-negatives', authenticateToken);
+app.use('/api/submission-history', authenticateToken);
+app.use('/api/campaigns', authenticateToken);
+app.use('/api/adgroups', authenticateToken);
+app.use('/api/add-campaign-negative', authenticateToken);
+app.use('/api/add-adgroup-negative', authenticateToken);
+app.use('/api/apply-list-to-campaigns', authenticateToken);
 
 // New endpoint to get list of clients
 app.get('/api/clients', async (req, res) => {
@@ -893,16 +1269,24 @@ app.delete('/api/client-saved-negatives', async (req, res) => {
 });
 
 // Save a submission record
-app.post('/api/submission-history', async (req, res) => {
+app.post('/api/submission-history', authenticateToken, async (req, res) => {
     const { clientId, keywords, listName, matchTypes } = req.body;
     if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
     if (!keywords || !keywords.length) return res.status(400).json({ error: 'Keywords are required' });
 
     try {
         await dbPool.query(
-            `INSERT INTO submission_history (client_id, keyword_count, list_name, match_types, keywords)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [clientId, keywords.length, listName || '', matchTypes || '', JSON.stringify(keywords)]
+            `INSERT INTO submission_history (client_id, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+                clientId, 
+                keywords.length, 
+                listName || '', 
+                matchTypes || '', 
+                JSON.stringify(keywords),
+                req.user.email,
+                req.user.name || ''
+            ]
         );
         res.json({ success: true });
     } catch (err) {
@@ -912,17 +1296,17 @@ app.post('/api/submission-history', async (req, res) => {
 });
 
 // Get submission history for a client
-app.get('/api/submission-history', async (req, res) => {
+app.get('/api/submission-history', authenticateToken, async (req, res) => {
     const { clientId } = req.query;
     if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
 
     try {
         const result = await dbPool.query(
-            `SELECT id, submitted_at, keyword_count, list_name, match_types, keywords
+            `SELECT id, submitted_at, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name
              FROM submission_history
              WHERE client_id = $1
              ORDER BY submitted_at DESC
-             LIMIT 30`,
+             LIMIT 50`,
             [clientId]
         );
         res.json(result.rows);

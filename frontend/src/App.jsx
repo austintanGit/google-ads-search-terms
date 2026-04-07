@@ -4,6 +4,67 @@ import Select from 'react-select'
 import { getDefaultDates, escapeRegex } from './utils'
 import SearchTermsTable from './SearchTermsTable'
 import AIPanel from './AIPanel'
+import AuthPage from './components/AuthPage'
+import AdminPanel from './components/AdminPanel'
+
+// Authentication check
+function useAuth() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem('authToken');
+    const savedUser = localStorage.getItem('user');
+    
+    if (token && savedUser) {
+      // Verify token is still valid
+      fetch('/api/auth/me', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      })
+      .then(response => {
+        if (response.ok) {
+          setUser(JSON.parse(savedUser));
+        } else {
+          // Token invalid, clear it
+          localStorage.removeItem('authToken');
+          localStorage.removeItem('user');
+        }
+      })
+      .catch(() => {
+        // Network error or token invalid
+        localStorage.removeItem('authToken');
+        localStorage.removeItem('user');
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+    } else {
+      setLoading(false);
+    }
+  }, []);
+
+  const logout = () => {
+    localStorage.removeItem('authToken');
+    localStorage.removeItem('user');
+    setUser(null);
+  };
+
+  return { user, loading, logout };
+}
+
+// Add authentication header to fetch requests
+const authenticatedFetch = (url, options = {}) => {
+  const token = localStorage.getItem('authToken');
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+    }
+  });
+};
 
 // Single word → Exact, multi-word → Phrase
 function inferMatchType(kw) {
@@ -37,7 +98,7 @@ function inferKeywordDestination(kw, terms) {
   }
 }
 
-function HomePage({ onNavigate }) {
+function HomePage({ onNavigate, user }) {
   return (
     <div className="home-page">
       <img src="/assets/main.png" alt="Google Ads AI Management Tools" className="home-main-img" />
@@ -58,12 +119,31 @@ function HomePage({ onNavigate }) {
           </div>
           <i className="fas fa-arrow-right home-tool-arrow" />
         </button>
+        {user && user.isSuperUser && (
+          <button
+            className="home-tool-card"
+            onClick={() => onNavigate('/admin')}
+          >
+            <div className="home-tool-icon">
+              <i className="fas fa-users-cog" style={{ fontSize: '2rem', color: '#667eea' }}></i>
+            </div>
+            <div className="home-tool-info">
+              <span className="home-tool-name">User Administration</span>
+              <span className="home-tool-desc">
+                Approve new users and manage access permissions for the application.
+              </span>
+            </div>
+            <i className="fas fa-arrow-right home-tool-arrow" />
+          </button>
+        )}
       </div>
     </div>
   )
 }
 
 function NegativeKeywordsPage({
+  user,
+  onLogout,
   clients,
   currentClientId,
   onClientChange,
@@ -182,6 +262,42 @@ function NegativeKeywordsPage({
                 </button>
               </div>
             </div>
+            <div className="header-divider"></div>
+            <div className="header-control-group">
+              <div className="user-dropdown">
+                <button className="user-dropdown-toggle" type="button">
+                  <div className="user-avatar">
+                    <i className="fas fa-user"></i>
+                  </div>
+                  <i className="fas fa-chevron-down user-dropdown-arrow"></i>
+                </button>
+                <div className="user-dropdown-menu">
+                  <div className="user-dropdown-header">
+                    <div className="user-info">
+                      <div className="user-name">{user.name || 'User'}</div>
+                      <div className="user-email">{user.email}</div>
+                    </div>
+                  </div>
+                  <div className="user-dropdown-divider"></div>
+                  {user.isSuperUser && (
+                    <>
+                      <button 
+                        className="user-dropdown-item admin-btn" 
+                        onClick={() => window.location.href = '/admin'}
+                      >
+                        <i className="fas fa-users-cog"></i>
+                        <span>User Management</span>
+                      </button>
+                      <div className="user-dropdown-divider"></div>
+                    </>
+                  )}
+                  <button className="user-dropdown-item logout-btn" onClick={onLogout}>
+                    <i className="fas fa-sign-out-alt"></i>
+                    <span>Logout</span>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </header>
@@ -293,6 +409,43 @@ function NegativeKeywordsPage({
 }
 
 export default function App() {
+  const { user, loading, logout } = useAuth();
+
+  // If still checking authentication, show loading
+  if (loading) {
+    return (
+      <div style={{ 
+        display: 'flex', 
+        justifyContent: 'center', 
+        alignItems: 'center', 
+        height: '100vh',
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
+      }}>
+        <div style={{ 
+          background: 'white', 
+          padding: '40px', 
+          borderRadius: '12px',
+          textAlign: 'center'
+        }}>
+          <div className="spinner-border text-primary" role="status">
+            <span className="visually-hidden">Loading...</span>
+          </div>
+          <p style={{ marginTop: '20px', color: '#666' }}>Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // If not authenticated, show login page
+  if (!user) {
+    return <AuthPage />;
+  }
+
+  // If authenticated, show the main app
+  return <AuthenticatedApp user={user} onLogout={logout} />;
+}
+
+function AuthenticatedApp({ user, onLogout }) {
   const { startDate: defaultStart, endDate: defaultEnd } = getDefaultDates()
   
   const today = new Date().toISOString().split('T')[0]
@@ -415,7 +568,7 @@ export default function App() {
 
   // Load clients on mount
   useEffect(() => {
-    fetch('/api/clients')
+    authenticatedFetch('/api/clients')
       .then(r => r.json())
       .then(data => setClients(Array.isArray(data) ? data : []))
       .catch(err => setError('Error loading clients: ' + err.message))
@@ -444,7 +597,7 @@ export default function App() {
     setError('')
     try {
       const url = `/api/search-terms?clientId=${clientId}&startDate=${start}&endDate=${end}`;
-      const r = await fetch(url)
+      const r = await authenticatedFetch(url)
       if (!r.ok) {
         const d = await r.json()
         throw new Error(d.error || 'Failed to fetch data')
@@ -481,10 +634,10 @@ export default function App() {
 
     try {
       const [settingsRes, negRes, setsRes, historyRes] = await Promise.all([
-        fetch(`/api/client-settings?clientId=${clientId}`).then(r => r.json()),
-        fetch(`/api/negative-keywords?clientId=${clientId}`).then(r => r.json()),
-        fetch(`/api/shared-sets?clientId=${clientId}`).then(r => r.json()),
-        fetch(`/api/submission-history?clientId=${clientId}`).then(r => r.json()),
+        authenticatedFetch(`/api/client-settings?clientId=${clientId}`).then(r => r.json()),
+        authenticatedFetch(`/api/negative-keywords?clientId=${clientId}`).then(r => r.json()),
+        authenticatedFetch(`/api/shared-sets?clientId=${clientId}`).then(r => r.json()),
+        authenticatedFetch(`/api/submission-history?clientId=${clientId}`).then(r => r.json()),
       ])
       setSubmissionHistory(Array.isArray(historyRes) ? historyRes : [])
 
@@ -503,7 +656,7 @@ export default function App() {
         setWebsiteUrl(urlToUse)
       } else {
         try {
-          const d = await fetch(`/api/detect-website?clientId=${clientId}`).then(r => r.json())
+          const d = await authenticatedFetch(`/api/detect-website?clientId=${clientId}`).then(r => r.json())
           if (d.websiteUrl) {
             urlToUse = d.websiteUrl
             setWebsiteUrl(d.websiteUrl)
@@ -524,7 +677,7 @@ export default function App() {
       if (urlToUse && terms && terms.length > 0) {
         setAiLoading(true)
         try {
-          const r = await fetch('/api/ai-recommend-negatives', {
+          const r = await authenticatedFetch('/api/ai-recommend-negatives', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ searchTerms: terms, websiteUrl: urlToUse.trim() }),
@@ -620,7 +773,7 @@ export default function App() {
     if (websiteUrl && terms && terms.length > 0) {
       setAiLoading(true)
       try {
-        const r = await fetch('/api/ai-recommend-negatives', {
+        const r = await authenticatedFetch('/api/ai-recommend-negatives', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ searchTerms: terms, websiteUrl: websiteUrl.trim() }),
@@ -660,7 +813,7 @@ export default function App() {
 
     if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(keyword.toLowerCase())) {
       setDbSavedNegatives(prev => [...prev, keyword])
-      fetch('/api/client-saved-negatives', {
+      authenticatedFetch('/api/client-saved-negatives', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clientId: currentClientId, keywords: [keyword] }),
@@ -681,7 +834,7 @@ export default function App() {
     
     if (currentClientId && dbSavedNegatives.map(k => k.toLowerCase()).includes(kwLower)) {
       setDbSavedNegatives(prev => prev.filter(k => k.toLowerCase() !== kwLower))
-      fetch('/api/client-saved-negatives', {
+      authenticatedFetch('/api/client-saved-negatives', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clientId: currentClientId, keyword }),
@@ -732,7 +885,7 @@ export default function App() {
 
   async function handleCreateSharedSet(name) {
     if (!currentClientId) throw new Error('No client selected')
-    const r = await fetch('/api/create-shared-set', {
+    const r = await authenticatedFetch('/api/create-shared-set', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId: currentClientId, name }),
@@ -782,7 +935,7 @@ export default function App() {
     setUrlPopupLoading(true)
     try {
       // Save the website URL to the database
-      await fetch('/api/client-website-url', {
+      await authenticatedFetch('/api/client-website-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -802,7 +955,7 @@ export default function App() {
       if (searchTerms.length > 0) {
         setAiLoading(true)
         try {
-          const r = await fetch('/api/ai-recommend-negatives', {
+          const r = await authenticatedFetch('/api/ai-recommend-negatives', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ searchTerms, websiteUrl: tempWebsiteUrl.trim() }),
@@ -877,7 +1030,7 @@ export default function App() {
         const listResults = await Promise.all(
           Object.entries(byList).map(async ([sid, items]) => {
             const selectedSet = sharedSets.find(s => s.id === sid)
-            const r = await fetch('/api/add-to-exclusion-list', {
+            const r = await authenticatedFetch('/api/add-to-exclusion-list', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -912,7 +1065,7 @@ export default function App() {
               clientId: currentClientId,
             }
             
-            const r = await fetch('/api/add-campaign-negative', {
+            const r = await authenticatedFetch('/api/add-campaign-negative', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -954,7 +1107,7 @@ export default function App() {
               clientId: currentClientId,
             }
             
-            const r = await fetch('/api/add-adgroup-negative', {
+            const r = await authenticatedFetch('/api/add-adgroup-negative', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -994,7 +1147,7 @@ export default function App() {
           ? ({ EXACT: 'Exact match', PHRASE: 'Phrase match', BROAD: 'Broad match' }[uniqueTypes[0]] || uniqueTypes[0])
           : 'Mixed match types'
         const listNames = [...new Set(listKeywords.map(i => sharedSets.find(s => s.id === i.sharedSetId)?.name || i.sharedSetId))]
-        fetch('/api/submission-history', {
+        authenticatedFetch('/api/submission-history', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1013,6 +1166,8 @@ export default function App() {
               list_name: listNames.join(', '),
               match_types: matchTypeLabel,
               keywords: listKeywords.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+              submitted_by_email: user.email,
+              submitted_by_name: user.name || ''
             }, ...prev])
           })
           .catch(console.error)
@@ -1032,9 +1187,11 @@ export default function App() {
 
   return (
     <Routes>
-      <Route path="/" element={<HomePage onNavigate={navigate} />} />
+      <Route path="/" element={<HomePage onNavigate={navigate} user={user} />} />
       <Route path="/negative-keywords" element={
         <NegativeKeywordsPage
+          user={user}
+          onLogout={onLogout}
           clients={clients}
           currentClientId={currentClientId}
           onClientChange={handleClientChange}
@@ -1077,6 +1234,23 @@ export default function App() {
           handleSkipWebsiteUrl={handleSkipWebsiteUrl}
           existingNegatives={existingNegatives}
         />
+      } />
+      <Route path="/admin" element={
+        user && user.isSuperUser ? (
+          <AdminPanel user={user} />
+        ) : (
+          <div className="access-denied">
+            <div className="access-denied-content">
+              <i className="fas fa-shield-alt text-danger mb-3" style={{ fontSize: '4rem' }}></i>
+              <h3>Access Denied</h3>
+              <p className="text-muted">You don't have permission to access this page.</p>
+              <button className="btn btn-primary" onClick={() => navigate('/')}>
+                <i className="fas fa-home me-1"></i>
+                Go Home
+              </button>
+            </div>
+          </div>
+        )
       } />
     </Routes>
   )
