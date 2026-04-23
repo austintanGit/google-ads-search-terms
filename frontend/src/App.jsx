@@ -169,6 +169,7 @@ function NegativeKeywordsPage({
   onCreateSharedSet,
   onAddManualNegative,
   onRemoveNegative,
+  onRemoveGoogleNegative,
   onSubmitNegatives,
   submitSuccess,
   setSubmitSuccess,
@@ -354,6 +355,7 @@ function NegativeKeywordsPage({
               rowNegatives={rowNegatives}
               onAddNegative={onAddManualNegative}
               onRemoveNegative={onRemoveNegative}
+              onRemoveGoogleNegative={onRemoveGoogleNegative}
               existingNegatives={existingNegatives}
             />
           </>
@@ -688,6 +690,7 @@ function AuthenticatedApp({ user, onLogout }) {
           }
           const result = await r.json()
           const aiKeywords = result.negativeKeywords || []
+          const sourcesMap = result.negativeKeywordSources || {}
           
           // Only count truly new keywords (not existing in any match type)
           const trueNewKeywords = aiKeywords.filter(kw => {
@@ -707,7 +710,7 @@ function AuthenticatedApp({ user, onLogout }) {
               .map(kw => {
                 const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, terms)
                 const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, googleNegatives)
-                return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
+                return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
               })
             return [...prev, ...newItems]
           })
@@ -847,8 +850,27 @@ function AuthenticatedApp({ user, onLogout }) {
     });
   }, [currentClientId, dbSavedNegatives])
 
+  const handleRemoveGoogleNegative = useCallback(async (resourceName, source) => {
+    if (!currentClientId || !resourceName) return
+    try {
+      const r = await authenticatedFetch('/api/remove-google-negative', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId: currentClientId, resourceName, source }),
+      })
+      if (!r.ok) {
+        const d = await r.json()
+        throw new Error(d.details || d.error || 'Failed to remove')
+      }
+      setExistingNegatives(prev => prev.filter(n => n.resourceName !== resourceName))
+    } catch (err) {
+      console.error('Failed to remove Google negative:', err.message)
+    }
+  }, [currentClientId])
+
   const handleAiResults = useCallback((result) => {
     const aiKeywords = result.negativeKeywords || []
+    const sourcesMap = result.negativeKeywordSources || {}
 
     // Only count truly new keywords (not existing in any match type)
     const trueNewKeywords = aiKeywords.filter(kw => {
@@ -868,7 +890,7 @@ function AuthenticatedApp({ user, onLogout }) {
         .map(kw => {
           const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, searchTerms)
           const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, existingNegatives)
-          return { keyword: kw, matchType, source: 'ai', selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
+          return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
         })
       return [...prev, ...newItems]
     })
@@ -1217,6 +1239,7 @@ function AuthenticatedApp({ user, onLogout }) {
           onCreateSharedSet={handleCreateSharedSet}
           onAddManualNegative={handleAddManualNegative}
           onRemoveNegative={handleRemoveNegativeFromRow}
+          onRemoveGoogleNegative={handleRemoveGoogleNegative}
           onSubmitNegatives={handleSubmitNegatives}
           submitSuccess={submitSuccess}
           setSubmitSuccess={setSubmitSuccess}

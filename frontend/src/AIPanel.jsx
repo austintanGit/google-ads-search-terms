@@ -642,6 +642,14 @@ export default function AIPanel({
                       }
                     </div>
                     {renderKeywordDetails(item)}
+                    {item.source === 'ai' && item.sourceSearchTerms?.length > 0 && (
+                      <div className="kw-dest-result">
+                        <span className="kw-dest-result-item">
+                          <span className="kw-dest-result-label">Search term:</span>
+                          <span className="kw-dest-result-val">{item.sourceSearchTerms[0]}</span>
+                        </span>
+                      </div>
+                    )}
                   </td>
                   <td className="col-matchtype">
                     <select

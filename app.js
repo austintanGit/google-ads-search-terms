@@ -485,6 +485,7 @@ app.use('/api/campaigns', authenticateToken);
 app.use('/api/adgroups', authenticateToken);
 app.use('/api/add-campaign-negative', authenticateToken);
 app.use('/api/add-adgroup-negative', authenticateToken);
+app.use('/api/remove-google-negative', authenticateToken);
 app.use('/api/apply-list-to-campaigns', authenticateToken);
 
 // New endpoint to get list of clients
@@ -634,6 +635,7 @@ app.get('/api/negative-keywords', async (req, res) => {
         const queries = [
             // 1. Shared set negative keywords (negative keyword lists)
             `SELECT 
+                shared_criterion.resource_name,
                 shared_criterion.keyword.text,
                 shared_criterion.keyword.match_type,
                 shared_set.name,
@@ -647,6 +649,7 @@ app.get('/api/negative-keywords', async (req, res) => {
             
             // 2. Campaign-level negative keywords
             `SELECT 
+                campaign_criterion.resource_name,
                 campaign_criterion.keyword.text,
                 campaign_criterion.keyword.match_type,
                 campaign.name,
@@ -658,6 +661,7 @@ app.get('/api/negative-keywords', async (req, res) => {
             
             // 3. Ad group-level negative keywords  
             `SELECT 
+                ad_group_criterion.resource_name,
                 ad_group_criterion.keyword.text,
                 ad_group_criterion.keyword.match_type,
                 ad_group.name,
@@ -691,7 +695,8 @@ app.get('/api/negative-keywords', async (req, res) => {
                     keyword: row.shared_criterion.keyword.text,
                     matchType: matchType,
                     source: 'SHARED_SET',
-                    location: row.shared_set.name
+                    location: row.shared_set.name,
+                    resourceName: row.shared_criterion.resource_name,
                 });
             });
 
@@ -710,7 +715,8 @@ app.get('/api/negative-keywords', async (req, res) => {
                     keyword: row.campaign_criterion.keyword.text,
                     matchType: matchType,
                     source: 'CAMPAIGN',
-                    location: row.campaign.name
+                    location: row.campaign.name,
+                    resourceName: row.campaign_criterion.resource_name,
                 });
             });
 
@@ -729,7 +735,8 @@ app.get('/api/negative-keywords', async (req, res) => {
                     keyword: row.ad_group_criterion.keyword.text,
                     matchType: matchType,
                     source: 'AD_GROUP',
-                    location: `${row.campaign.name} › ${row.ad_group.name}`
+                    location: `${row.campaign.name} › ${row.ad_group.name}`,
+                    resourceName: row.ad_group_criterion.resource_name,
                 });
             });
 
@@ -1126,13 +1133,16 @@ Respond ONLY with a valid JSON object in this exact format, with no additional t
         const parsed = JSON.parse(jsonText);
 
         // Hard filter: remove any keyword the AI invented that isn't present in the actual search terms
-        const searchTermsLower = searchTerms.map(st => st.searchTerm.toLowerCase());
+        const sourcesMap = {};
         parsed.negativeKeywords = (parsed.negativeKeywords || []).filter(kw => {
             const kwLower = kw.toLowerCase().trim();
             const escaped = kwLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i');
-            return searchTermsLower.some(term => re.test(term));
+            const matches = searchTerms.filter(st => re.test(st.searchTerm.toLowerCase())).map(st => st.searchTerm);
+            sourcesMap[kw] = matches;
+            return matches.length > 0;
         });
+        parsed.negativeKeywordSources = sourcesMap;
 
         // Recalculate summary counts based on validated keywords
         if (parsed.summary) {
@@ -1431,6 +1441,35 @@ app.post('/api/add-adgroup-negative', async (req, res) => {
         console.error('Error adding ad group-level negatives:', err.errors || err.message);
         const details = err.errors?.[0]?.message || err.message || 'Unknown error';
         res.status(500).json({ error: 'Failed to add ad group-level negative keywords', details });
+    }
+});
+
+// Remove a negative keyword from Google Ads (campaign, ad group, or shared set)
+app.delete('/api/remove-google-negative', async (req, res) => {
+    const { resourceName, source, clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID required' });
+    if (!resourceName) return res.status(400).json({ error: 'Resource name required' });
+    if (!source) return res.status(400).json({ error: 'Source required' });
+    try {
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+        if (source === 'CAMPAIGN') {
+            await withRetry(() => customer.campaignCriteria.remove([resourceName]));
+        } else if (source === 'AD_GROUP') {
+            await withRetry(() => customer.adGroupCriteria.remove([resourceName]));
+        } else if (source === 'SHARED_SET') {
+            await withRetry(() => customer.sharedCriteria.remove([resourceName]));
+        } else {
+            return res.status(400).json({ error: `Unknown source type: ${source}` });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error removing Google negative:', err.errors || err.message);
+        const details = err.errors?.[0]?.message || err.message || 'Unknown error';
+        res.status(500).json({ error: 'Failed to remove negative keyword', details });
     }
 });
 

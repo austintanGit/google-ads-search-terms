@@ -60,7 +60,7 @@ function HighlightedSearchTerm({ text, negatives }) {
   )
 }
 
-function NegativeBadges({ negatives, onRemove, existingNegatives, onAddNegative, searchTerm, campaignId, campaignName, adGroupId, adGroupName }) {
+function NegativeBadges({ negatives, onRemove, onRemoveGoogle, existingNegatives, onAddNegative, searchTerm, campaignId, campaignName, adGroupId, adGroupName }) {
   if (!negatives || negatives.size === 0) return null
 
   const googlePhrases = new Set(
@@ -103,9 +103,14 @@ function NegativeBadges({ negatives, onRemove, existingNegatives, onAddNegative,
       
       const key = keywordOnly.toLowerCase()
       if (!googleKeywordGroups.has(key)) {
+        // Find matching existing negatives to get resourceName/source
+        const matches = (existingNegatives || []).filter(n =>
+          typeof n === 'object' && n.keyword?.toLowerCase() === key
+        )
         googleKeywordGroups.set(key, {
           keyword: keywordOnly,
-          matchTypes: new Set()
+          matchTypes: new Set(),
+          negativeEntries: matches,
         })
       }
       googleKeywordGroups.get(key).matchTypes.add(matchType.toUpperCase())
@@ -121,15 +126,27 @@ function NegativeBadges({ negatives, onRemove, existingNegatives, onAddNegative,
         
         return (
           <div key={`google-${keyLower}`} className="neg-badge-with-options neg-badge-google">
-            <div className="neg-badge-chips">
-              {Array.from(group.matchTypes).map(matchType => (
-                <span key={`${keyLower}-${matchType}`} className="neg-badge-chip">
-                  {formatKeywordWithNotation(group.keyword, matchType)}
-                </span>
-              ))}
-            </div>
+            {Array.from(group.matchTypes).map(matchType => {
+              const entry = group.negativeEntries.find(e => e.matchType === matchType)
+              return (
+                <div key={`${keyLower}-${matchType}`} className="neg-badge-chip-group">
+                  <span className="neg-badge-chip">
+                    {formatKeywordWithNotation(group.keyword, matchType)}
+                  </span>
+                  {onRemoveGoogle && entry?.resourceName && (
+                    <button
+                      className="btn-remove-google-negative"
+                      onClick={(e) => { e.stopPropagation(); onRemoveGoogle(entry.resourceName, entry.source) }}
+                      title={`Remove "${group.keyword}" (${matchType}) from ${entry.location}`}
+                    >
+                      – Remove
+                    </button>
+                  )}
+                </div>
+              )
+            })}
             {availableMatchTypes.length > 0 && (
-              <div className="negative-match-options">
+              <div className="neg-badge-chip-buttons">
                 {availableMatchTypes.map(matchType => (
                   <button
                     key={`${group.keyword}-${matchType.value}`}
@@ -198,7 +215,7 @@ const COLUMNS = [
   { key: 'negatives', label: 'NEGATIVE', sortable: false },
 ]
 
-export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegative, onRemoveNegative, existingNegatives }) {
+export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegative, onRemoveNegative, onRemoveGoogleNegative, existingNegatives }) {
   const [sortCol, setSortCol] = useState('clicks')
   const [sortDir, setSortDir] = useState('desc')
   const [searchFilter, setSearchFilter] = useState('')
@@ -449,7 +466,8 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
                     <td>
                       <NegativeBadges 
                         negatives={negatives} 
-                        onRemove={onRemoveNegative} 
+                        onRemove={onRemoveNegative}
+                        onRemoveGoogle={onRemoveGoogleNegative}
                         existingNegatives={existingNegatives}
                         onAddNegative={onAddNegative}
                         searchTerm={term.searchTerm}

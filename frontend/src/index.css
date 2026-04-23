@@ -670,6 +670,20 @@
   line-height: 1.2;
 }
 
+.btn-remove-google-negative {
+  background: none;
+  color: #ef4444;
+  border: none;
+  font-size: 0.6rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.btn-remove-google-negative:hover {
+  color: #b91c1c;
+}
+
 
 /* Source badge */
 .source-badge {
@@ -685,9 +699,10 @@
 /* Nested badge with options */
 .neg-badge-with-options {
   display: inline-flex;
-  flex-direction: column;
+  flex-direction: row;
+  flex-wrap: wrap;
   align-items: flex-start;
-  gap: 0;
+  gap: 6px;
   padding: 6px 8px;
   line-height: 1.3;
 }
@@ -1577,6 +1592,21 @@
   flex-wrap: wrap;
   gap: 0;
   margin-bottom: 2px;
+}
+
+.neg-badge-chip-group {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.neg-badge-chip-buttons {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 2px;
 }
 
 .neg-badge-chip {
