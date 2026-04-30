@@ -158,6 +158,8 @@ function NegativeKeywordsPage({
   aiStats,
   aiLoading,
   searchTerms,
+  campaigns,
+  adGroupsByCampaign,
   pendingNegatives,
   setPendingNegatives,
   sharedSets,
@@ -175,6 +177,7 @@ function NegativeKeywordsPage({
   setSubmitSuccess,
   submitError,
   setSubmitError,
+  manualAddSuccess,
   submissionHistory,
   rowNegatives,
   error,
@@ -308,8 +311,22 @@ function NegativeKeywordsPage({
           currentClientId={currentClientId}
           websiteUrl={websiteUrl}
           setWebsiteUrl={setWebsiteUrl}
+          onSaveWebsiteUrl={async (url) => {
+            if (!currentClientId) return
+            try {
+              await authenticatedFetch('/api/client-website-url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ clientId: currentClientId, websiteUrl: url }),
+              })
+            } catch (err) {
+              console.error('Failed to save website URL:', err)
+            }
+          }}
           aiStats={aiStats}
           aiLoading={aiLoading}
+          campaigns={campaigns}
+          adGroupsByCampaign={adGroupsByCampaign}
           pendingNegatives={pendingNegatives}
           setPendingNegatives={setPendingNegatives}
           sharedSets={sharedSets}
@@ -320,11 +337,13 @@ function NegativeKeywordsPage({
           onCreateSharedSet={onCreateSharedSet}
           onAddManualNegative={onAddManualNegative}
           onRemoveNegative={onRemoveNegative}
+          onRemoveGoogleNegative={onRemoveGoogleNegative}
           onSubmitNegatives={onSubmitNegatives}
           submitSuccess={submitSuccess}
           setSubmitSuccess={setSubmitSuccess}
           submitError={submitError}
           setSubmitError={setSubmitError}
+          manualAddSuccess={manualAddSuccess}
           submissionHistory={submissionHistory}
           existingNegatives={existingNegatives}
         />
@@ -486,6 +505,7 @@ function AuthenticatedApp({ user, onLogout }) {
   const [error, setError] = useState('')
   const [submitSuccess, setSubmitSuccess] = useState('')
   const [submitError, setSubmitError] = useState('')
+  const [manualAddSuccess, setManualAddSuccess] = useState('')
   
   // Website URL popup
   const [showUrlPopup, setShowUrlPopup] = useState(false)
@@ -709,8 +729,9 @@ function AuthenticatedApp({ user, onLogout }) {
               })
               .map(kw => {
                 const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, terms)
-                const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, googleNegatives)
-                return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
+                const googleEntry = googleNegatives.find(n => typeof n === 'object' && n.keyword?.toLowerCase() === kw.toLowerCase() && n.matchType === matchType)
+                const inGoogle = !!googleEntry
+                return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, googleResourceName: googleEntry?.resourceName || null, googleSource: googleEntry?.source || null, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
               })
             return [...prev, ...newItems]
           })
@@ -823,14 +844,20 @@ function AuthenticatedApp({ user, onLogout }) {
       }).catch(console.error)
     }
 
+    const alreadyPending = pendingNegatives.some(
+      item => item.keyword.toLowerCase() === keyword.toLowerCase() && item.matchType === finalMatchType
+    )
     setPendingNegatives(prev => {
-      // Check if this exact keyword + match type combination already exists in pending
       if (prev.some(item => item.keyword.toLowerCase() === keyword.toLowerCase() && item.matchType === finalMatchType)) return prev
       return [...prev, { keyword, matchType: finalMatchType, source: 'manual', selected: true, destination: finalDestination, sharedSetId: null, campaignId: finalCampaignId, campaignName: finalCampaignName, adGroupId: finalAdGroupId, adGroupName: finalAdGroupName }]
     })
     setAiStats(prev => prev || {})
     setSubmitSuccess('')
-  }, [currentClientId, dbSavedNegatives, existingNegatives, searchTerms])
+    if (!alreadyPending) {
+      setManualAddSuccess(`"${keyword}" added to pending keywords`)
+      setTimeout(() => setManualAddSuccess(''), 3000)
+    }
+  }, [currentClientId, dbSavedNegatives, existingNegatives, pendingNegatives, searchTerms])
 
   const handleRemoveNegativeFromRow = useCallback((keyword) => {
     const kwLower = keyword.toLowerCase()
@@ -863,6 +890,7 @@ function AuthenticatedApp({ user, onLogout }) {
         throw new Error(d.details || d.error || 'Failed to remove')
       }
       setExistingNegatives(prev => prev.filter(n => n.resourceName !== resourceName))
+      setPendingNegatives(prev => prev.filter(n => n.googleResourceName !== resourceName))
     } catch (err) {
       console.error('Failed to remove Google negative:', err.message)
     }
@@ -889,8 +917,9 @@ function AuthenticatedApp({ user, onLogout }) {
         })
         .map(kw => {
           const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, searchTerms)
-          const inGoogle = isKeywordMatchTypeInGoogle(kw, matchType, existingNegatives)
-          return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
+          const googleEntry = existingNegatives.find(n => typeof n === 'object' && n.keyword?.toLowerCase() === kw.toLowerCase() && n.matchType === matchType)
+          const inGoogle = !!googleEntry
+          return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, googleResourceName: googleEntry?.resourceName || null, googleSource: googleEntry?.source || null, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
         })
       return [...prev, ...newItems]
     })
@@ -927,7 +956,7 @@ function AuthenticatedApp({ user, onLogout }) {
     setSubmitSuccess('')
     setSubmitError('')
     try {
-      const r = await fetch('/api/ai-recommend-negatives', {
+      const r = await authenticatedFetch('/api/ai-recommend-negatives', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ searchTerms, websiteUrl: urlToUse.trim() }),
@@ -1156,26 +1185,62 @@ function AuthenticatedApp({ user, onLogout }) {
         summaryParts.push(`${adGroupKeywords.length} at ad group level (${agNames.join(', ')})`)
       }
 
-      setExistingNegatives(prev => [...prev, ...submittedKeywords])
+      // Add submitted keywords to existingNegatives so the search terms table shows them as "In Google"
+      setExistingNegatives(prev => [
+        ...prev,
+        ...toSubmit.map(item => ({
+          keyword: item.keyword,
+          matchType: item.matchType,
+          source: item.destination === 'NEGATIVE_LIST' ? 'SHARED_SET' : item.destination,
+          resourceName: null,
+        }))
+      ])
       setSubmitSuccess(`Keywords submitted — ${summaryParts.join(' · ')}`)
 
-      const submittedSet = new Set(submittedKeywords.map(k => k.toLowerCase()))
-      setPendingNegatives(prev => prev.filter(item => !submittedSet.has(item.keyword.toLowerCase())))
+      // Mark submitted keywords as "In Google" instead of removing them, so they stay visible in both panels
+      const submittedSet = new Set(toSubmit.map(i => `${i.keyword.toLowerCase()}:${i.matchType}`))
+      setPendingNegatives(prev => prev.map(item => {
+        if (!submittedSet.has(`${item.keyword.toLowerCase()}:${item.matchType}`)) return item
+        return {
+          ...item,
+          alreadyInGoogle: true,
+          selected: false,
+          googleResourceName: null,
+          googleSource: item.destination === 'NEGATIVE_LIST' ? 'SHARED_SET' : item.destination,
+        }
+      }))
 
-      // Save history for list submissions
-      if (listKeywords.length > 0) {
-        const uniqueTypes = [...new Set(listKeywords.map(item => item.matchType))]
+      // Save history for all submissions
+      if (toSubmit.length > 0) {
+        const allSubmitted = toSubmit.map(i => ({ keyword: i.keyword, matchType: i.matchType }))
+        const uniqueTypes = [...new Set(toSubmit.map(item => item.matchType))]
         const matchTypeLabel = uniqueTypes.length === 1
           ? ({ EXACT: 'Exact match', PHRASE: 'Phrase match', BROAD: 'Broad match' }[uniqueTypes[0]] || uniqueTypes[0])
           : 'Mixed match types'
-        const listNames = [...new Set(listKeywords.map(i => sharedSets.find(s => s.id === i.sharedSetId)?.name || i.sharedSetId))]
+
+        // Build a destination label for the history entry
+        const destParts = []
+        if (listKeywords.length > 0) {
+          const listNames = [...new Set(listKeywords.map(i => sharedSets.find(s => s.id === i.sharedSetId)?.name || i.sharedSetId))]
+          destParts.push(`List: ${listNames.join(', ')}`)
+        }
+        if (campaignKeywords.length > 0) {
+          const campaignNames = [...new Set(campaignKeywords.map(i => i.campaignName || i.campaignId))]
+          destParts.push(`Campaign: ${campaignNames.join(', ')}`)
+        }
+        if (adGroupKeywords.length > 0) {
+          const agNames = [...new Set(adGroupKeywords.map(i => i.adGroupName || i.adGroupId))]
+          destParts.push(`Ad group: ${agNames.join(', ')}`)
+        }
+        const destLabel = destParts.join(' · ')
+
         authenticatedFetch('/api/submission-history', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             clientId: currentClientId,
-            keywords: listKeywords.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
-            listName: listNames.join(', '),
+            keywords: allSubmitted,
+            listName: destLabel,
             matchTypes: matchTypeLabel,
           }),
         })
@@ -1184,10 +1249,10 @@ function AuthenticatedApp({ user, onLogout }) {
             setSubmissionHistory(prev => [{
               id: Date.now(),
               submitted_at: new Date().toISOString(),
-              keyword_count: listKeywords.length,
-              list_name: listNames.join(', '),
+              keyword_count: allSubmitted.length,
+              list_name: destLabel,
               match_types: matchTypeLabel,
-              keywords: listKeywords.map(i => ({ keyword: i.keyword, matchType: i.matchType })),
+              keywords: allSubmitted,
               submitted_by_email: user.email,
               submitted_by_name: user.name || ''
             }, ...prev])
@@ -1228,6 +1293,8 @@ function AuthenticatedApp({ user, onLogout }) {
           aiStats={aiStats}
           aiLoading={aiLoading}
           searchTerms={searchTerms}
+          campaigns={campaigns}
+          adGroupsByCampaign={adGroupsByCampaign}
           pendingNegatives={pendingNegatives}
           setPendingNegatives={setPendingNegatives}
           sharedSets={sharedSets}
@@ -1245,6 +1312,7 @@ function AuthenticatedApp({ user, onLogout }) {
           setSubmitSuccess={setSubmitSuccess}
           submitError={submitError}
           setSubmitError={setSubmitError}
+          manualAddSuccess={manualAddSuccess}
           submissionHistory={submissionHistory}
           rowNegatives={rowNegatives}
           error={error}

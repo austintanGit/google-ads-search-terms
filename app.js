@@ -117,15 +117,24 @@ async function withRetry(fn, maxAttempts = 3, delayMs = 1500) {
         try {
             return await fn();
         } catch (err) {
+            const errMsg = err.message || '';
             const isConcurrent =
                 err.errors?.some(e =>
                     e.error_code?.mutate_error === 'CONCURRENT_MODIFICATION' ||
-                    /concurrent/i.test(e.message || '')
-                ) || /concurrent/i.test(err.message || '');
+                    /concurrent/i.test(e.message || '') ||
+                    /modify the same resource/i.test(e.message || '')
+                ) ||
+                /concurrent/i.test(errMsg) ||
+                /modify the same resource/i.test(errMsg);
 
             if (isConcurrent && attempt < maxAttempts) {
                 console.log(`[retry] CONCURRENT_MODIFICATION on attempt ${attempt}, retrying in ${delayMs}ms...`);
                 await new Promise(r => setTimeout(r, delayMs));
+            } else if (isConcurrent) {
+                // All retries exhausted — surface a friendly message
+                const friendly = new Error('Google Ads is temporarily busy — please wait a moment and click Submit again.');
+                friendly.isFriendly = true;
+                throw friendly;
             } else {
                 throw err;
             }
@@ -137,7 +146,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Serve React build files
 app.use(express.static('public'));

@@ -50,8 +50,11 @@ export default function AIPanel({
   currentClientId,
   websiteUrl,
   setWebsiteUrl,
+  onSaveWebsiteUrl,
   aiStats,
   aiLoading,
+  campaigns,
+  adGroupsByCampaign,
   pendingNegatives,
   setPendingNegatives,
   sharedSets,
@@ -62,11 +65,13 @@ export default function AIPanel({
   onCreateSharedSet,
   onAddManualNegative,
   onRemoveNegative,
+  onRemoveGoogleNegative,
   onSubmitNegatives,
   submitSuccess,
   setSubmitSuccess,
   submitError,
   setSubmitError,
+  manualAddSuccess,
   submissionHistory,
   existingNegatives,
 }) {
@@ -79,6 +84,8 @@ export default function AIPanel({
   const [specificPageUrl, setSpecificPageUrl] = useState('')
   const [showManualAdd, setShowManualAdd] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const [editingWebsiteUrl, setEditingWebsiteUrl] = useState(false)
+  const [editWebsiteUrlValue, setEditWebsiteUrlValue] = useState('')
 
   // Create-list inline state — ctx is 'bulk' | keyword-string | null
   const [createListCtx, setCreateListCtx] = useState(null)
@@ -130,6 +137,15 @@ export default function AIPanel({
     ))
   }
 
+  function handleApplyBulkMatchType() {
+    setPendingNegatives(prev =>
+      prev.map(item => {
+        if (!item.selected || item.alreadyInGoogle) return item
+        return { ...item, matchType: bulkMatchType }
+      })
+    )
+  }
+
   function handleMatchTypeChange(keyword, matchType) {
     setPendingNegatives(prev =>
       prev.map(item => item.keyword === keyword ? { ...item, matchType } : item)
@@ -160,12 +176,25 @@ export default function AIPanel({
     )
   }
 
-  function handleApplyBulkMatchType() {
+  function handleCampaignChange(keyword, campaignId) {
+    const campaign = (campaigns || []).find(c => c.id === campaignId)
     setPendingNegatives(prev =>
-      prev.map(item => {
-        if (!item.selected || item.alreadyInGoogle) return item
-        return { ...item, matchType: bulkMatchType }
-      })
+      prev.map(item => item.keyword === keyword
+        ? { ...item, campaignId: campaign?.id || null, campaignName: campaign?.name || null, adGroupId: null, adGroupName: null }
+        : item
+      )
+    )
+  }
+
+  function handleAdGroupChange(keyword, adGroupId) {
+    const item = pendingNegatives.find(i => i.keyword === keyword)
+    const adGroups = (adGroupsByCampaign || {})[item?.campaignId] || []
+    const ag = adGroups.find(a => a.id === adGroupId)
+    setPendingNegatives(prev =>
+      prev.map(i => i.keyword === keyword
+        ? { ...i, adGroupId: ag?.id || null, adGroupName: ag?.name || null }
+        : i
+      )
     )
   }
 
@@ -278,11 +307,13 @@ export default function AIPanel({
     )
   }
 
-  // Destination column — just the type dropdown, color-coded by level
+  // Destination column — type dropdown + optional campaign/adgroup picker
   function renderDestinationCell(item) {
     if (item.alreadyInGoogle) return null
     const dest = item.destination || 'CAMPAIGN'
-    
+    const availableCampaigns = campaigns || []
+    const availableAdGroups = (adGroupsByCampaign || {})[item.campaignId] || []
+
     return (
       <div className="destination-cell">
         <select
@@ -294,6 +325,34 @@ export default function AIPanel({
             <option key={opt.value} value={opt.value}>{opt.label}</option>
           ))}
         </select>
+
+        {/* Campaign picker — shown when campaign level is selected but no campaign is set */}
+        {(dest === 'CAMPAIGN' || dest === 'ADGROUP') && !item.campaignId && availableCampaigns.length > 0 && (
+          <select
+            className="matchtype-select dest-select-campaign"
+            value=""
+            onChange={e => handleCampaignChange(item.keyword, e.target.value)}
+          >
+            <option value="">Select campaign…</option>
+            {availableCampaigns.map(c => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </select>
+        )}
+
+        {/* Ad group picker — shown when adgroup level is selected and campaign is set but no adgroup */}
+        {dest === 'ADGROUP' && item.campaignId && !item.adGroupId && availableAdGroups.length > 0 && (
+          <select
+            className="matchtype-select dest-select-adgroup"
+            value=""
+            onChange={e => handleAdGroupChange(item.keyword, e.target.value)}
+          >
+            <option value="">Select ad group…</option>
+            {availableAdGroups.map(ag => (
+              <option key={ag.id} value={ag.id}>{ag.name}</option>
+            ))}
+          </select>
+        )}
         
         {dest === 'NEGATIVE_LIST' && (
           <div className="inline-list-picker">
@@ -352,6 +411,64 @@ export default function AIPanel({
             <p className="ai-scanner-desc">
               AI automatically analyzes your site to recommend negative keywords — so you stop wasting ad spend on irrelevant searches.
             </p>
+            {/* Website URL display / edit */}
+            <div className="ai-website-url-row">
+              {editingWebsiteUrl ? (
+                <div className="ai-website-url-edit">
+                  <input
+                    type="url"
+                    className="form-control form-control-sm"
+                    value={editWebsiteUrlValue}
+                    onChange={e => setEditWebsiteUrlValue(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        const v = editWebsiteUrlValue.trim()
+                        if (v) { setWebsiteUrl(v); if (onSaveWebsiteUrl) onSaveWebsiteUrl(v) }
+                        setEditingWebsiteUrl(false)
+                      }
+                      if (e.key === 'Escape') setEditingWebsiteUrl(false)
+                    }}
+                    autoFocus
+                    style={{ width: 320 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    disabled={!editWebsiteUrlValue.trim()}
+                    onClick={() => {
+                      const v = editWebsiteUrlValue.trim()
+                      if (v) { setWebsiteUrl(v); if (onSaveWebsiteUrl) onSaveWebsiteUrl(v) }
+                      setEditingWebsiteUrl(false)
+                    }}
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={() => setEditingWebsiteUrl(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <div className="ai-website-url-display">
+                  <span className="ai-website-url-label">Website:</span>
+                  {websiteUrl
+                    ? <a className="ai-website-url-link" href={websiteUrl} target="_blank" rel="noreferrer">{websiteUrl}</a>
+                    : <span className="ai-website-url-empty">Not set</span>
+                  }
+                  <button
+                    type="button"
+                    className="btn-edit-url"
+                    title="Edit website URL"
+                    onClick={() => { setEditWebsiteUrlValue(websiteUrl || ''); setEditingWebsiteUrl(true) }}
+                  >
+                    <i className="fas fa-pencil-alt" />
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
           <div className="ai-scanner-actions">
             {lastScannedAt && (
@@ -450,6 +567,7 @@ export default function AIPanel({
         </div>
       )}
 
+
       {/* Step 1 heading */}
       <div className="step-heading">
         <div className="step-heading-num">1</div>
@@ -466,8 +584,6 @@ export default function AIPanel({
         <div className="pending-header">
           <div className="pending-header-left">
             <span className="pending-title">Pending negative keywords</span>
-            <span className="source-badge source-ai">AI-recommended</span>
-            <span className="source-badge source-manual">Manual</span>
           </div>
           <button className="btn btn-sm btn-outline-secondary" onClick={exportNegatives}>
             <i className="fas fa-download me-1" />Export negatives
@@ -636,9 +752,9 @@ export default function AIPanel({
                       <span className="kw-text">{item.keyword}</span>
                       {item.alreadyInGoogle
                         ? <span className="source-badge source-in-google">In Google</span>
-                        : item.source === 'ai'
-                          ? <span className="source-badge source-ai">AI</span>
-                          : <span className="source-badge source-manual">Manual</span>
+                        : (!item.selected && item.source === 'ai')
+                          ? <span className="source-badge source-ai-rec">AI Recommended</span>
+                          : <span className="source-badge source-pending">Pending Negative Keyword</span>
                       }
                     </div>
                     {renderKeywordDetails(item)}
@@ -667,7 +783,19 @@ export default function AIPanel({
                     {renderDestinationCell(item)}
                   </td>
                   <td className="col-action">
-                    {!item.alreadyInGoogle && (
+                    {item.alreadyInGoogle ? (
+                      <button
+                        className="btn-remove-kw btn-remove-google"
+                        title="Remove from Google Ads"
+                        onClick={() => {
+                          if (window.confirm(`Remove "${item.keyword}" from Google Ads? This cannot be undone.`)) {
+                            onRemoveGoogleNegative(item.googleResourceName, item.googleSource)
+                          }
+                        }}
+                      >
+                        ×
+                      </button>
+                    ) : (
                       <button
                         className="btn-remove-kw"
                         onClick={() => onRemoveNegative(item.keyword)}
@@ -802,6 +930,14 @@ export default function AIPanel({
         )}
 
       </div>
+
+      {/* Fixed toast — visible regardless of scroll position */}
+      {manualAddSuccess && (
+        <div className="manual-add-toast">
+          <i className="fas fa-check-circle me-2" />
+          {manualAddSuccess}
+        </div>
+      )}
     </>
   )
 }

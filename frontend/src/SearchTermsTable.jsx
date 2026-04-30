@@ -1,50 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, Fragment } from 'react'
 import { buildHighlightedParts } from './utils'
 
-const MATCH_TYPE_OPTIONS = [
-  { value: 'EXACT', label: 'Exact' },
-  { value: 'PHRASE', label: 'Phrase' },
-  { value: 'BROAD', label: 'Broad' },
-]
-
-// Helper function to convert numeric match types to text
-function convertMatchTypeToText(matchType) {
-  if (typeof matchType === 'string') return matchType;
-  if (matchType === 2) return 'EXACT';
-  if (matchType === 3) return 'PHRASE'; 
-  if (matchType === 4) return 'BROAD';
-  return 'EXACT'; // default
-}
-
-// Helper function to get available match types for a keyword
-function getAvailableMatchTypes(keyword, existingNegatives, destination = 'CAMPAIGN') {
-  const existingMatchTypes = new Set()
-  
-  existingNegatives.forEach(existing => {
-    let existingKeyword, matchType
-    if (typeof existing === 'string') {
-      existingKeyword = existing
-      matchType = 'EXACT'
-    } else {
-      existingKeyword = existing.keyword
-      matchType = convertMatchTypeToText(existing.matchType || 'EXACT')
-    }
-    
-    if (existingKeyword.toLowerCase() === keyword.toLowerCase()) {
-      existingMatchTypes.add(matchType)
-    }
-  })
-  
-  let availableOptions = MATCH_TYPE_OPTIONS.filter(option => !existingMatchTypes.has(option.value))
-  
-  // For campaign/adgroup level, don't show BROAD option since it gets converted to EXACT anyway
-  if (destination === 'CAMPAIGN' || destination === 'ADGROUP') {
-    availableOptions = availableOptions.filter(option => option.value !== 'BROAD')
-  }
-  
-  return availableOptions
-}
-
 function HighlightedSearchTerm({ text, negatives }) {
   const parts = buildHighlightedParts(text, negatives)
   return (
@@ -60,160 +16,27 @@ function HighlightedSearchTerm({ text, negatives }) {
   )
 }
 
-function NegativeBadges({ negatives, onRemove, onRemoveGoogle, existingNegatives, onAddNegative, searchTerm, campaignId, campaignName, adGroupId, adGroupName }) {
-  if (!negatives || negatives.size === 0) return null
-
-  const googlePhrases = new Set(
-    [...negatives]
-      .filter(p => p.startsWith('google:'))
-      .map(p => p.replace('google:', '').toLowerCase())
-  )
-
-  // Helper function to format keyword with Google Ads match type notation
-  function formatKeywordWithNotation(keyword, matchType) {
-    const normalizedMatchType = matchType.toUpperCase()
-    switch (normalizedMatchType) {
-      case 'EXACT':
-        return `[${keyword}]`
-      case 'PHRASE':
-        return `"${keyword}"`
-      case 'BROAD':
-        return keyword
-      default:
-        return `[${keyword}]` // Default to exact if unknown
-    }
-  }
-
-  // Group Google keywords by base keyword to show all match types together
-  const googleKeywordGroups = new Map()
-  
-  ;[...negatives]
-    .filter(p => p.startsWith('google:'))
-    .forEach(phrase => {
-      const display = phrase.replace('google:', '')
-      let keywordOnly = display
-      let matchType = 'EXACT'
-      
-      if (display.includes('(') && display.includes(')')) {
-        const parts = display.split('(')
-        keywordOnly = parts[0].trim()
-        const matchTypePart = parts[1].replace(')', '').trim()
-        matchType = convertMatchTypeToText(isNaN(matchTypePart) ? matchTypePart : parseInt(matchTypePart))
-      }
-      
-      const key = keywordOnly.toLowerCase()
-      if (!googleKeywordGroups.has(key)) {
-        // Find matching existing negatives to get resourceName/source
-        const matches = (existingNegatives || []).filter(n =>
-          typeof n === 'object' && n.keyword?.toLowerCase() === key
-        )
-        googleKeywordGroups.set(key, {
-          keyword: keywordOnly,
-          matchTypes: new Set(),
-          negativeEntries: matches,
-        })
-      }
-      googleKeywordGroups.get(key).matchTypes.add(matchType.toUpperCase())
-    })
-
-  return (
-    <span className="negative-badges">
-      {/* Google negatives with match type notation */}
-      {Array.from(googleKeywordGroups.entries()).map(([keyLower, group]) => {
-        // For existing Google negatives, allow all match types since user might want to add to negative lists
-        // We'll let the backend/validation handle whether broad match is appropriate for the chosen destination
-        const availableMatchTypes = getAvailableMatchTypes(group.keyword, existingNegatives, 'NEGATIVE_LIST')
-        
-        return (
-          <div key={`google-${keyLower}`} className="neg-badge-with-options neg-badge-google">
-            {Array.from(group.matchTypes).map(matchType => {
-              const entry = group.negativeEntries.find(e => e.matchType === matchType)
-              return (
-                <div key={`${keyLower}-${matchType}`} className="neg-badge-chip-group">
-                  <span className="neg-badge-chip">
-                    {formatKeywordWithNotation(group.keyword, matchType)}
-                  </span>
-                  {onRemoveGoogle && entry?.resourceName && (
-                    <button
-                      className="btn-remove-google-negative"
-                      onClick={(e) => { e.stopPropagation(); onRemoveGoogle(entry.resourceName, entry.source) }}
-                      title={`Remove "${group.keyword}" (${matchType}) from ${entry.location}`}
-                    >
-                      – Remove
-                    </button>
-                  )}
-                </div>
-              )
-            })}
-            {availableMatchTypes.length > 0 && (
-              <div className="neg-badge-chip-buttons">
-                {availableMatchTypes.map(matchType => (
-                  <button
-                    key={`${group.keyword}-${matchType.value}`}
-                    className="btn-add-match-type-table"
-                    onClick={() => onAddNegative(group.keyword, matchType.value, campaignId, campaignName, adGroupId, adGroupName, 'NEGATIVE_LIST')}
-                    title={`Add "${group.keyword}" as ${matchType.label} match to negative keyword list`}
-                  >
-                    +{matchType.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )
-      })}
-
-      {/* Non-Google negatives (AI/Manual) - only show if not covered by Google */}
-      {[...negatives].map(phrase => {
-        const isGoogle = phrase.startsWith('google:')
-        const isAi = phrase.startsWith('ai:')
-        const isManual = phrase.startsWith('manual:')
-        const display = phrase.replace(/^(google:|ai:|manual:)/, '')
-
-        // Skip Google badges (handled above) and skip AI/manual if Google already covers it
-        if (isGoogle || ((isAi || isManual) && googlePhrases.has(display.toLowerCase()))) return null
-
-        let keywordOnly = display
-        let matchType = 'EXACT'
-        
-        if (display.includes('(') && display.includes(')')) {
-          const parts = display.split('(')
-          keywordOnly = parts[0].trim()
-          const matchTypePart = parts[1].replace(')', '').trim()
-          matchType = convertMatchTypeToText(isNaN(matchTypePart) ? matchTypePart : parseInt(matchTypePart))
-        }
-
-        const formattedKeyword = formatKeywordWithNotation(keywordOnly, matchType)
-
-        return (
-          <span key={phrase} className={`neg-badge ${isAi ? 'neg-badge-ai' : 'neg-badge-manual'}`} title={isAi ? "AI-recommended — not yet submitted" : "Manually flagged — not yet submitted"}>
-            {formattedKeyword}
-            <button 
-              className="neg-badge-remove" 
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                onRemove(keywordOnly);
-              }}
-              style={{zIndex: 1000, position: 'relative', minWidth: '16px', minHeight: '16px'}}
-            >
-              ×
-            </button>
-          </span>
-        )
-      })}
-    </span>
-  )
-}
-
 const COLUMNS = [
   { key: 'searchTerm', label: 'SEARCH TERM', sortable: true },
+  { key: 'negatives', label: 'TRIGGERED NEGATIVE', sortable: false },
   { key: 'matchingKeyword', label: 'KEYWORD', sortable: true },
   { key: 'campaign', label: 'CAMPAIGN', sortable: true, filterable: true },
   { key: 'clicks', label: 'CLICKS', sortable: true, numeric: true },
-  { key: 'conversions', label: 'CONV', sortable: true, numeric: true },
-  { key: 'negatives', label: 'NEGATIVE', sortable: false },
+  { key: 'conversions', label: 'CONV.', sortable: true, numeric: true },
 ]
+
+// Parse a prefixed negative phrase into { keyword, matchType, source }
+function parseNegativePhrase(phrase) {
+  const source = phrase.startsWith('google:') ? 'google'
+    : phrase.startsWith('ai:') ? 'ai'
+    : 'manual'
+  const raw = phrase.replace(/^(google:|ai:|manual:)/, '')
+  const parenIdx = raw.lastIndexOf(' (')
+  if (parenIdx !== -1) {
+    return { keyword: raw.slice(0, parenIdx), matchType: raw.slice(parenIdx + 2, -1), source }
+  }
+  return { keyword: raw, matchType: 'EXACT', source }
+}
 
 export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegative, onRemoveNegative, onRemoveGoogleNegative, existingNegatives }) {
   const [sortCol, setSortCol] = useState('clicks')
@@ -359,16 +182,11 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
         <div className="search-terms-panel-header">
           <div className="status-key">
             <div className="status-key-items">
-              <div className="status-key-item status-key-item-google">
-                <span className="status-key-item-label">Already a Negative</span>
-              </div>
               <div className="status-key-item status-key-item-ai">
-                <span className="status-key-item-label">AI-Recommended</span>
-                <span className="status-key-item-sub">Not Yet Submitted</span>
+                <span className="status-key-item-label">AI Recommended</span>
               </div>
               <div className="status-key-item status-key-item-manual">
-                <span className="status-key-item-label">Manual</span>
-                <span className="status-key-item-sub">Not Yet Submitted</span>
+                <span className="status-key-item-label">Pending Negative Keyword</span>
               </div>
             </div>
           </div>
@@ -459,24 +277,30 @@ export default function SearchTermsTable({ searchTerms, rowNegatives, onAddNegat
                         )}
                       </span>
                     </td>
+                    <td className="triggered-neg-cell">
+                      {negatives && [...negatives].some(p => p.startsWith('ai:') || p.startsWith('manual:'))
+                        ? [...negatives]
+                            .filter(p => p.startsWith('ai:') || p.startsWith('manual:'))
+                            .map((phrase, i) => {
+                              const { keyword, matchType, source } = parseNegativePhrase(phrase)
+                              const cls = source === 'ai' ? 'trig-badge-ai' : 'trig-badge-manual'
+                              const mt = matchType.toUpperCase()
+                              const label = mt === 'EXACT' ? `[${keyword}]`
+                                : mt === 'PHRASE' ? `"${keyword}"`
+                                : keyword
+                              return (
+                                <span key={i} className={`trig-badge ${cls}`}>
+                                  {label}
+                                </span>
+                              )
+                            })
+                        : <span className="trig-badge-none">—</span>
+                      }
+                    </td>
                     <td className="text-muted">{term.matchingKeyword}</td>
                     <td>{term.campaign}</td>
                     <td className="text-end">{Number(term.clicks).toLocaleString()}</td>
                     <td className="text-end">{Number(term.conversions).toFixed(1)}</td>
-                    <td>
-                      <NegativeBadges 
-                        negatives={negatives} 
-                        onRemove={onRemoveNegative}
-                        onRemoveGoogle={onRemoveGoogleNegative}
-                        existingNegatives={existingNegatives}
-                        onAddNegative={onAddNegative}
-                        searchTerm={term.searchTerm}
-                        campaignId={term.campaignId}
-                        campaignName={term.campaign}
-                        adGroupId={term.adGroupId}
-                        adGroupName={term.adGroup}
-                      />
-                    </td>
                   </tr>
                 )
               })}
