@@ -216,6 +216,16 @@ async function initDB() {
             )
         `);
         await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS client_rejected_ai_negatives (
+                client_id VARCHAR(30) NOT NULL,
+                keyword_normalized TEXT NOT NULL,
+                keyword_display TEXT,
+                feedback TEXT,
+                rejected_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (client_id, keyword_normalized)
+            )
+        `);
+        await dbPool.query(`
             CREATE TABLE IF NOT EXISTS client_pending_state (
                 client_id VARCHAR(30) NOT NULL,
                 keyword TEXT NOT NULL,
@@ -750,6 +760,7 @@ app.use('/api/client-settings', authenticateToken);
 app.use('/api/client-website-url', authenticateToken);
 app.use('/api/client-default-shared-set', authenticateToken);
 app.use('/api/client-saved-negatives', authenticateToken);
+app.use('/api/rejected-ai-negatives', authenticateToken);
 app.use('/api/submission-history', authenticateToken);
 app.use('/api/campaigns', authenticateToken);
 app.use('/api/adgroups', authenticateToken);
@@ -1302,6 +1313,48 @@ app.get('/api/review-requests/:id', async (req, res) => {
     } catch (err) {
         console.error('Error loading review request:', err);
         res.status(500).json({ error: 'Failed to load review request', details: err.message });
+    }
+});
+
+/**
+ * Strategist adjusts block/keep after the client submitted (before finalize).
+ * Lets the agency add negatives the client kept, or skip ones the client blocked.
+ */
+app.patch('/api/review-requests/:id/items/:itemId/decision', async (req, res) => {
+    const { id, itemId } = req.params;
+    const decision = String(req.body?.decision || '').toLowerCase();
+    if (!REVIEW_DECISIONS.has(decision)) {
+        return res.status(400).json({ error: 'decision must be "block" or "keep"' });
+    }
+    const itemIdNum = Number.parseInt(String(itemId), 10);
+    if (!Number.isFinite(itemIdNum) || itemIdNum <= 0) {
+        return res.status(400).json({ error: 'Invalid item id' });
+    }
+    try {
+        const data = await loadReviewRequestForStrategist(id);
+        if (!data) return res.status(404).json({ error: 'Review request not found' });
+        if (data.request.status !== REVIEW_STATUSES.CLIENT_SUBMITTED) {
+            return res.status(409).json({
+                error:
+                    'Decisions can only be changed after the client submits and before you finalize.',
+            });
+        }
+        const item = data.items.find((it) => Number(it.id) === itemIdNum);
+        if (!item) return res.status(404).json({ error: 'Item not found on this review' });
+
+        await dbPool.query(
+            `INSERT INTO review_request_decisions (review_request_item_id, decision, decided_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (review_request_item_id) DO UPDATE
+               SET decision = EXCLUDED.decision, decided_at = EXCLUDED.decided_at`,
+            [itemIdNum, decision],
+        );
+        await dbPool.query(`UPDATE review_requests SET updated_at = NOW() WHERE id = $1`, [id]);
+
+        res.json({ success: true, itemId: itemIdNum, decision });
+    } catch (err) {
+        console.error('review item decision patch error:', err);
+        res.status(500).json({ error: 'Failed to update decision', details: err.message });
     }
 });
 
@@ -2247,10 +2300,25 @@ async function scrapeWebsiteContext(url) {
 
 app.post('/api/ai-recommend-negatives', async (req, res) => {
     try {
-        const { searchTerms, websiteUrl } = req.body;
+        const { searchTerms, websiteUrl, clientId } = req.body;
 
         if (!searchTerms || !searchTerms.length) {
             return res.status(400).json({ error: 'Search terms are required' });
+        }
+
+        /** @type {Set<string>} Lowercased keywords the user already dismissed as AI suggestions */
+        let rejectedNormalized = new Set();
+        if (clientId && String(clientId).trim()) {
+            const cid = String(clientId).trim();
+            try {
+                const rej = await dbPool.query(
+                    'SELECT keyword_normalized FROM client_rejected_ai_negatives WHERE client_id = $1',
+                    [cid],
+                );
+                rejectedNormalized = new Set(rej.rows.map((r) => r.keyword_normalized));
+            } catch (rejErr) {
+                console.error('Error loading rejected AI negatives:', rejErr);
+            }
         }
 
         const searchTermsTable = searchTerms
@@ -2330,6 +2398,15 @@ ${pagesText}`;
             ])
         ].join(', ');
 
+        const rejectedPromptBlock =
+            rejectedNormalized.size === 0
+                ? ''
+                : `
+USER-REJECTED AI SUGGESTIONS — never include any of these in negativeKeywords (the account owner already dismissed them), even if they appear in the search terms:
+${[...rejectedNormalized].sort().join(', ')}
+
+`;
+
         const prompt = `You are a Google Ads specialist helping identify negative keywords to add to a campaign.
 
 Your job is to find words or phrases that signal a search is NOT from a potential customer of this business. Prefer precision over recall: when intent is ambiguous, do NOT include the term as a negative (avoid costing real leads).
@@ -2355,7 +2432,7 @@ RULES:
      - \"best Chicago plumber near me\" (local Columbus business) → \"Chicago\" (do not negate \"near me\" or generic praise words)
 7. COMPETITORS: Identify competitor brand names in the search terms using your industry knowledge and add them as negatives (smallest unmistakable substring that appears verbatim in the query).
 8. When in doubt, leave it OUT of negativeKeywords entirely.
-
+${rejectedPromptBlock}
 ${websiteContext}
 
 Search Terms (format: term | clicks | conversions | campaign):
@@ -2417,6 +2494,10 @@ Respond ONLY with a valid JSON object in this exact format, with no additional t
         parsed.negativeKeywords = parsed.negativeKeywords.filter(
             kw => !shouldDropAiNegativeSuggestion(kw, searchTerms)
         );
+        parsed.negativeKeywords = parsed.negativeKeywords.filter((kw) => {
+            const n = kw.toLowerCase().trim();
+            return !rejectedNormalized.has(n);
+        });
         for (const k of Object.keys(sourcesMap)) {
             if (!parsed.negativeKeywords.includes(k)) delete sourcesMap[k];
         }
@@ -2582,6 +2663,40 @@ app.delete('/api/client-saved-negatives', async (req, res) => {
     } catch (err) {
         console.error('Error deleting negative keyword:', err);
         res.status(500).json({ error: 'Failed to delete negative keyword', details: err.message });
+    }
+});
+
+// Record an AI-suggested negative the user dismissed (so future scans exclude it)
+app.post('/api/rejected-ai-negatives', async (req, res) => {
+    const { clientId, keyword, feedback } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
+    if (keyword === undefined || keyword === null || String(keyword).trim() === '') {
+        return res.status(400).json({ error: 'Keyword is required' });
+    }
+
+    const trimmed = String(keyword).trim();
+    const normalized = trimmed.toLowerCase();
+    const fb =
+        feedback === undefined || feedback === null
+            ? null
+            : String(feedback).trim() || null;
+
+    try {
+        await dbPool.query(
+            `
+            INSERT INTO client_rejected_ai_negatives (client_id, keyword_normalized, keyword_display, feedback, rejected_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (client_id, keyword_normalized) DO UPDATE SET
+                keyword_display = EXCLUDED.keyword_display,
+                feedback = EXCLUDED.feedback,
+                rejected_at = NOW()
+            `,
+            [clientId, normalized, trimmed, fb],
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error saving rejected AI negative:', err);
+        res.status(500).json({ error: 'Failed to save rejected suggestion', details: err.message });
     }
 });
 

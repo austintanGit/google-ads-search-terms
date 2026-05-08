@@ -1189,6 +1189,7 @@ function AuthenticatedApp({ user, onLogout }) {
           const result = await postAiRecommendNegatives({
             searchTerms: terms,
             websiteUrl: urlToUse.trim(),
+            clientId,
           })
           handleAiResults(result)
           if (!result.scanSkippedDueToBadWebsiteUrl) {
@@ -1354,6 +1355,7 @@ function AuthenticatedApp({ user, onLogout }) {
       const result = await postAiRecommendNegatives({
         searchTerms: terms,
         websiteUrl: websiteUrl.trim(),
+        clientId: currentClientId,
       })
       handleAiResults(result)
       if (!result.scanSkippedDueToBadWebsiteUrl) {
@@ -1496,22 +1498,40 @@ function AuthenticatedApp({ user, onLogout }) {
     }
   }, [currentClientId, dbSavedNegatives, existingNegatives, pendingNegatives, searchTerms, sharedSets])
 
-  const handleRemoveNegativeFromRow = useCallback((keyword) => {
+  const handleRemoveNegativeFromRow = useCallback((keyword, opts) => {
     const kwLower = keyword.toLowerCase()
-    
-    if (currentClientId && dbSavedNegatives.map(k => k.toLowerCase()).includes(kwLower)) {
-      setDbSavedNegatives(prev => prev.filter(k => k.toLowerCase() !== kwLower))
+    const explicitFeedback = opts != null && Object.prototype.hasOwnProperty.call(opts, 'feedback')
+    const feedbackBody = explicitFeedback
+      ? (opts.feedback == null ? null : String(opts.feedback).trim() || null)
+      : null
+
+    let hadAi = false
+    setPendingNegatives((prev) => {
+      const touching = prev.filter((i) => i.keyword.toLowerCase() === kwLower)
+      hadAi = touching.some((i) => i.source === 'ai')
+      return prev.filter((item) => item.keyword.toLowerCase() !== kwLower)
+    })
+
+    if (hadAi && currentClientId) {
+      void authenticatedFetch('/api/rejected-ai-negatives', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId: currentClientId,
+          keyword,
+          feedback: feedbackBody,
+        }),
+      }).catch(console.error)
+    }
+
+    if (currentClientId && dbSavedNegatives.map((k) => k.toLowerCase()).includes(kwLower)) {
+      setDbSavedNegatives((prev) => prev.filter((k) => k.toLowerCase() !== kwLower))
       authenticatedFetch('/api/client-saved-negatives', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clientId: currentClientId, keyword }),
       }).catch(console.error)
     }
-    
-    setPendingNegatives(prev => {
-      const filtered = prev.filter(item => item.keyword.toLowerCase() !== kwLower);
-      return filtered;
-    });
   }, [currentClientId, dbSavedNegatives])
 
   const handleRemoveGoogleNegative = useCallback(async (resourceName, source) => {
@@ -1628,6 +1648,7 @@ function AuthenticatedApp({ user, onLogout }) {
       const result = await postAiRecommendNegatives({
         searchTerms,
         websiteUrl: urlToUse.trim(),
+        clientId: currentClientId,
       })
       handleAiResults(result)
       if (result.scanSkippedDueToBadWebsiteUrl) {
@@ -1676,6 +1697,7 @@ function AuthenticatedApp({ user, onLogout }) {
           const result = await postAiRecommendNegatives({
             searchTerms,
             websiteUrl: tempWebsiteUrl.trim(),
+            clientId: pendingClientId,
           })
           handleAiResults(result)
           if (!result.scanSkippedDueToBadWebsiteUrl) {

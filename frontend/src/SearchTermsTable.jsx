@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useTransition } from 'react'
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useTransition } from 'react'
 import { createPortal } from 'react-dom'
 import { buildHighlightedParts, parseNegativePhrase } from './utils'
 
@@ -13,6 +13,66 @@ const DESTINATION_OPTIONS = [
   { value: 'ADGROUP', label: 'Ad group level' },
   { value: 'NEGATIVE_LIST', label: 'Keyword list' },
 ]
+
+const ORIGIN_POPOVER_WIDTH = 300
+const NEG_WHERE_WIDTH = 320
+const ORIGIN_POPOVER_GAP = 8
+const ORIGIN_VIEW_MARGIN = 8
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(n, max))
+}
+
+function computePortalPopoverPosition(anchorEl, popoverEl, popoverWidth) {
+  if (!anchorEl) return null
+  const ar = anchorEl.getBoundingClientRect()
+  const ph = popoverEl ? popoverEl.getBoundingClientRect().height : 280
+  const pw = popoverWidth
+  const m = ORIGIN_VIEW_MARGIN
+  const gap = ORIGIN_POPOVER_GAP
+  let left = ar.left - pw - gap
+  if (left < m && ar.right + gap + pw <= window.innerWidth - m) {
+    left = ar.right + gap
+  }
+  left = clamp(left, m, window.innerWidth - pw - m)
+  const maxTop = Math.max(m, window.innerHeight - ph - m)
+  let top = ar.top + ar.height / 2 - ph / 2
+  top = clamp(top, m, maxTop)
+  return { top, left }
+}
+
+function buildNegWhereRowsGoogle(existing, sharedSets) {
+  if (!existing) return []
+  const kw = formatNegLabel(existing.keyword, existing.matchType || 'EXACT')
+  if (existing.source === 'SHARED_SET') {
+    const listName =
+      existing.location ||
+      sharedSets?.find(s => String(s.id) === String(existing.sharedSetId))?.name ||
+      '—'
+    return [
+      { label: 'Keyword', value: kw, mono: true },
+      { label: 'Keyword list', value: listName, bold: true },
+    ]
+  }
+  if (existing.source === 'CAMPAIGN') {
+    return [
+      { label: 'Keyword', value: kw, mono: true },
+      { label: 'Campaign', value: existing.location || existing.campaignName || '—', bold: true },
+    ]
+  }
+  if (existing.source === 'AD_GROUP') {
+    const loc = existing.location || ''
+    const parts = loc.split(/\s*›\s*/)
+    const camp = parts[0]?.trim() || existing.campaignName || '—'
+    const ag = parts[1]?.trim() || existing.adGroupName || '—'
+    return [
+      { label: 'Keyword', value: kw, mono: true },
+      { label: 'Campaign', value: camp, bold: true },
+      { label: 'Ad group', value: ag, bold: true },
+    ]
+  }
+  return [{ label: 'Keyword', value: kw, mono: true }]
+}
 
 const DEST_CLASS = {
   CAMPAIGN: 'dest-select-campaign',
@@ -174,6 +234,11 @@ export default function SearchTermsTable({
   const videoRef = useRef(null)
   const pendingSelectionRef = useRef(null)
   const tableRef = useRef(null)
+  const tableWrapperRef = useRef(null)
+  const originInfoAnchorRef = useRef(null)
+  const originInfoPopoverRef = useRef(null)
+  const negWhereAnchorRef = useRef(null)
+  const negWherePopoverRef = useRef(null)
   const destinationPlacementHydrateRef = useRef(() => {})
 
   const [pointerBusyAt, setPointerBusyAt] = useState(null)
@@ -194,6 +259,16 @@ export default function SearchTermsTable({
   const [reviewSubmitting, setReviewSubmitting] = useState(false)
   const [showApprovalModal, setShowApprovalModal] = useState(false)
   const [showSaveModal, setShowSaveModal] = useState(false)
+  const [showPendingRemoveModal, setShowPendingRemoveModal] = useState(false)
+  const [pendingRemoveTarget, setPendingRemoveTarget] = useState(null)
+  const [pendingRemoveFeedback, setPendingRemoveFeedback] = useState('')
+  /** Remove-from-Google confirmation (replaces window.confirm on green chip ×) */
+  const [removeGoogleModal, setRemoveGoogleModal] = useState(null)
+  const [originInfoOpenRowKey, setOriginInfoOpenRowKey] = useState(null)
+  const [originPopoverPos, setOriginPopoverPos] = useState({ top: 0, left: 0 })
+  /** `kind` + ids so each chip can open its own "where this negative lives" popover */
+  const [negWhereOpen, setNegWhereOpen] = useState(null)
+  const [negWherePos, setNegWherePos] = useState({ top: 0, left: 0 })
   const [approvalEmail, setApprovalEmail] = useState('')
   const [approvalSending, setApprovalSending] = useState(false)
   const [approvalSendError, setApprovalSendError] = useState('')
@@ -263,6 +338,34 @@ export default function SearchTermsTable({
     return () => document.removeEventListener('mousedown', handleMouseDown)
   }, [])
 
+  useEffect(() => {
+    function handleDocPointerDown(e) {
+      if (
+        e.target.closest('.origin-info-popover') ||
+        e.target.closest('.row-origin-info-btn') ||
+        e.target.closest('.neg-where-popover') ||
+        e.target.closest('.neg-where-info-btn')
+      ) {
+        return
+      }
+      setOriginInfoOpenRowKey(null)
+      setNegWhereOpen(null)
+    }
+    function handleDocKeydown(e) {
+      if (e.key === 'Escape') {
+        setOriginInfoOpenRowKey(null)
+        setNegWhereOpen(null)
+        setRemoveGoogleModal(null)
+      }
+    }
+    document.addEventListener('mousedown', handleDocPointerDown)
+    document.addEventListener('keydown', handleDocKeydown)
+    return () => {
+      document.removeEventListener('mousedown', handleDocPointerDown)
+      document.removeEventListener('keydown', handleDocKeydown)
+    }
+  }, [])
+
   const safeSearchTerms = Array.isArray(searchTerms) ? searchTerms : []
 
   const campaignList = [...new Set(safeSearchTerms.map(t => t.campaign).filter(Boolean))].sort()
@@ -326,6 +429,21 @@ export default function SearchTermsTable({
       .filter(Boolean)
   }, [searchTerms, frozenRowIndices, searchFilter, campaignFilter])
 
+  const openOriginRowData = useMemo(() => {
+    if (!originInfoOpenRowKey) return null
+    for (const row of sortedRows) {
+      if (!row) continue
+      const { term, rowIndex } = row
+      const uniqueKey = `${term.searchTerm}__${term.campaignId || 'nc'}__${term.adGroupId || 'na'}__${rowIndex}`
+      if (uniqueKey === originInfoOpenRowKey) return { term, uniqueKey }
+    }
+    return null
+  }, [originInfoOpenRowKey, sortedRows])
+
+  useEffect(() => {
+    if (originInfoOpenRowKey && !openOriginRowData) setOriginInfoOpenRowKey(null)
+  }, [originInfoOpenRowKey, openOriginRowData])
+
   function handleSort(_col) {
     // Order is fixed after each data load; column headers keep the active sort indicator from when terms loaded.
   }
@@ -354,6 +472,98 @@ export default function SearchTermsTable({
         .map(([kw]) => kw)
     )
   }, [searchTerms, rowNegatives])
+
+  const negWhereRows = useMemo(() => {
+    if (!negWhereOpen || negWhereOpen.kind !== 'google') return null
+    const ex = (existingNegatives || []).find(
+      n =>
+        typeof n === 'object' &&
+        n.keyword?.toLowerCase() === negWhereOpen.keyword.toLowerCase() &&
+        (n.matchType || '').toUpperCase() === (negWhereOpen.matchType || '').toUpperCase(),
+    )
+    return buildNegWhereRowsGoogle(ex, sharedSets)
+  }, [negWhereOpen, existingNegatives, sharedSets])
+
+  useEffect(() => {
+    if (!originInfoOpenRowKey && !negWhereOpen) return undefined
+    function onTableScrollClosePopovers() {
+      setOriginInfoOpenRowKey(null)
+      setNegWhereOpen(null)
+    }
+    const wrap = tableWrapperRef.current
+    if (wrap) wrap.addEventListener('scroll', onTableScrollClosePopovers, { passive: true })
+    return () => {
+      if (wrap) wrap.removeEventListener('scroll', onTableScrollClosePopovers)
+    }
+  }, [originInfoOpenRowKey, negWhereOpen])
+
+  useLayoutEffect(() => {
+    if (!originInfoOpenRowKey || !openOriginRowData) return undefined
+
+    function updatePosition() {
+      const pos = computePortalPopoverPosition(
+        originInfoAnchorRef.current,
+        originInfoPopoverRef.current,
+        ORIGIN_POPOVER_WIDTH,
+      )
+      if (pos) setOriginPopoverPos(pos)
+    }
+
+    updatePosition()
+    const raf = requestAnimationFrame(() => updatePosition())
+
+    let ro = null
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => updatePosition())
+      if (originInfoPopoverRef.current) ro.observe(originInfoPopoverRef.current)
+      if (originInfoAnchorRef.current) ro.observe(originInfoAnchorRef.current)
+    }
+
+    const onWindowScrollOrResize = () => updatePosition()
+    window.addEventListener('resize', onWindowScrollOrResize)
+    window.addEventListener('scroll', onWindowScrollOrResize, true)
+
+    return () => {
+      cancelAnimationFrame(raf)
+      if (ro) ro.disconnect()
+      window.removeEventListener('resize', onWindowScrollOrResize)
+      window.removeEventListener('scroll', onWindowScrollOrResize, true)
+    }
+  }, [originInfoOpenRowKey, openOriginRowData])
+
+  useLayoutEffect(() => {
+    if (!negWhereOpen) return undefined
+
+    function updatePosition() {
+      const pos = computePortalPopoverPosition(
+        negWhereAnchorRef.current,
+        negWherePopoverRef.current,
+        NEG_WHERE_WIDTH,
+      )
+      if (pos) setNegWherePos(pos)
+    }
+
+    updatePosition()
+    const raf = requestAnimationFrame(() => updatePosition())
+
+    let ro = null
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => updatePosition())
+      if (negWherePopoverRef.current) ro.observe(negWherePopoverRef.current)
+      if (negWhereAnchorRef.current) ro.observe(negWhereAnchorRef.current)
+    }
+
+    const onWindowScrollOrResize = () => updatePosition()
+    window.addEventListener('resize', onWindowScrollOrResize)
+    window.addEventListener('scroll', onWindowScrollOrResize, true)
+
+    return () => {
+      cancelAnimationFrame(raf)
+      if (ro) ro.disconnect()
+      window.removeEventListener('resize', onWindowScrollOrResize)
+      window.removeEventListener('scroll', onWindowScrollOrResize, true)
+    }
+  }, [negWhereOpen, negWhereRows])
 
   const selectedCount = (pendingNegatives || []).filter(i => i.selected && !i.alreadyInGoogle).length
 
@@ -872,6 +1082,48 @@ export default function SearchTermsTable({
     pendingSelectionRef.current = null
   }
 
+  function openPendingRemoveModal(keyword, label) {
+    setPendingRemoveTarget({ keyword, label })
+    setPendingRemoveFeedback('')
+    setShowPendingRemoveModal(true)
+  }
+
+  function closePendingRemoveModal() {
+    setShowPendingRemoveModal(false)
+    setPendingRemoveTarget(null)
+    setPendingRemoveFeedback('')
+  }
+
+  function confirmPendingRemoveSkip(ev) {
+    if (!pendingRemoveTarget?.keyword) return
+    runPendingUiUpdate(
+      () => onRemoveNegative(pendingRemoveTarget.keyword, { feedback: null }),
+      pointFromEvent(ev),
+    )
+    closePendingRemoveModal()
+  }
+
+  function confirmPendingRemoveSubmit(ev) {
+    if (!pendingRemoveTarget?.keyword) return
+    const fb = pendingRemoveFeedback.trim() || null
+    runPendingUiUpdate(
+      () => onRemoveNegative(pendingRemoveTarget.keyword, { feedback: fb }),
+      pointFromEvent(ev),
+    )
+    closePendingRemoveModal()
+  }
+
+  function closeRemoveGoogleModal() {
+    setRemoveGoogleModal(null)
+  }
+
+  function confirmRemoveGoogleModal() {
+    if (!removeGoogleModal?.resourceName) return
+    const { resourceName, source } = removeGoogleModal
+    closeRemoveGoogleModal()
+    void onRemoveGoogleNegative(resourceName, source)
+  }
+
   // All pending items that are checked and not already in google (for submit modal)
   const checkedPendingItems = useMemo(() => {
     const seen = new Set()
@@ -1046,6 +1298,81 @@ export default function SearchTermsTable({
             document.body,
           )
         : null}
+      {openOriginRowData && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              ref={originInfoPopoverRef}
+              className="origin-info-popover origin-info-popover--portal"
+              style={{
+                top: originPopoverPos.top,
+                left: originPopoverPos.left,
+                width: ORIGIN_POPOVER_WIDTH,
+              }}
+              role="dialog"
+              aria-label="Search term origin"
+            >
+              <div className="origin-info-popover-title">Search term origin</div>
+              <div className="origin-info-row">
+                <span className="origin-info-label">KW derived from</span>
+                <span className="origin-info-value">{openOriginRowData.term.matchingKeyword || '—'}</span>
+              </div>
+              <div className="origin-info-row">
+                <span className="origin-info-label">Campaign</span>
+                <span className="origin-info-value">{openOriginRowData.term.campaign || '—'}</span>
+              </div>
+              <div className="origin-info-row">
+                <span className="origin-info-label">Ad group</span>
+                <span className="origin-info-value">{openOriginRowData.term.adGroup || '—'}</span>
+              </div>
+              {openOriginRowData.term.matchingKeyword && problematicKws.has(openOriginRowData.term.matchingKeyword) ? (
+                <div className="origin-info-warning">
+                  <i className="fas fa-exclamation-triangle" aria-hidden />
+                  <span>
+                    This keyword is triggering a high percentage of your negative keywords — consider tightening its match type or reviewing it.
+                  </span>
+                </div>
+              ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
+      {negWhereOpen && negWhereRows && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              ref={negWherePopoverRef}
+              className="neg-where-popover neg-where-popover--portal"
+              style={{
+                top: negWherePos.top,
+                left: negWherePos.left,
+                width: NEG_WHERE_WIDTH,
+              }}
+              role="dialog"
+              aria-label="Where this negative lives"
+            >
+              <div className="neg-where-header">
+                <i className="fas fa-info-circle neg-where-header-icon" aria-hidden />
+                <span className="neg-where-title">Where this negative lives</span>
+              </div>
+              {(negWhereRows || []).map((row, i) => (
+                <div key={i} className={`neg-where-row${i === 0 ? ' neg-where-row-first' : ''}`}>
+                  <span className="neg-where-label">{row.label}</span>
+                  <span
+                    className={
+                      row.bold
+                        ? 'neg-where-value neg-where-value-bold'
+                        : row.mono
+                          ? 'neg-where-value neg-where-value-mono'
+                          : 'neg-where-value'
+                    }
+                  >
+                    {row.value}
+                  </span>
+                </div>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
       {showSubmitSuccessModal && submitSuccess && (
         <div className="unified-modal-overlay" onClick={() => { setShowSubmitSuccessModal(false); setSubmitSuccess('') }}>
           <div className="submit-success-modal" onClick={e => e.stopPropagation()}>
@@ -1081,6 +1408,72 @@ export default function SearchTermsTable({
                 onClick={() => { setShowSubmitSuccessModal(false); setSubmitSuccess('') }}
               >
                 Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removeGoogleModal && (
+        <div className="unified-modal-overlay" onClick={closeRemoveGoogleModal}>
+          <div className="remove-google-modal" onClick={e => e.stopPropagation()} role="dialog" aria-labelledby="remove-google-modal-title" aria-modal="true">
+            <div className="remove-google-modal-icon-wrap" aria-hidden>
+              <i className="fas fa-exclamation-triangle remove-google-modal-warn-icon" />
+            </div>
+            <h3 id="remove-google-modal-title" className="remove-google-modal-title">
+              Remove negative keyword?
+            </h3>
+            <div className="remove-google-modal-keyword-pill">{removeGoogleModal.label}</div>
+            <p className="remove-google-modal-desc">
+              By proceeding, you will be removing this negative keyword from your Google Ads account. This cannot be undone from this tool.
+            </p>
+            <div className="remove-google-modal-actions">
+              <button type="button" className="remove-google-modal-btn" onClick={closeRemoveGoogleModal}>
+                Cancel
+              </button>
+              <button type="button" className="remove-google-modal-btn remove-google-modal-btn-primary" onClick={confirmRemoveGoogleModal}>
+                Remove from Google Ads
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showPendingRemoveModal && pendingRemoveTarget && (
+        <div className="unified-modal-overlay" onClick={closePendingRemoveModal}>
+          <div className="pending-remove-modal" onClick={e => e.stopPropagation()}>
+            <button
+              type="button"
+              className="pending-remove-modal-close"
+              onClick={closePendingRemoveModal}
+              aria-label="Close"
+            >
+              ×
+            </button>
+            <div className="pending-remove-modal-icon" aria-hidden>
+              <i className="fas fa-lightbulb" />
+            </div>
+            <h3 className="pending-remove-modal-title">Help us learn</h3>
+            <p className="pending-remove-modal-copy">
+              You&apos;re removing <span className="pending-remove-modal-keyword">{pendingRemoveTarget.label}</span> as a suggested negative.
+            </p>
+            <p className="pending-remove-modal-copy pending-remove-modal-copy-secondary">
+              Why isn&apos;t this a negative? Your feedback helps improve future recommendations.
+            </p>
+            <textarea
+              className="pending-remove-modal-feedback"
+              rows={3}
+              value={pendingRemoveFeedback}
+              onChange={e => setPendingRemoveFeedback(e.target.value)}
+              placeholder="Optional feedback"
+            />
+            <div className="pending-remove-modal-helper">Optional - skip if you&apos;d prefer not to explain.</div>
+            <div className="pending-remove-modal-actions">
+              <button type="button" className="btn btn-outline-secondary" onClick={confirmPendingRemoveSkip}>
+                Skip Feedback &amp; Remove
+              </button>
+              <button type="button" className="btn btn-primary" onClick={confirmPendingRemoveSubmit}>
+                Submit Feedback &amp; Remove
               </button>
             </div>
           </div>
@@ -1499,7 +1892,7 @@ export default function SearchTermsTable({
         </div>
 
         {/* Table */}
-        <div className="table-wrapper" aria-busy={isUpdatePending || undefined}>
+        <div ref={tableWrapperRef} className="table-wrapper" aria-busy={isUpdatePending || undefined}>
           <table ref={tableRef} className="table table-hover table-sm mb-0 search-terms-table unified-table">
             <thead>
               <tr>
@@ -1537,16 +1930,7 @@ export default function SearchTermsTable({
                 >
                   CONV. <SortIcon col="conversions" />
                 </th>
-                <th style={{ width: 170 }}>KW DERIVED FROM</th>
-                <th
-                  className="sortable-th"
-                  style={{ width: 170, cursor: 'default' }}
-                  title="Order is set when search terms load."
-                  onClick={() => handleSort('campaign')}
-                >
-                  CAMPAIGN <SortIcon col="campaign" />
-                </th>
-                <th style={{ width: 150 }}>AD GROUP</th>
+                <th style={{ width: 56 }} aria-label="Row origin details" />
               </tr>
             </thead>
             <tbody>
@@ -1651,7 +2035,7 @@ export default function SearchTermsTable({
                                   type="button"
                                   className="unified-neg-del"
                                   onClick={e =>
-                                    runPendingUiUpdate(() => onRemoveNegative(keyword), pointFromEvent(e))}
+                                    openPendingRemoveModal(keyword, label)}
                                   title="Remove"
                                 >
                                   ×
@@ -1686,6 +2070,7 @@ export default function SearchTermsTable({
                             !!existing?.resourceName &&
                             !!existing?.source &&
                             typeof onRemoveGoogleNegative === 'function'
+                          const googleNegInfoId = `g:${uniqueKey}:${keyword}:${matchType}`
                           return (
                             <div key={`g-${i}`} className="triggered-neg-stack-item">
                               <span
@@ -1693,26 +2078,48 @@ export default function SearchTermsTable({
                                 title="Already in Google Ads"
                               >
                                 {label}
+                                <button
+                                  type="button"
+                                  className="neg-where-info-btn unified-neg-info"
+                                  aria-label={`Where this negative lives: ${keyword}`}
+                                  aria-expanded={negWhereOpen?.id === googleNegInfoId}
+                                  ref={el => {
+                                    if (negWhereOpen?.id === googleNegInfoId) negWhereAnchorRef.current = el
+                                  }}
+                                  onClick={e => {
+                                    e.stopPropagation()
+                                    setOriginInfoOpenRowKey(null)
+                                    setNegWhereOpen(prev =>
+                                      prev?.id === googleNegInfoId
+                                        ? null
+                                        : {
+                                            id: googleNegInfoId,
+                                            kind: 'google',
+                                            keyword,
+                                            matchType,
+                                            rowKey: uniqueKey,
+                                          },
+                                    )
+                                  }}
+                                  title="Where this negative lives"
+                                >
+                                  <i className="fas fa-info-circle" />
+                                </button>
                                 {canDeleteGoogleNegative ? (
                                   <button
                                     type="button"
                                     className="unified-neg-del"
                                     title="Remove from Google Ads"
-                                    onClick={e =>
-                                      runPendingUiUpdate(
-                                        () => {
-                                          const approved = window.confirm(
-                                            `Remove ${label} from Google Ads?`,
-                                          )
-                                          if (!approved) return
-                                          onRemoveGoogleNegative(
-                                            existing.resourceName,
-                                            existing.source,
-                                          )
-                                        },
-                                        pointFromEvent(e),
-                                      )
-                                    }
+                                    onClick={e => {
+                                      e.stopPropagation()
+                                      setNegWhereOpen(null)
+                                      setOriginInfoOpenRowKey(null)
+                                      setRemoveGoogleModal({
+                                        label,
+                                        resourceName: existing.resourceName,
+                                        source: existing.source,
+                                      })
+                                    }}
                                   >
                                     ×
                                   </button>
@@ -1770,38 +2177,29 @@ export default function SearchTermsTable({
                     {/* Conv. */}
                     <td className="text-end">{Number(term.conversions).toFixed(1)}</td>
 
-                    {/* KW derived from */}
-                    <td>
-                      {term.matchingKeyword ? (
-                        <div className="kw-derived-cell">
-                          <span className="kw-derived-text">{term.matchingKeyword}</span>
-                          {problematicKws.has(term.matchingKeyword) && (
-                            <span className="kw-warn-wrap">
-                              <svg width="14" height="14" viewBox="0 0 20 20" fill="none" style={{ cursor: 'pointer', display: 'block', flexShrink: 0 }}>
-                                <circle cx="10" cy="10" r="9" fill="#fce8e6" stroke="#d93025" strokeWidth="1.5"/>
-                                <line x1="10" y1="6" x2="10" y2="11" stroke="#d93025" strokeWidth="1.8" strokeLinecap="round"/>
-                                <circle cx="10" cy="13.5" r="0.8" fill="#d93025"/>
-                              </svg>
-                              <span className="kw-warn-tip">This keyword is triggering a high percentage of your negative keywords — consider tightening its match type or reviewing it.</span>
-                            </span>
-                          )}
-                        </div>
-                      ) : (
-                        <span style={{ color: '#aaa', fontSize: 12 }}>—</span>
-                      )}
+                    <td className="origin-info-cell">
+                      <button
+                        type="button"
+                        className="row-origin-info-btn"
+                        aria-label="View search term origin"
+                        aria-expanded={originInfoOpenRowKey === uniqueKey}
+                        ref={el => {
+                          if (uniqueKey === originInfoOpenRowKey) originInfoAnchorRef.current = el
+                        }}
+                        onClick={() => {
+                          setNegWhereOpen(null)
+                          setOriginInfoOpenRowKey(originInfoOpenRowKey === uniqueKey ? null : uniqueKey)
+                        }}
+                      >
+                        <i className="fas fa-info-circle" />
+                      </button>
                     </td>
-
-                    {/* Campaign */}
-                    <td style={{ fontSize: 12, color: '#555' }}>{term.campaign}</td>
-
-                    {/* Ad group */}
-                    <td style={{ fontSize: 12, color: '#555' }}>{term.adGroup}</td>
                   </tr>
                 )
               })}
               {sortedRows.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="text-center text-muted py-3">
+                  <td colSpan={7} className="text-center text-muted py-3">
                     No matching records found
                   </td>
                 </tr>

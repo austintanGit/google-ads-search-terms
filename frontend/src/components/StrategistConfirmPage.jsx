@@ -59,6 +59,7 @@ export default function StrategistConfirmPage() {
   const [actionPending, setActionPending] = useState('')
   const [actionError, setActionError] = useState('')
   const [actionResult, setActionResult] = useState(null)
+  const [patchingItemId, setPatchingItemId] = useState(null)
 
   async function reload() {
     if (!id) return
@@ -88,12 +89,35 @@ export default function StrategistConfirmPage() {
   const status = data?.status || ''
   const canFinalize = status === 'client_submitted'
   const canReject = status === 'client_submitted' || status === 'pending_client'
+  const actionsLocked = actionPending !== '' || patchingItemId !== null
+
+  async function patchItemDecision(itemId, decision) {
+    if (!canFinalize) return
+    setPatchingItemId(itemId)
+    setActionError('')
+    try {
+      const r = await authedFetch(`/api/review-requests/${id}/items/${itemId}/decision`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(body?.error || body?.details || `Update failed (${r.status})`)
+      await reload()
+    } catch (err) {
+      setActionError(err.message || 'Could not update decision.')
+    } finally {
+      setPatchingItemId(null)
+    }
+  }
 
   async function finalize() {
     if (!canFinalize) return
-    if (!window.confirm(
-      `Finalize and submit ${blockItems.length} blocked keyword${blockItems.length === 1 ? '' : 's'} to Google Ads?`,
-    )) return
+    const confirmMsg =
+      blockItems.length > 0
+        ? `Finalize and submit ${blockItems.length} blocked keyword${blockItems.length === 1 ? '' : 's'} to Google Ads?`
+        : 'Finalize this review? No terms were marked to block — nothing new will be added to Google Ads (this just closes the review).'
+    if (!window.confirm(confirmMsg)) return
     setActionPending('finalize')
     setActionError('')
     try {
@@ -153,10 +177,11 @@ export default function StrategistConfirmPage() {
     <div className="review-clean-wrap" style={{ padding: '24px 16px' }}>
       <section className="review-clean-header-card">
         <h2 className="review-clean-title">Confirm client review</h2>
-        <p className="review-clean-sub">
-          {data?.clientName ? <><strong>{data.clientName}</strong> · </> : null}
-          Recipient: {data?.recipientEmail || 'n/a'}
-        </p>
+        {data?.clientName ? (
+          <p className="review-clean-sub">
+            <strong>{data.clientName}</strong>
+          </p>
+        ) : null}
         <p className="review-clean-sub" style={{ margin: 0 }}>
           Status: <strong>{status.replace(/_/g, ' ')}</strong> — {statusCopy(status)}
         </p>
@@ -173,6 +198,15 @@ export default function StrategistConfirmPage() {
             </span>
           ) : null}
         </div>
+        {canFinalize && blockItems.length === 0 ? (
+          <p
+            className="review-clean-sub"
+            style={{ marginTop: 10, marginBottom: 0, fontSize: '0.85rem', color: '#6b7280' }}
+          >
+            Only terms marked <strong style={{ fontWeight: 600 }}>block</strong> are pushed to Google Ads.
+            If you still want a term the client kept, use <strong>Add as negative</strong> on that row below.
+          </p>
+        ) : null}
       </section>
 
       {actionError ? <div className="alert alert-danger" role="alert">{actionError}</div> : null}
@@ -198,9 +232,21 @@ export default function StrategistConfirmPage() {
                 <div className="review-clean-item-kw">{formatNegLabel(it.keyword, it.matchType)}</div>
                 <div className="review-clean-item-meta">{destLabel(it)}</div>
               </div>
-              <span className="badge bg-danger-subtle text-danger" style={{ alignSelf: 'center' }}>
-                Block
-              </span>
+              <div className="review-clean-item-actions">
+                {canFinalize ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-secondary"
+                    disabled={actionsLocked}
+                    onClick={() => patchItemDecision(it.id, 'keep')}
+                  >
+                    {patchingItemId === it.id ? 'Updating…' : "Don't add"}
+                  </button>
+                ) : null}
+                <span className="badge bg-danger-subtle text-danger" style={{ alignSelf: 'center' }}>
+                  Block
+                </span>
+              </div>
             </article>
           ))}
         </div>
@@ -217,9 +263,21 @@ export default function StrategistConfirmPage() {
                 <div className="review-clean-item-kw">{formatNegLabel(it.keyword, it.matchType)}</div>
                 <div className="review-clean-item-meta">{destLabel(it)}</div>
               </div>
-              <span className="badge bg-success-subtle text-success" style={{ alignSelf: 'center' }}>
-                Keep
-              </span>
+              <div className="review-clean-item-actions">
+                {canFinalize ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm review-clean-btn-block"
+                    disabled={actionsLocked}
+                    onClick={() => patchItemDecision(it.id, 'block')}
+                  >
+                    {patchingItemId === it.id ? 'Updating…' : 'Add as negative'}
+                  </button>
+                ) : null}
+                <span className="badge bg-success-subtle text-success" style={{ alignSelf: 'center' }}>
+                  Keep
+                </span>
+              </div>
             </article>
           ))}
         </div>
@@ -236,7 +294,30 @@ export default function StrategistConfirmPage() {
                 <div className="review-clean-item-kw">{formatNegLabel(it.keyword, it.matchType)}</div>
                 <div className="review-clean-item-meta">{destLabel(it)}</div>
               </div>
-              <span className="badge bg-secondary" style={{ alignSelf: 'center' }}>—</span>
+              <div className="review-clean-item-actions">
+                {canFinalize ? (
+                  <>
+                    <button
+                      type="button"
+                      className="btn btn-sm review-clean-btn-block"
+                      disabled={actionsLocked}
+                      onClick={() => patchItemDecision(it.id, 'block')}
+                    >
+                      {patchingItemId === it.id ? '…' : 'Block'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm review-clean-btn-keep"
+                      disabled={actionsLocked}
+                      onClick={() => patchItemDecision(it.id, 'keep')}
+                    >
+                      {patchingItemId === it.id ? '…' : 'Keep'}
+                    </button>
+                  </>
+                ) : (
+                  <span className="badge bg-secondary" style={{ alignSelf: 'center' }}>—</span>
+                )}
+              </div>
             </article>
           ))}
         </div>
@@ -246,17 +327,19 @@ export default function StrategistConfirmPage() {
         <button
           type="button"
           className="btn btn-success"
-          disabled={!canFinalize || actionPending !== ''}
+          disabled={!canFinalize || actionsLocked}
           onClick={finalize}
         >
           {actionPending === 'finalize'
             ? 'Submitting to Google Ads…'
-            : `Finalize submission (${blockItems.length} block${blockItems.length === 1 ? '' : 's'})`}
+            : blockItems.length > 0
+              ? `Finalize — add ${blockItems.length} negative${blockItems.length === 1 ? '' : 's'}`
+              : 'Finalize review (no negatives to add)'}
         </button>
         <button
           type="button"
           className="btn btn-outline-danger"
-          disabled={!canReject || actionPending !== ''}
+          disabled={!canReject || actionsLocked}
           onClick={reject}
         >
           {actionPending === 'reject' ? 'Rejecting…' : 'Reject'}

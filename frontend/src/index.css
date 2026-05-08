@@ -2116,12 +2116,6 @@ body {
 /* ============================================================
    Negative Badges (in table NEGATIVE column)
    ============================================================ */
-.negative-badges {
-  /* display: flex;
-  flex-wrap: wrap;
-  gap: 4px; */
-}
-
 .neg-badge {
   display: inline-flex;
   align-items: center;
@@ -2132,12 +2126,6 @@ body {
   font-weight: 500;
   line-height: 1.4;
   white-space: nowrap;
-}
-
-.neg-badge-google {
-  /* background-color: #dcfce7;
-  color: #15803d;
-  border: 1px solid #86efac; */
 }
 
 .neg-badge-ai {
@@ -3545,6 +3533,37 @@ body {
   opacity: 1;
 }
 
+.unified-neg-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 0 2px;
+  margin: 0 1px;
+  line-height: 1;
+  font-size: 12px;
+  color: inherit;
+  opacity: 0.72;
+  flex-shrink: 0;
+}
+
+.unified-neg-info:hover,
+.unified-neg-info:focus-visible {
+  opacity: 1;
+}
+
+.unified-neg-info:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+.unified-neg-green .unified-neg-info {
+  color: #137333;
+}
+
 .unified-neg-green .unified-neg-del {
   color: #dc2626;
 }
@@ -3554,45 +3573,172 @@ body {
 }
 
 /* KW derived from column */
-.kw-derived-cell {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.kw-derived-text {
-  font-size: 12px;
-  color: #555;
-}
-
-/* Warning icon wrapper with tooltip */
-.kw-warn-wrap {
+.origin-info-cell {
   position: relative;
+  width: 56px;
+  text-align: center;
+}
+
+.row-origin-info-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid #d7dce9;
+  background: #fff;
+  color: #5f6368;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.row-origin-info-btn:hover {
+  background: #f3f6fd;
+  color: #1a73e8;
+  border-color: #b8c8f5;
+}
+
+.row-origin-info-btn:focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 2px;
+}
+
+.origin-info-popover {
+  background: #fff;
+  border: 1px solid #d8dde8;
+  border-radius: 10px;
+  box-shadow: 0 14px 34px rgba(17, 24, 39, 0.18);
+  padding: 12px;
+  text-align: left;
+}
+
+/* Portaled + fixed: stays in viewport (top/bottom not clipped by scroll parents) */
+.origin-info-popover--portal {
+  position: fixed;
+  z-index: 10050;
+  max-height: min(70vh, calc(100vh - 2 * 16px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.origin-info-popover-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1f2937;
+  margin-bottom: 8px;
+}
+
+.origin-info-row {
+  display: grid;
+  grid-template-columns: 122px 1fr;
+  gap: 10px;
+  align-items: start;
+  border-top: 1px solid #edf1f6;
+  padding-top: 7px;
+  margin-top: 7px;
+}
+
+.origin-info-label {
+  font-size: 11px;
+  color: #6b7280;
+  font-weight: 600;
+}
+
+.origin-info-value {
+  font-size: 12px;
+  color: #111827;
+}
+
+.origin-info-warning {
+  margin-top: 10px;
+  border: 1px solid #f3d08f;
+  background: #fff8e7;
+  border-radius: 8px;
+  color: #8b5e00;
+  font-size: 12px;
+  line-height: 1.35;
+  padding: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.origin-info-warning i {
+  margin-top: 1px;
+}
+
+/* "Where this negative lives" (destination) — portaled like search-term origin */
+.neg-where-popover--portal {
+  position: fixed;
+  z-index: 10051;
+  max-height: min(70vh, calc(100vh - 2 * 16px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
+  background: #fff;
+  border: 1px solid #d8dde8;
+  border-radius: 10px;
+  box-shadow: 0 14px 34px rgba(17, 24, 39, 0.18);
+  padding: 12px 14px;
+  text-align: left;
+}
+
+.neg-where-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e8eaef;
+}
+
+.neg-where-header-icon {
+  color: #1a73e8;
+  font-size: 15px;
   flex-shrink: 0;
 }
 
-.kw-warn-tip {
-  display: none;
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: #2c2c2c;
-  color: #fff;
-  font-size: 11px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  z-index: 200;
-  width: 240px;
-  white-space: normal;
-  line-height: 1.5;
-  pointer-events: none;
+.neg-where-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111827;
 }
 
-.kw-warn-wrap:hover .kw-warn-tip {
-  display: block;
+.neg-where-row {
+  display: grid;
+  grid-template-columns: 112px 1fr;
+  gap: 10px;
+  align-items: start;
+  border-top: 1px solid #edf1f6;
+  padding-top: 8px;
+  margin-top: 8px;
+}
+
+.neg-where-row-first {
+  border-top: none;
+  margin-top: 6px;
+  padding-top: 0;
+}
+
+.neg-where-label {
+  font-size: 11px;
+  color: #6b7280;
+  font-weight: 500;
+}
+
+.neg-where-value {
+  font-size: 13px;
+  color: #111827;
+}
+
+.neg-where-value-bold {
+  font-weight: 700;
+}
+
+.neg-where-value-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
 }
 
 /* Unified table overrides */
@@ -4080,6 +4226,183 @@ body {
 .unified-modal-close:hover {
   color: #111827;
   background: #f3f4f6;
+}
+
+/* Remove negative from Google Ads — confirmation (replaces window.confirm) */
+.remove-google-modal {
+  position: relative;
+  background: #fff;
+  border-radius: 12px;
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  border: 1px solid #e8eaed;
+  box-shadow: 0 18px 44px rgba(17, 24, 39, 0.22);
+  padding: 24px 26px 22px;
+}
+
+.remove-google-modal-icon-wrap {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #fce8e6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 14px;
+}
+
+.remove-google-modal-warn-icon {
+  color: #d93025;
+  font-size: 18px;
+}
+
+.remove-google-modal-title {
+  margin: 0 0 12px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #202124;
+  line-height: 1.3;
+}
+
+.remove-google-modal-keyword-pill {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  color: #202124;
+  background: #f1f3f4;
+  border-radius: 6px;
+  padding: 5px 10px;
+  margin-bottom: 14px;
+}
+
+.remove-google-modal-desc {
+  margin: 0 0 22px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #3c4043;
+}
+
+.remove-google-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.remove-google-modal-btn {
+  border: 1px solid #dadce0;
+  background: #fff;
+  color: #202124;
+  border-radius: 8px;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  min-height: 40px;
+}
+
+.remove-google-modal-btn:hover {
+  background: #f8f9fa;
+}
+
+.remove-google-modal-btn-primary {
+  /* same visual weight as Cancel per design mock; slightly darker border for emphasis */
+  border-color: #c4c7cc;
+}
+
+.pending-remove-modal {
+  position: relative;
+  background: #fff;
+  border-radius: 16px;
+  width: 480px;
+  max-width: 100%;
+  border: 1px solid #d6dae3;
+  box-shadow: 0 18px 44px rgba(17, 24, 39, 0.28);
+  padding: 22px 22px 18px;
+}
+
+.pending-remove-modal-close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #777;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pending-remove-modal-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid #d9ddd0;
+  background: #f2f1ea;
+  color: #6b7280;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 12px;
+  font-size: 15px;
+}
+
+.pending-remove-modal-title {
+  margin: 0 0 6px;
+  font-size: 1.125rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #111827;
+}
+
+.pending-remove-modal-copy {
+  font-size: 0.875rem;
+  line-height: 1.45;
+  margin: 0 0 6px;
+  color: #1f2937;
+}
+
+.pending-remove-modal-copy-secondary {
+  margin-bottom: 10px;
+}
+
+.pending-remove-modal-keyword {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.88em;
+  background: #f3f4f6;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.pending-remove-modal-feedback {
+  width: 100%;
+  border: 1px solid #cdd3e0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.875rem;
+  resize: vertical;
+}
+
+.pending-remove-modal-helper {
+  margin-top: 6px;
+  margin-bottom: 12px;
+  color: #6b7280;
+  font-size: 0.75rem;
+}
+
+.pending-remove-modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.pending-remove-modal-actions .btn {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.35rem 0.75rem;
+  line-height: 1.35;
 }
 
 .unified-modal-body {
