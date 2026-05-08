@@ -2,6 +2,71 @@ export function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/** Normalize for comparison (case-insensitive, collapsed spaces). */
+function normalizeComparableQuery(q) {
+  return (q ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+}
+
+/**
+ * Approximate Google Ads negative matching for UI chips/highlights — not authoritative.
+ * EXACT ≈ query text equals keyword; PHRASE ≈ contiguous whole-word phrase; BROAD ≈ every token appears as whole word (any order).
+ */
+export function googleNegativeMatchesSearchQuery(searchTerm, keyword, matchType) {
+  const mt = (matchType ?? 'EXACT').toString().toUpperCase()
+  const termNorm = normalizeComparableQuery(searchTerm)
+  const kwNorm = normalizeComparableQuery(typeof keyword === 'string' ? keyword : keyword == null ? '' : String(keyword))
+  if (!kwNorm) return false
+
+  if (mt === 'EXACT') {
+    return termNorm === kwNorm
+  }
+
+  if (mt === 'PHRASE') {
+    const parts = kwNorm.split(/\s+/).map(p => escapeRegex(p)).filter(Boolean)
+    if (!parts.length) return false
+    const body = parts.join('\\s+')
+    const re = new RegExp(`(?<![a-z0-9])${body}(?![a-z0-9])`, 'i')
+    return re.test(searchTerm)
+  }
+
+  if (mt === 'BROAD') {
+    const tokens = kwNorm.split(/\s+/).filter(Boolean)
+    if (!tokens.length) return false
+    return tokens.every(tok => {
+      const re = new RegExp(`(?<![a-z0-9])${escapeRegex(tok)}(?![a-z0-9])`, 'i')
+      return re.test(searchTerm)
+    })
+  }
+
+  return termNorm === kwNorm
+}
+
+// Same parsing as SearchTermsTable: "google:foo bar (PHRASE)" → keyword + matchType
+export function parseNegativePhrase(phrase) {
+  const source = phrase.startsWith('google:') ? 'google'
+    : phrase.startsWith('ai:') ? 'ai'
+    : 'manual'
+  const raw = phrase.replace(/^(google:|ai:|manual:)/, '')
+  const parenIdx = raw.lastIndexOf(' (')
+  if (parenIdx !== -1) {
+    return { keyword: raw.slice(0, parenIdx), matchType: raw.slice(parenIdx + 2, -1), source }
+  }
+  return { keyword: raw, matchType: 'EXACT', source }
+}
+
+/**
+ * Value for `/review?client=` — prefer digits-only Google Ads customer id so it matches
+ * `client_pending_state` keys and the review resolver `byId`; fall back to descriptive name.
+ */
+export function buildReviewClientQueryParam(customerId, descriptiveName) {
+  const digits = String(customerId ?? '').replace(/\D/g, '')
+  if (digits.length >= 6) return digits
+  return String(descriptiveName ?? '').trim()
+}
+
 /**
  * Returns the CSS class for highlighting a matched phrase in a search term.
  * Phrases can be prefixed with 'google:', 'ai:', or 'manual:' to indicate source.
@@ -38,8 +103,17 @@ export function buildHighlightedParts(text, negatives) {
   negatives.forEach(phrase => {
     const cls = getHighlightClass(phrase, negatives)
     if (!cls) return
-    const displayPhrase = phrase.replace(/^(google:|ai:|manual:)/, '')
-    const escaped = escapeRegex(displayPhrase)
+    const { keyword: kwRaw, matchType: mtParsed } = parseNegativePhrase(phrase)
+    const kwTrim = kwRaw.trim()
+    if (!kwTrim) return
+
+    // Keep chip display and highlighting aligned for Google-loaded negatives.
+    if (phrase.startsWith('google:')) {
+      if (!googleNegativeMatchesSearchQuery(text, kwTrim, mtParsed)) return
+    }
+
+    const parts = kwTrim.split(/\s+/).map(seg => escapeRegex(seg)).join('\\s+')
+    const escaped = `(?:${parts})`
     const regex = new RegExp(`(?<![a-z0-9])(${escaped})(?![a-z0-9])`, 'gi')
     let match
     while ((match = regex.exec(text)) !== null) {

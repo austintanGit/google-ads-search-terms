@@ -1,11 +1,14 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react'
-import { Routes, Route, useNavigate } from 'react-router-dom'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { Routes, Route, useNavigate, useLocation, useSearchParams } from 'react-router-dom'
 import Select from 'react-select'
-import { getDefaultDates, escapeRegex } from './utils'
+import { getDefaultDates, escapeRegex, googleNegativeMatchesSearchQuery } from './utils'
 import SearchTermsTable from './SearchTermsTable'
 import AIPanel from './AIPanel'
+import AIScanTablePlaceholder from './components/AIScanTablePlaceholder'
 import AuthPage from './components/AuthPage'
 import AdminPanel from './components/AdminPanel'
+import PublicReviewPage from './components/PublicReviewPage'
+import StrategistConfirmPage from './components/StrategistConfirmPage'
 
 // Authentication check
 function useAuth() {
@@ -66,35 +69,254 @@ const authenticatedFetch = (url, options = {}) => {
   });
 };
 
-// Single word → Exact, multi-word → Phrase
-function inferMatchType(kw) {
+/** Server may scrape pages + Bedrock — cap wait so a dead 404/host never locks the analyser spinner. */
+const AI_RECOMMEND_TIMEOUT_MS = 150000
+
+function aiRecommendAbortSignal() {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(AI_RECOMMEND_TIMEOUT_MS)
+  }
+  const ctrl = new AbortController()
+  setTimeout(() => ctrl.abort(), AI_RECOMMEND_TIMEOUT_MS)
+  return ctrl.signal
+}
+
+function isAiRequestTimeoutAbort(err) {
+  const n = err?.name
+  return n === 'AbortError' || n === 'TimeoutError'
+}
+
+async function postAiRecommendNegatives(payload) {
+  let r
+  try {
+    r = await authenticatedFetch('/api/ai-recommend-negatives', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: aiRecommendAbortSignal(),
+    })
+  } catch (err) {
+    if (isAiRequestTimeoutAbort(err)) {
+      throw new Error(
+        'AI scan timed out. The client site may be down, very slow to load, or the model took too long. Try Re-scan, fix the URL, or continue without AI.',
+      )
+    }
+    throw new Error(err.message || 'Could not reach the AI scan server.')
+  }
+  if (!r.ok) {
+    let msg = `AI scan failed (${r.status})`
+    try {
+      const d = await r.json()
+      msg = d.details || d.error || msg
+    } catch {
+      /* keep msg */
+    }
+    throw new Error(msg)
+  }
+  return r.json()
+}
+
+/**
+ * Load `client_pending_state` for a Google Ads customer id.
+ * Requires r.ok + JSON array — error bodies like `{ error }` are ignored (previously broke restore).
+ * Retries digits-only id when the first query returns [] (rows may have been saved under a different id shape).
+ */
+/** Prefer digits-only Google customer id for `client_pending_state` keys (matches list/search APIs). */
+function canonicalPendingStateClientId(clientId) {
+  const digits = String(clientId ?? '').replace(/\D/g, '')
+  return digits.length >= 6 ? digits : String(clientId ?? '').trim()
+}
+
+const LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY = 'negativeKeywords:lastClientCustomerId'
+
+function findStoredClientMatch(clientsList, storedRaw) {
+  if (!storedRaw || !clientsList?.length) return null
+  const s = String(storedRaw).trim()
+  const byExact = clientsList.find(c => String(c.customerId) === s)
+  if (byExact) return byExact
+  const digits = s.replace(/\D/g, '')
+  if (digits.length < 6) return null
+  return clientsList.find(c => String(c.customerId).replace(/\D/g, '') === digits) || null
+}
+
+async function fetchPendingStateForClient(clientId) {
+  const raw = String(clientId ?? '').trim()
+  const canonical = canonicalPendingStateClientId(clientId)
+  const candidates = [...new Set([canonical, raw].filter(Boolean))]
+  for (let i = 0; i < candidates.length; i++) {
+    const cid = candidates[i]
+    try {
+      const r = await authenticatedFetch(`/api/pending-state?clientId=${encodeURIComponent(cid)}`)
+      const data = await r.json().catch(() => null)
+      if (!r.ok || !Array.isArray(data)) continue
+      if (data.length > 0) return data
+      if (i === candidates.length - 1) return data
+    } catch {
+      /* try next candidate */
+    }
+  }
+  return []
+}
+
+async function saveDefaultSharedSetForClient(clientId, sharedSetId) {
+  const r = await authenticatedFetch('/api/client-default-shared-set', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      clientId,
+      sharedSetId: sharedSetId != null && sharedSetId !== '' ? String(sharedSetId) : null,
+    }),
+  })
+  const d = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error(d.details || d.error || 'Failed to save default keyword list')
+  return d
+}
+
+// Default for new inferred / AI recommendations (rows & bulk controls use Phrase).
+function inferMatchType(_kw) {
   return 'PHRASE'
 }
 
-// Infer campaign/adgroup, destination type, and match type for a keyword based on search term data.
-// - 1 ad group  → ADGROUP (most targeted)
-// - 1 campaign, multiple ad groups → CAMPAIGN
-// - Multiple campaigns → NEGATIVE_LIST (can't target all campaigns at once)
-function inferKeywordDestination(kw, terms) {
-  const kwLower = kw.toLowerCase()
-  const matching = terms.filter(t => t.searchTerm.toLowerCase().includes(kwLower))
+// Default placement: negative keyword list; callers can override (e.g. row flag → campaign/ad group).
+function inferKeywordDestination(kw, _terms) {
   const matchType = inferMatchType(kw)
+  return {
+    campaignId: null,
+    campaignName: null,
+    adGroupId: null,
+    adGroupName: null,
+    destination: 'NEGATIVE_LIST',
+    matchType,
+  }
+}
 
-  if (matching.length === 0) {
-    return { campaignId: null, campaignName: null, adGroupId: null, adGroupName: null, destination: 'CAMPAIGN', matchType }
+/** AI suggestions default to phrase + keyword list; match type may be changed in the UI. */
+function normalizeAiPendingItem(item, defaultSharedSetId) {
+  if (!item || item.source !== 'ai') return item
+  const base = {
+    ...item,
+    destination: 'NEGATIVE_LIST',
+    campaignId: null,
+    campaignName: null,
+    adGroupId: null,
+    adGroupName: null,
+  }
+  if (defaultSharedSetId && !base.sharedSetId) {
+    return { ...base, sharedSetId: defaultSharedSetId }
+  }
+  return base
+}
+
+const PENDING_DESTINATIONS = new Set(['NEGATIVE_LIST', 'CAMPAIGN', 'ADGROUP'])
+
+/** Round-trip persisted fields after load so selects and submit logic match React state shapes. */
+function mapRestoredPendingItem(item, defaultSharedSetId) {
+  if (!item) return item
+  const dest = PENDING_DESTINATIONS.has(item.destination) ? item.destination : 'NEGATIVE_LIST'
+  const mt = (item.matchType || 'PHRASE').toString().toUpperCase()
+  let sharedSetId = null
+  let campaignId = null
+  let campaignName = null
+  let adGroupId = null
+  let adGroupName = null
+  if (dest === 'NEGATIVE_LIST') {
+    if (item.sharedSetId != null && item.sharedSetId !== '') sharedSetId = String(item.sharedSetId)
+    else if (defaultSharedSetId != null && defaultSharedSetId !== '')
+      sharedSetId = String(defaultSharedSetId)
+  } else {
+    campaignId = item.campaignId != null ? String(item.campaignId) : null
+    campaignName = item.campaignName ?? null
+  }
+  if (dest === 'ADGROUP') {
+    adGroupId = item.adGroupId != null ? String(item.adGroupId) : null
+    adGroupName = item.adGroupName ?? null
   }
 
-  // Find the best matching search term (highest clicks)
-  const best = [...matching].sort((a, b) => (b.clicks || 0) - (a.clicks || 0))[0]
-
-  // Always default destination to CAMPAIGN as requested, but preserve campaign/adgroup context
   return {
-    campaignId: best?.campaignId || null,
-    campaignName: best?.campaign || null,
-    adGroupId: best?.adGroupId || null,
-    adGroupName: best?.adGroup || null,
-    destination: 'CAMPAIGN', // Always default to CAMPAIGN level
-    matchType
+    ...item,
+    keyword: String(item.keyword || '').trim(),
+    matchType: mt,
+    destination: dest,
+    sharedSetId: dest === 'NEGATIVE_LIST' ? sharedSetId : null,
+    source: item.source === 'ai' ? 'ai' : 'manual',
+    selected: item.selected !== false,
+    campaignId: dest === 'NEGATIVE_LIST' ? null : campaignId,
+    campaignName: dest === 'NEGATIVE_LIST' ? null : campaignName,
+    adGroupId: dest === 'ADGROUP' ? adGroupId : null,
+    adGroupName: dest === 'ADGROUP' ? adGroupName : null,
+  }
+}
+
+/** Send only persisted columns with stable types so saves match DB and restore cleanly. */
+function serializePendingItemsForPersist(items) {
+  const serialized = (items || [])
+    .filter(i => i && typeof i.keyword === 'string' && i.keyword.trim())
+    .map(i => {
+      const dest = PENDING_DESTINATIONS.has(i.destination) ? i.destination : 'NEGATIVE_LIST'
+      const mt = (i.matchType || 'PHRASE').toString().toUpperCase()
+      let sharedSetId = null
+      let campaignId = null
+      let campaignName = null
+      let adGroupId = null
+      let adGroupName = null
+      if (dest === 'NEGATIVE_LIST') {
+        if (i.sharedSetId != null && i.sharedSetId !== '') sharedSetId = String(i.sharedSetId)
+      } else {
+        campaignId = i.campaignId != null ? String(i.campaignId) : null
+        campaignName = i.campaignName ?? null
+      }
+      if (dest === 'ADGROUP') {
+        adGroupId = i.adGroupId != null ? String(i.adGroupId) : null
+        adGroupName = i.adGroupName ?? null
+      }
+
+      return {
+        keyword: String(i.keyword || '').trim(),
+        matchType: mt,
+        destination: dest,
+        sharedSetId: dest === 'NEGATIVE_LIST' ? sharedSetId : null,
+        source: i.source === 'ai' ? 'ai' : 'manual',
+        selected: i.selected !== false,
+        campaignId: dest === 'NEGATIVE_LIST' ? null : campaignId,
+        campaignName: dest === 'NEGATIVE_LIST' ? null : campaignName,
+        adGroupId: dest === 'ADGROUP' ? adGroupId : null,
+        adGroupName: dest === 'ADGROUP' ? adGroupName : null,
+      }
+    })
+  // DB key is (client_id, keyword, match_type); dedupe to avoid PK collisions.
+  const seen = new Set()
+  return serialized.filter(i => {
+    const key = `${String(i.keyword || '').trim().toLowerCase()}::${String(i.matchType || 'PHRASE').toUpperCase()}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function buildAiPendingRow(kw, sourcesMap, googleNegatives, defaultSharedSetId) {
+  const matchType = 'PHRASE'
+  const googleEntry = (googleNegatives || []).find(
+    n =>
+      typeof n === 'object' &&
+      n.keyword?.toLowerCase() === kw.toLowerCase() &&
+      (n.matchType || 'EXACT').toString().toUpperCase() === matchType
+  )
+  const inGoogle = !!googleEntry
+  return {
+    keyword: kw,
+    matchType,
+    source: 'ai',
+    sourceSearchTerms: sourcesMap[kw] || [],
+    selected: !inGoogle,
+    alreadyInGoogle: inGoogle,
+    googleResourceName: googleEntry?.resourceName || null,
+    googleSource: googleEntry?.source || null,
+    destination: 'NEGATIVE_LIST',
+    sharedSetId: defaultSharedSetId ?? null,
+    campaignId: null,
+    campaignName: null,
+    adGroupId: null,
+    adGroupName: null,
   }
 }
 
@@ -178,6 +400,7 @@ function NegativeKeywordsPage({
   submitError,
   setSubmitError,
   manualAddSuccess,
+  manualAddError,
   submissionHistory,
   rowNegatives,
   error,
@@ -189,7 +412,33 @@ function NegativeKeywordsPage({
   handleSaveWebsiteUrl,
   handleSkipWebsiteUrl,
   existingNegatives,
+  onSaveWork,
+  onClearWork,
+  reviewLinkError = '',
+  onCreateReviewRequest,
+  onSaveDefaultSharedSet,
+  savedWorkRestoreNotice = null,
+  onDismissSavedWorkRestoreNotice,
+  searchTermsEmptyReason = '',
 }) {
+  const location = useLocation()
+  const clientName = currentClientId
+    ? (clients.find(c => c.customerId === currentClientId)?.descriptiveName || currentClientId)
+    : ''
+
+  const showClientIntro =
+    !currentClientId && !reviewLinkError && location.pathname !== '/review'
+  const showReviewConnecting =
+    location.pathname === '/review' && !currentClientId && !reviewLinkError && !loading
+  const isReviewMode = location.pathname === '/review'
+  const showNoTermsEmpty =
+    !!currentClientId &&
+    !loading &&
+    !error &&
+    searchTerms.length === 0 &&
+    !aiLoading &&
+    !reviewLinkError
+
   return (
     <>
       <header className="sticky-header">
@@ -306,47 +555,106 @@ function NegativeKeywordsPage({
         </div>
       </header>
 
-      <div className="app-wrapper">
-        <AIPanel
-          currentClientId={currentClientId}
-          websiteUrl={websiteUrl}
-          setWebsiteUrl={setWebsiteUrl}
-          onSaveWebsiteUrl={async (url) => {
-            if (!currentClientId) return
-            try {
-              await authenticatedFetch('/api/client-website-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ clientId: currentClientId, websiteUrl: url }),
-              })
-            } catch (err) {
-              console.error('Failed to save website URL:', err)
-            }
-          }}
-          aiStats={aiStats}
-          aiLoading={aiLoading}
-          campaigns={campaigns}
-          adGroupsByCampaign={adGroupsByCampaign}
-          pendingNegatives={pendingNegatives}
-          setPendingNegatives={setPendingNegatives}
-          sharedSets={sharedSets}
-          selectedSharedSetId={selectedSharedSetId}
-          setSelectedSharedSetId={setSelectedSharedSetId}
-          lastScannedAt={lastScannedAt}
-          onRescan={onRescan}
-          onCreateSharedSet={onCreateSharedSet}
-          onAddManualNegative={onAddManualNegative}
-          onRemoveNegative={onRemoveNegative}
-          onRemoveGoogleNegative={onRemoveGoogleNegative}
-          onSubmitNegatives={onSubmitNegatives}
-          submitSuccess={submitSuccess}
-          setSubmitSuccess={setSubmitSuccess}
-          submitError={submitError}
-          setSubmitError={setSubmitError}
-          manualAddSuccess={manualAddSuccess}
-          submissionHistory={submissionHistory}
-          existingNegatives={existingNegatives}
-        />
+      <div
+        className={`app-wrapper page-negative-keywords${currentClientId ? ' page-negative-keywords--has-client' : ''}`}
+      >
+        {reviewLinkError ? (
+          <div className="alert alert-warning mb-3" role="alert">{reviewLinkError}</div>
+        ) : null}
+
+        {showClientIntro ? (
+          <div className="negative-kw-intro-sole">
+            <div className="negative-kw-intro-side-inner">
+              <span className="negative-kw-intro-badge">Get started</span>
+              <h2 id="negative-kw-intro-heading" className="negative-kw-intro-title">
+                Select a Google Ads account
+              </h2>
+              <p className="negative-kw-intro-lede">
+                We’ll load recent search terms, run the AI scanner against your site, and show a review table where
+                you can send negatives straight to Google Ads. The <strong>Negative Keyword Scanner</strong> appears
+                after you choose a client.
+              </p>
+              <ol className="negative-kw-intro-steps">
+                <li>
+                  <i className="fas fa-mouse-pointer negative-kw-intro-step-icon" aria-hidden />
+                  Use <strong>Client account</strong> in the header to pick an MCC-linked client.
+                </li>
+                <li>
+                  <i className="fas fa-calendar-alt negative-kw-intro-step-icon" aria-hidden />
+                  Adjust the <strong>date range</strong> if needed, then click <strong>Apply</strong>.
+                </li>
+                <li>
+                  <i className="fas fa-robot negative-kw-intro-step-icon" aria-hidden />
+                  Use the scanner to confirm your <strong>website URL</strong> and run AI, then review suggestions in the
+                  table.
+                </li>
+              </ol>
+            </div>
+          </div>
+        ) : (
+          <>
+            {savedWorkRestoreNotice ? (
+              <div className="saved-work-restore-banner" role="status">
+                <i className="fas fa-history saved-work-restore-icon" aria-hidden />
+                <span className="saved-work-restore-text">
+                  Restored{' '}
+                  <strong>{savedWorkRestoreNotice.count}</strong>{' '}
+                  saved pending keyword{savedWorkRestoreNotice.count === 1 ? '' : 's'} from{' '}
+                  {savedWorkRestoreNotice.clientName ? (
+                    <>
+                      your last session for <strong>{savedWorkRestoreNotice.clientName}</strong>
+                    </>
+                  ) : (
+                    'your last session'
+                  )}
+                  .
+                  {savedWorkRestoreNotice.skippedAutoAiScan ? (
+                    <> Automatic AI scan was skipped so this list stays as you saved it. Use Re-scan for new suggestions.</>
+                  ) : null}
+                </span>
+                <button
+                  type="button"
+                  className="saved-work-restore-dismiss"
+                  onClick={() =>
+                    onDismissSavedWorkRestoreNotice && onDismissSavedWorkRestoreNotice()
+                  }
+                >
+                  Dismiss
+                </button>
+              </div>
+            ) : null}
+            {!isReviewMode && (
+              <AIPanel
+                currentClientId={currentClientId}
+                websiteUrl={websiteUrl}
+                setWebsiteUrl={setWebsiteUrl}
+                onSaveWebsiteUrl={async (url) => {
+                  if (!currentClientId) return
+                  try {
+                    await authenticatedFetch('/api/client-website-url', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ clientId: currentClientId, websiteUrl: url }),
+                    })
+                  } catch (err) {
+                    console.error('Failed to save website URL:', err)
+                  }
+                }}
+                aiStats={aiStats}
+                aiLoading={aiLoading}
+                lastScannedAt={lastScannedAt}
+                onRescan={onRescan}
+              />
+            )}
+          </>
+        )}
+
+        {showReviewConnecting ? (
+          <div className="negative-kw-review-connecting" role="status">
+            <div className="spinner-border text-primary spinner-border-sm me-2" aria-hidden />
+            Opening shared review link…
+          </div>
+        ) : null}
 
         {error && <div className="alert alert-danger mx-0 mb-3">{error}</div>}
 
@@ -359,25 +667,68 @@ function NegativeKeywordsPage({
           </div>
         )}
 
-        {!loading && searchTerms.length > 0 && (
-          <>
-            <div className="step-heading" id="search-terms-section">
-              <div className="step-heading-num">2</div>
-              <div className="step-heading-text">
-                <div className="step-heading-title">Review your search terms</div>
-                <div className="step-heading-sub">Flag irrelevant terms directly from your search term report</div>
-              </div>
+        {!loading && searchTerms.length > 0 && aiLoading && (
+          <AIScanTablePlaceholder clientName={clientName} />
+        )}
+
+        {showNoTermsEmpty ? (
+          <div className="negative-kw-empty-terms" role="region" aria-label="No search terms">
+            <div className="negative-kw-empty-terms-inner">
+              <i className="fas fa-search negative-kw-empty-terms-icon" aria-hidden />
+              <h3 className="negative-kw-empty-terms-title">
+                {searchTermsEmptyReason === 'no_clicks_only'
+                  ? 'No clicked search terms found for this date range'
+                  : 'No search terms in this range'}
+              </h3>
+              <p className="negative-kw-empty-terms-copy">
+                {searchTermsEmptyReason === 'no_clicks_only' ? (
+                  <>
+                    We found search terms for this account in the selected period, but none of them received clicks.
+                    Because this view currently shows only search terms with at least one click, the table is empty.
+                    Try expanding the date range, or enable 0-click terms if you want to review all search queries.
+                  </>
+                ) : (
+                  <>
+                    Try a wider date range with <strong>Apply</strong>, or verify this account has search term data for
+                    the selected period.
+                  </>
+                )}
+              </p>
             </div>
-            
-            <SearchTermsTable
-              searchTerms={searchTerms}
-              rowNegatives={rowNegatives}
-              onAddNegative={onAddManualNegative}
-              onRemoveNegative={onRemoveNegative}
-              onRemoveGoogleNegative={onRemoveGoogleNegative}
-              existingNegatives={existingNegatives}
-            />
-          </>
+          </div>
+        ) : null}
+
+        {!loading && searchTerms.length > 0 && !aiLoading && (
+          <SearchTermsTable
+            searchTerms={searchTerms}
+            rowNegatives={rowNegatives}
+            onAddNegative={onAddManualNegative}
+            onRemoveNegative={onRemoveNegative}
+            onRemoveGoogleNegative={onRemoveGoogleNegative}
+            existingNegatives={existingNegatives}
+            pendingNegatives={pendingNegatives}
+            setPendingNegatives={setPendingNegatives}
+            campaigns={campaigns}
+            adGroupsByCampaign={adGroupsByCampaign}
+            sharedSets={sharedSets}
+            onCreateSharedSet={onCreateSharedSet}
+            onSubmitNegatives={onSubmitNegatives}
+            submissionHistory={submissionHistory}
+            clientName={clientName}
+            submitSuccess={submitSuccess}
+            setSubmitSuccess={setSubmitSuccess}
+            submitError={submitError}
+            setSubmitError={setSubmitError}
+            manualAddSuccess={manualAddSuccess}
+            manualAddError={manualAddError}
+            onSaveWork={onSaveWork}
+            onClearWork={onClearWork}
+            approvalClientId={currentClientId}
+            onCreateReviewRequest={onCreateReviewRequest}
+            defaultSharedSetId={selectedSharedSetId}
+            onSaveDefaultSharedSet={onSaveDefaultSharedSet}
+            isReviewMode={isReviewMode}
+          />
         )}
       </div>
 
@@ -431,6 +782,17 @@ function NegativeKeywordsPage({
 
 export default function App() {
   const { user, loading, logout } = useAuth();
+  const location = useLocation();
+
+  // Public review page (`/review-public?t=...`) renders outside the auth gate
+  // so clients can review without an account.
+  if (location.pathname === '/review-public') {
+    return (
+      <Routes>
+        <Route path="/review-public" element={<PublicReviewPage />} />
+      </Routes>
+    );
+  }
 
   // If still checking authentication, show loading
   if (loading) {
@@ -472,6 +834,14 @@ function AuthenticatedApp({ user, onLogout }) {
   const today = new Date().toISOString().split('T')[0]
 
   const navigate = useNavigate()
+  const location = useLocation()
+  const locationRef = useRef(location)
+  locationRef.current = location
+  const [searchParams] = useSearchParams()
+  /** Cleared when leaving /review so the same query can hydrate again after navigation. */
+  const reviewHandledSearchRef = useRef('')
+  const [reviewLinkError, setReviewLinkError] = useState('')
+  const handleClientChangeRef = useRef(async () => {})
 
   // Core data
   const [clients, setClients] = useState([])
@@ -479,6 +849,7 @@ function AuthenticatedApp({ user, onLogout }) {
   const [startDate, setStartDate] = useState(defaultStart)
   const [endDate, setEndDate] = useState(defaultEnd)
   const [searchTerms, setSearchTerms] = useState([])
+  const [searchTermsEmptyReason, setSearchTermsEmptyReason] = useState('')
 
   // Negative keywords
   const [existingNegatives, setExistingNegatives] = useState([])
@@ -506,6 +877,12 @@ function AuthenticatedApp({ user, onLogout }) {
   const [submitSuccess, setSubmitSuccess] = useState('')
   const [submitError, setSubmitError] = useState('')
   const [manualAddSuccess, setManualAddSuccess] = useState('')
+  const [manualAddError, setManualAddError] = useState('')
+  const [savedWorkRestoreNotice, setSavedWorkRestoreNotice] = useState(null)
+
+  const dismissSavedWorkRestoreNotice = useCallback(() => {
+    setSavedWorkRestoreNotice(null)
+  }, [])
   
   // Website URL popup
   const [showUrlPopup, setShowUrlPopup] = useState(false)
@@ -547,26 +924,32 @@ function AuthenticatedApp({ user, onLogout }) {
   const rowNegatives = useMemo(() => {
     const map = new Map()
 
+    // Only show a Google chip when the negative is actually in scope for this
+    // row's campaign / ad group — matches what Google Ads actually applies.
+    const negativeAppliesToRow = (neg, term) => {
+      if (typeof neg === 'string') return false
+      const cid = String(term.campaignId || '')
+      const aid = String(term.adGroupId || '')
+      if (neg.source === 'AD_GROUP')   return String(neg.adGroupId || '') === aid
+      if (neg.source === 'CAMPAIGN')   return String(neg.campaignId || '') === cid
+      if (neg.source === 'SHARED_SET') return (neg.appliedCampaignIds || []).map(String).includes(cid)
+      return false
+    }
+
     searchTerms.forEach(term => {
       const termStr = term.searchTerm
       const negatives = new Set()
 
-      // Check existing Google negatives
+      // Check existing Google negatives (text match AND scope match)
       existingNegatives.forEach(existing => {
-        let keyword, matchType
-        if (typeof existing === 'string') {
-          // Old format - just keyword text
-          keyword = existing.toLowerCase()
-          matchType = 'EXACT'
-        } else {
-          // New format - object with keyword and matchType
-          keyword = existing.keyword.toLowerCase()
-          matchType = convertMatchTypeToText(existing.matchType || 'EXACT')
-        }
-        
-        if (termStr.toLowerCase().includes(keyword)) {
-          // Use the original keyword case from existing negatives, not the lowercase version
-          const originalKeyword = typeof existing === 'string' ? existing : existing.keyword
+        const matchType = typeof existing === 'string'
+          ? 'EXACT'
+          : convertMatchTypeToText(existing.matchType || 'EXACT')
+        const originalKeyword = typeof existing === 'string' ? existing : existing.keyword
+        if (
+          googleNegativeMatchesSearchQuery(termStr, originalKeyword, matchType) &&
+          negativeAppliesToRow(existing, term)
+        ) {
           negatives.add(`google:${originalKeyword} (${matchType})`)
         }
       })
@@ -598,6 +981,7 @@ function AuthenticatedApp({ user, onLogout }) {
 
   function resetState() {
     setSearchTerms([])
+    setSearchTermsEmptyReason('')
     setExistingNegatives([])
     setDbSavedNegatives([])
     setPendingNegatives([])
@@ -609,14 +993,27 @@ function AuthenticatedApp({ user, onLogout }) {
     setSubmissionHistory([])
     setSubmitSuccess('')
     setSubmitError('')
+    setManualAddError('')
     setError('')
+    setAiLoading(false)
+    setSavedWorkRestoreNotice(null)
   }
 
   // Returns the loaded terms array so callers can use it for auto-scanning
-  async function loadSearchTerms(clientId, start, end, googleNegs, dbNegs) {
+  // skipPendingRestore: if true, skip the plain-keyword pendingNegatives init (rich state already restored)
+  async function loadSearchTerms(
+    clientId,
+    start,
+    end,
+    googleNegs,
+    dbNegs,
+    skipPendingRestore = false,
+    defaultSharedSetIdOverride = null,
+  ) {
     if (!clientId) { setError('Please select a client first'); return [] }
     setLoading(true)
     setError('')
+    setSearchTermsEmptyReason('')
     try {
       const url = `/api/search-terms?clientId=${clientId}&startDate=${start}&endDate=${end}`;
       const r = await authenticatedFetch(url)
@@ -628,17 +1025,27 @@ function AuthenticatedApp({ user, onLogout }) {
       // Handle new response structure with searchTerms and summary
       const terms = data.searchTerms || data // Fallback for backward compatibility
       setSearchTerms(terms)
+      setSearchTermsEmptyReason(data?.emptyReason || '')
 
       if (googleNegs !== undefined) setExistingNegatives(googleNegs)
       if (dbNegs !== undefined) {
         setDbSavedNegatives(dbNegs)
-        const googleNegLower = new Set((googleNegs || existingNegatives).map(k => 
-          typeof k === 'string' ? k.toLowerCase() : k.keyword.toLowerCase()
-        ))
-        const pendingFromDb = dbNegs
-          .filter(kw => !googleNegLower.has(kw.toLowerCase()))
-          .map(kw => ({ keyword: kw, matchType: 'EXACT', source: 'manual', selected: true, destination: 'CAMPAIGN', sharedSetId: null }))
-        setPendingNegatives(pendingFromDb)
+        if (!skipPendingRestore) {
+          const googleNegLower = new Set((googleNegs || existingNegatives).map(k => 
+            typeof k === 'string' ? k.toLowerCase() : k.keyword.toLowerCase()
+          ))
+          const pendingFromDb = dbNegs
+            .filter(kw => !googleNegLower.has(kw.toLowerCase()))
+            .map(kw => ({
+              keyword: kw,
+              matchType: 'PHRASE',
+              source: 'manual',
+              selected: true,
+              destination: 'NEGATIVE_LIST',
+              sharedSetId: defaultSharedSetIdOverride || selectedSharedSetId || null,
+            }))
+          setPendingNegatives(pendingFromDb)
+        }
       }
       return terms
     } catch (err) {
@@ -652,25 +1059,71 @@ function AuthenticatedApp({ user, onLogout }) {
   async function handleClientChange(clientId) {
     setCurrentClientId(clientId)
     resetState()
-    if (!clientId) return
+    if (!clientId) {
+      try {
+        localStorage.removeItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY)
+      } catch (_) {
+        /* ignore */
+      }
+      return
+    }
 
     try {
-      const [settingsRes, negRes, setsRes, historyRes] = await Promise.all([
+      const [settingsRes, negRes, setsRes, historyRes, savedPendingState] = await Promise.all([
         authenticatedFetch(`/api/client-settings?clientId=${clientId}`).then(r => r.json()),
         authenticatedFetch(`/api/negative-keywords?clientId=${clientId}`).then(r => r.json()),
         authenticatedFetch(`/api/shared-sets?clientId=${clientId}`).then(r => r.json()),
         authenticatedFetch(`/api/submission-history?clientId=${clientId}`).then(r => r.json()),
+        fetchPendingStateForClient(clientId),
       ])
       setSubmissionHistory(Array.isArray(historyRes) ? historyRes : [])
 
       const savedNegatives = settingsRes.savedNegatives || []
       const googleNegatives = negRes['Global Negative Keywords'] || []
       const sets = Array.isArray(setsRes) ? setsRes : []
+      const configuredDefaultListId = settingsRes.defaultSharedSetId
+      const hasConfiguredDefault =
+        configuredDefaultListId != null &&
+        sets.some(s => String(s.id) === String(configuredDefaultListId))
+      const defaultListId = hasConfiguredDefault ? String(configuredDefaultListId) : sets[0]?.id ?? null
 
       setDbSavedNegatives(savedNegatives)
       setExistingNegatives(googleNegatives)
       setSharedSets(sets)
-      if (sets.length > 0) setSelectedSharedSetId(sets[0].id)
+      setSelectedSharedSetId(defaultListId || '')
+
+      const hasRestoredPendingFromDb = savedPendingState.length > 0
+      let restoredFromDb = null
+
+      // Restore rich pending state if it was saved, otherwise fall back to plain-keyword DB list
+      if (hasRestoredPendingFromDb) {
+        // Keep every saved row. If Google already has this keyword+matchType, mark alreadyInGoogle
+        // instead of dropping — otherwise chips/row state vanish even though DB still lists the keyword.
+        restoredFromDb = savedPendingState.map(item => {
+          const enriched = mapRestoredPendingItem(item, defaultListId)
+          const inGoogle = isKeywordMatchTypeInGoogle(
+            enriched.keyword,
+            enriched.matchType || 'PHRASE',
+            googleNegatives
+          )
+          return {
+            ...enriched,
+            alreadyInGoogle: inGoogle,
+            selected: inGoogle ? false : item.selected !== false,
+          }
+        })
+        // Review link loads the same saved pending list as the main app. Unchecked rows stay visible
+        // with their checkbox off; the approval email still only attaches checked keywords.
+        setPendingNegatives(restoredFromDb)
+      } else {
+        setSavedWorkRestoreNotice(null)
+      }
+
+      try {
+        localStorage.setItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY, String(clientId))
+      } catch (_) {
+        /* ignore */
+      }
 
       // Determine website URL — await detection so we have it before scanning
       let urlToUse = settingsRes.websiteUrl || ''
@@ -686,7 +1139,38 @@ function AuthenticatedApp({ user, onLogout }) {
         } catch {}
       }
 
-      const terms = await loadSearchTerms(clientId, startDate, endDate, googleNegatives, savedNegatives)
+      const willAutoAi =
+        locationRef.current.pathname !== '/review' &&
+        !!String(urlToUse || '').trim() &&
+        !hasRestoredPendingFromDb
+      if (willAutoAi) {
+        setAiLoading(true)
+      }
+
+      const terms = await loadSearchTerms(
+        clientId,
+        startDate,
+        endDate,
+        googleNegatives,
+        savedNegatives,
+        hasRestoredPendingFromDb,
+        defaultListId,
+      )
+
+      if (hasRestoredPendingFromDb && restoredFromDb) {
+        setSavedWorkRestoreNotice({
+          count: restoredFromDb.length,
+          clientName:
+            clients.find(c => String(c.customerId) === String(clientId))?.descriptiveName ||
+            clientId ||
+            '',
+          skippedAutoAiScan:
+            hasRestoredPendingFromDb &&
+            locationRef.current.pathname !== '/review' &&
+            !!String(urlToUse || '').trim() &&
+            !!(terms && terms.length > 0),
+        })
+      }
 
       // If no website URL found and we have search terms, show popup to ask user
       if (!urlToUse && terms && terms.length > 0) {
@@ -695,64 +1179,122 @@ function AuthenticatedApp({ user, onLogout }) {
         return
       }
 
-      // Auto-scan immediately after loading — use local vars to avoid stale closure
-      if (urlToUse && terms && terms.length > 0) {
-        setAiLoading(true)
-        try {
-          const r = await authenticatedFetch('/api/ai-recommend-negatives', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ searchTerms: terms, websiteUrl: urlToUse.trim() }),
-          })
-          if (!r.ok) {
-            const d = await r.json()
-            throw new Error(d.error || 'AI analysis failed')
-          }
-          const result = await r.json()
-          const aiKeywords = result.negativeKeywords || []
-          const sourcesMap = result.negativeKeywordSources || {}
-          
-          // Only count truly new keywords (not existing in any match type)
-          const trueNewKeywords = aiKeywords.filter(kw => {
-            return !existingNegatives.some(existing => {
-              const existingKeyword = typeof existing === 'string' ? existing : existing.keyword
-              return existingKeyword.toLowerCase() === kw.toLowerCase()
-            })
-          })
+      if (willAutoAi && (!terms || terms.length === 0)) {
+        setAiLoading(false)
+      }
 
-          setPendingNegatives(prev => {
-            const existingKws = new Set(prev.map(i => `${i.keyword.toLowerCase()}:${i.matchType}`))
-            const newItems = aiKeywords
-              .filter(kw => {
-                const { matchType } = inferKeywordDestination(kw, terms)
-                return !existingKws.has(`${kw.toLowerCase()}:${matchType}`)
-              })
-              .map(kw => {
-                const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, terms)
-                const googleEntry = googleNegatives.find(n => typeof n === 'object' && n.keyword?.toLowerCase() === kw.toLowerCase() && n.matchType === matchType)
-                const inGoogle = !!googleEntry
-                return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, googleResourceName: googleEntry?.resourceName || null, googleSource: googleEntry?.source || null, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
-              })
-            return [...prev, ...newItems]
+      // Auto-scan immediately after loading — skip on /review; skip when DB had saved pending work
+      if (willAutoAi && urlToUse && terms && terms.length > 0) {
+        try {
+          const result = await postAiRecommendNegatives({
+            searchTerms: terms,
+            websiteUrl: urlToUse.trim(),
           })
-          setAiStats(result.summary ? {
-            ...result.summary,
-            negativeCount: trueNewKeywords.length,
-            qualityPercentage: result.summary.totalSearchTerms > 0
-              ? Math.round(((result.summary.totalSearchTerms - trueNewKeywords.length) / result.summary.totalSearchTerms) * 100)
-              : 100,
-            explanation: result.explanation,
-          } : {})
-          setLastScannedAt(new Date())
+          handleAiResults(result)
+          if (!result.scanSkippedDueToBadWebsiteUrl) {
+            setLastScannedAt(new Date())
+          }
         } catch (err) {
           console.error('Auto-scan failed:', err.message)
+          setSubmitError(err.message || 'AI scan failed.')
         } finally {
           setAiLoading(false)
         }
       }
     } catch (err) {
       setError('Error loading client data: ' + err.message)
+      setAiLoading(false)
     }
+  }
+
+  handleClientChangeRef.current = handleClientChange
+
+  useEffect(() => {
+    if (location.pathname !== '/negative-keywords') return
+    if (currentClientId) return
+    if (!clients.length) return
+    let stored = ''
+    try {
+      stored = localStorage.getItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY) || ''
+    } catch (_) {
+      return
+    }
+    const match = findStoredClientMatch(clients, stored)
+    if (!match) return
+    void handleClientChangeRef.current(match.customerId)
+    // intentional: omit handleClientChange from deps — ref is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot reconnect when arriving with no selection
+  }, [location.pathname, clients, currentClientId])
+
+  // /review?client=... — resolve Google Ads client by descriptive name or numeric ID; load same data as main tool (including DB pending state)
+  useEffect(() => {
+    if (location.pathname !== '/review') {
+      reviewHandledSearchRef.current = ''
+      setReviewLinkError('')
+      return
+    }
+    const raw = searchParams.get('client')
+    if (!raw || !String(raw).trim()) {
+      reviewHandledSearchRef.current = ''
+      setReviewLinkError(
+        'This review link is missing a client. Use ?client=CUSTOMER_ID or ?client=Exact%20account%20name.',
+      )
+      return
+    }
+    if (!clients.length) return
+
+    const searchKey = location.search
+    if (reviewHandledSearchRef.current === searchKey) return
+
+    let param
+    try {
+      param = decodeURIComponent(String(raw).trim())
+    } catch {
+      param = String(raw).trim()
+    }
+
+    const paramLower = param.toLowerCase()
+    const paramDigits = param.replace(/\D/g, '')
+    const byName = clients.find(c => (c.descriptiveName || '').trim().toLowerCase() === paramLower)
+    const byId = paramDigits.length >= 6
+      ? clients.find(c => String(c.customerId).replace(/\D/g, '') === paramDigits)
+      : null
+    const match = byName || byId
+
+    if (!match) {
+      reviewHandledSearchRef.current = ''
+      setReviewLinkError(
+        `No client matched "${param}". Ask the sender for a link with the numeric Google Ads customer ID, or the exact account name.`,
+      )
+      return
+    }
+
+    reviewHandledSearchRef.current = searchKey
+    setReviewLinkError('')
+    void handleClientChangeRef.current(match.customerId)
+  }, [location.pathname, location.search, clients, searchParams])
+
+  /**
+   * Creates a public review request and (optionally) emails the client.
+   * Replaces the previous `/api/send-approval-email` flow — the strategist now
+   * confirms decisions via /review-confirm/:id before anything goes to Google Ads.
+   */
+  async function handleCreateReviewRequest(body) {
+    const r = await authenticatedFetch('/api/review-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    let data = {}
+    try {
+      data = await r.json()
+    } catch {
+      /* ignore */
+    }
+    if (!r.ok) {
+      throw new Error(data.details || data.error || 'Failed to create review request')
+    }
+    return data
   }
 
   // Helper function to convert numeric match types to text
@@ -766,14 +1308,15 @@ function AuthenticatedApp({ user, onLogout }) {
 
   // Helper function to check if a keyword + match type combination already exists in Google
   function isKeywordMatchTypeInGoogle(keyword, matchType, googleNegatives) {
+    const mt = (matchType || 'EXACT').toString().toUpperCase()
     return googleNegatives.some(existing => {
       // Handle both old format (strings) and new format (objects with keyword/matchType)
       if (typeof existing === 'string') {
-        return existing.toLowerCase() === keyword.toLowerCase()
-      } else {
-        return existing.keyword.toLowerCase() === keyword.toLowerCase() && 
-               existing.matchType === matchType
+        // Legacy string rows only mean an exact negative of that text
+        return existing.toLowerCase() === keyword.toLowerCase() && mt === 'EXACT'
       }
+      const emt = (existing.matchType || 'EXACT').toString().toUpperCase()
+      return existing.keyword.toLowerCase() === keyword.toLowerCase() && emt === mt
     })
   }
 
@@ -792,72 +1335,166 @@ function AuthenticatedApp({ user, onLogout }) {
     // Clear AI-sourced pending negatives; keep manual ones
     setPendingNegatives(prev => prev.filter(item => item.source !== 'ai'))
 
-    const terms = await loadSearchTerms(currentClientId, startDate, endDate)
+    const shouldRunAi = !!(currentClientId && String(websiteUrl || '').trim())
+    if (shouldRunAi) setAiLoading(true)
 
-    if (websiteUrl && terms && terms.length > 0) {
-      setAiLoading(true)
-      try {
-        const r = await authenticatedFetch('/api/ai-recommend-negatives', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ searchTerms: terms, websiteUrl: websiteUrl.trim() }),
-        })
-        if (r.ok) {
-          const result = await r.json()
-          handleAiResults(result)
-          setLastScannedAt(new Date())
-        }
-      } catch (err) {
-        console.error('Auto-scan failed:', err.message)
-      } finally {
-        setAiLoading(false)
+    try {
+      const terms = await loadSearchTerms(
+        currentClientId,
+        startDate,
+        endDate,
+        undefined,
+        undefined,
+        false,
+        selectedSharedSetId || null,
+      )
+
+      if (!(shouldRunAi && websiteUrl && terms && terms.length > 0)) return
+
+      const result = await postAiRecommendNegatives({
+        searchTerms: terms,
+        websiteUrl: websiteUrl.trim(),
+      })
+      handleAiResults(result)
+      if (!result.scanSkippedDueToBadWebsiteUrl) {
+        setLastScannedAt(new Date())
       }
+    } catch (err) {
+      console.error('Auto-scan failed:', err.message)
+      if (shouldRunAi) setSubmitError(err.message || 'AI scan failed.')
+    } finally {
+      if (shouldRunAi) setAiLoading(false)
     }
   }
 
   // Called when user text-selects a phrase, clicks hover-flag button, or manually adds a keyword.
-  // When no campaign context is provided (manual text input), auto-infers from search terms.
+  // Defaults: phrase match + keyword list (caller may override match type / destination).
   const handleAddManualNegative = useCallback((keyword, matchType = null, campaignId = null, campaignName = null, adGroupId = null, adGroupName = null, destination = null) => {
-    // Infer destination/campaign from search terms when no explicit context; match type from word count unless caller passes one (e.g. manual add)
-    const inferred = inferKeywordDestination(keyword, searchTerms)
+    const normalizedKeyword = String(keyword ?? '').replace(/\u00A0/g, ' ').trim().replace(/\s+/g, ' ')
+    const inferred = inferKeywordDestination(normalizedKeyword, searchTerms)
     let finalCampaignId = campaignId || inferred.campaignId
     let finalCampaignName = campaignName || inferred.campaignName
     let finalAdGroupId = adGroupId || inferred.adGroupId
     let finalAdGroupName = adGroupName || inferred.adGroupName
-    let finalDestination = destination || inferred.destination || 'CAMPAIGN'
+    let finalDestination = destination || inferred.destination || 'NEGATIVE_LIST'
     let finalMatchType = (matchType != null && matchType !== '') ? matchType : inferred.matchType
+    if (finalDestination === 'NEGATIVE_LIST') {
+      finalCampaignId = null
+      finalCampaignName = null
+      finalAdGroupId = null
+      finalAdGroupName = null
+    }
     if ((finalDestination === 'CAMPAIGN' || finalDestination === 'ADGROUP') && finalMatchType === 'BROAD') {
-      finalMatchType = 'EXACT'
+      finalMatchType = 'PHRASE'
     }
 
+    const normalizedMatchType = String(finalMatchType || 'EXACT').toUpperCase()
+    const existingGoogleEntry = existingNegatives.find(existing => {
+      if (typeof existing === 'string') {
+        return existing.toLowerCase() === normalizedKeyword.toLowerCase() && normalizedMatchType === 'EXACT'
+      }
+      const existingMatchType = String(existing.matchType || 'EXACT').toUpperCase()
+      return (
+        String(existing.keyword || '').toLowerCase() === normalizedKeyword.toLowerCase() &&
+        existingMatchType === normalizedMatchType
+      )
+    })
+    const existsInGoogle = !!existingGoogleEntry
+    const alreadyPending = pendingNegatives.some(
+      item => item.keyword.toLowerCase() === normalizedKeyword.toLowerCase() && item.matchType === finalMatchType
+    )
     // Check if this specific keyword + match type combination already exists in Google
-    if (isKeywordMatchTypeInGoogle(keyword, finalMatchType, existingNegatives)) {
+    if (existsInGoogle) {
+      let locationLabel = 'Google Ads'
+      if (existingGoogleEntry && typeof existingGoogleEntry === 'object') {
+        if (existingGoogleEntry.source === 'SHARED_SET') {
+          const resolvedListName =
+            existingGoogleEntry.sharedSetName ||
+            sharedSets.find(s => String(s.id) === String(existingGoogleEntry.sharedSetId || ''))?.name ||
+            null
+          locationLabel = resolvedListName ? `keyword list "${resolvedListName}"` : 'a keyword list'
+        } else if (existingGoogleEntry.source === 'AD_GROUP') {
+          const adGroupNameFromTerms =
+            searchTerms.find(t => String(t.adGroupId || '') === String(existingGoogleEntry.adGroupId || ''))?.adGroup ||
+            null
+          const campaignNameFromTerms =
+            searchTerms.find(t => String(t.campaignId || '') === String(existingGoogleEntry.campaignId || ''))?.campaign ||
+            null
+          const adGroupLabel =
+            existingGoogleEntry.adGroupName ||
+            adGroupNameFromTerms ||
+            existingGoogleEntry.adGroupId ||
+            null
+          const campaignLabel =
+            existingGoogleEntry.campaignName ||
+            campaignNameFromTerms ||
+            existingGoogleEntry.campaignId ||
+            null
+          if (adGroupLabel && campaignLabel) locationLabel = `ad group "${adGroupLabel}" in campaign "${campaignLabel}"`
+          else if (adGroupLabel) locationLabel = `ad group "${adGroupLabel}"`
+          else locationLabel = 'an ad group'
+        } else if (existingGoogleEntry.source === 'CAMPAIGN') {
+          const campaignNameFromTerms =
+            searchTerms.find(t => String(t.campaignId || '') === String(existingGoogleEntry.campaignId || ''))?.campaign ||
+            null
+          const campaignLabel =
+            existingGoogleEntry.campaignName ||
+            campaignNameFromTerms ||
+            existingGoogleEntry.campaignId ||
+            null
+          locationLabel = campaignLabel ? `campaign "${campaignLabel}"` : 'a campaign'
+        }
+      }
+      setManualAddSuccess('')
+      setManualAddError(
+        `"${normalizedKeyword}" already in Google Ads (${finalMatchType.toLowerCase()}) in ${locationLabel}.`,
+      )
+      setTimeout(() => setManualAddError(''), 3500)
       return // Don't add if exact combination already exists
     }
 
-    if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(keyword.toLowerCase())) {
-      setDbSavedNegatives(prev => [...prev, keyword])
+    if (currentClientId && !dbSavedNegatives.map(k => k.toLowerCase()).includes(normalizedKeyword.toLowerCase())) {
+      setDbSavedNegatives(prev => [...prev, normalizedKeyword])
       authenticatedFetch('/api/client-saved-negatives', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clientId: currentClientId, keywords: [keyword] }),
+        body: JSON.stringify({ clientId: currentClientId, keywords: [normalizedKeyword] }),
       }).catch(console.error)
     }
 
-    const alreadyPending = pendingNegatives.some(
-      item => item.keyword.toLowerCase() === keyword.toLowerCase() && item.matchType === finalMatchType
-    )
+    const listDefaultSharedSetId =
+      finalDestination === 'NEGATIVE_LIST'
+        ? (selectedSharedSetId || sharedSets[0]?.id || null)
+        : null
+
     setPendingNegatives(prev => {
-      if (prev.some(item => item.keyword.toLowerCase() === keyword.toLowerCase() && item.matchType === finalMatchType)) return prev
-      return [...prev, { keyword, matchType: finalMatchType, source: 'manual', selected: true, destination: finalDestination, sharedSetId: null, campaignId: finalCampaignId, campaignName: finalCampaignName, adGroupId: finalAdGroupId, adGroupName: finalAdGroupName }]
+      if (prev.some(item => item.keyword.toLowerCase() === normalizedKeyword.toLowerCase() && item.matchType === finalMatchType)) {
+        setManualAddSuccess('')
+        setManualAddError(`"${normalizedKeyword}" already in pending (${finalMatchType.toLowerCase()}).`)
+        setTimeout(() => setManualAddError(''), 3000)
+        return prev
+      }
+      return [...prev, {
+        keyword: normalizedKeyword,
+        matchType: finalMatchType,
+        source: 'manual',
+        selected: true,
+        destination: finalDestination,
+        sharedSetId: listDefaultSharedSetId,
+        campaignId: finalCampaignId,
+        campaignName: finalCampaignName,
+        adGroupId: finalAdGroupId,
+        adGroupName: finalAdGroupName,
+      }]
     })
     setAiStats(prev => prev || {})
     setSubmitSuccess('')
+    setManualAddError('')
     if (!alreadyPending) {
-      setManualAddSuccess(`"${keyword}" added to pending keywords`)
+      setManualAddSuccess(`"${normalizedKeyword}" added to pending keywords`)
       setTimeout(() => setManualAddSuccess(''), 3000)
     }
-  }, [currentClientId, dbSavedNegatives, existingNegatives, pendingNegatives, searchTerms])
+  }, [currentClientId, dbSavedNegatives, existingNegatives, pendingNegatives, searchTerms, sharedSets])
 
   const handleRemoveNegativeFromRow = useCallback((keyword) => {
     const kwLower = keyword.toLowerCase()
@@ -897,6 +1534,28 @@ function AuthenticatedApp({ user, onLogout }) {
   }, [currentClientId])
 
   const handleAiResults = useCallback((result) => {
+    if (result.scanSkippedDueToBadWebsiteUrl) {
+      setSubmitSuccess('')
+      setSubmitError(
+        'This website URL did not load. Edit the URL under Negative Keyword Scanner, save the correct homepage, then click Re-scan.',
+      )
+      const total = result.summary?.totalSearchTerms ?? 0
+      setAiStats({
+        ...(result.summary || {
+          totalSearchTerms: total,
+          negativeCount: 0,
+          qualityPercentage: 100,
+        }),
+        negativeCount: 0,
+        qualityPercentage: 100,
+        explanation: '',
+        websiteContextStatus: 'unreadable',
+        websiteFetchDetail: result.websiteFetchDetail ?? null,
+      })
+      return
+    }
+
+    const defaultListId = selectedSharedSetId || sharedSets[0]?.id || null
     const aiKeywords = result.negativeKeywords || []
     const sourcesMap = result.negativeKeywordSources || {}
 
@@ -909,30 +1568,40 @@ function AuthenticatedApp({ user, onLogout }) {
     })
 
     setPendingNegatives(prev => {
-      const existingKws = new Set(prev.map(item => `${item.keyword.toLowerCase()}:${item.matchType}`))
+      const existingAiKw = new Set(prev.filter(i => i.source === 'ai').map(i => i.keyword.toLowerCase()))
       const newItems = aiKeywords
-        .filter(kw => {
-          const { matchType } = inferKeywordDestination(kw, searchTerms)
-          return !existingKws.has(`${kw.toLowerCase()}:${matchType}`)
-        })
-        .map(kw => {
-          const { campaignId, campaignName, adGroupId, adGroupName, destination, matchType } = inferKeywordDestination(kw, searchTerms)
-          const googleEntry = existingNegatives.find(n => typeof n === 'object' && n.keyword?.toLowerCase() === kw.toLowerCase() && n.matchType === matchType)
-          const inGoogle = !!googleEntry
-          return { keyword: kw, matchType, source: 'ai', sourceSearchTerms: sourcesMap[kw] || [], selected: !inGoogle, alreadyInGoogle: inGoogle, googleResourceName: googleEntry?.resourceName || null, googleSource: googleEntry?.source || null, destination, sharedSetId: null, campaignId, campaignName, adGroupId, adGroupName }
-        })
-      return [...prev, ...newItems]
+        .filter(kw => !existingAiKw.has(kw.toLowerCase()))
+        .map(kw => buildAiPendingRow(kw, sourcesMap, existingNegatives, defaultListId))
+      return [...prev.map(i => normalizeAiPendingItem(i, defaultListId)), ...newItems]
     })
 
-    setAiStats(result.summary ? {
-      ...result.summary,
-      negativeCount: trueNewKeywords.length,
-      qualityPercentage: result.summary.totalSearchTerms > 0
-        ? Math.round(((result.summary.totalSearchTerms - trueNewKeywords.length) / result.summary.totalSearchTerms) * 100)
-        : 100,
-      explanation: result.explanation,
-    } : {})
-  }, [existingNegatives, searchTerms])
+    const wcStatus = result.websiteContextStatus
+    const wcDetail = result.websiteFetchDetail ?? null
+
+    setAiStats(
+      result.summary
+        ? {
+            ...result.summary,
+            negativeCount: trueNewKeywords.length,
+            qualityPercentage:
+              result.summary.totalSearchTerms > 0
+                ? Math.round(
+                    ((result.summary.totalSearchTerms - trueNewKeywords.length) /
+                      result.summary.totalSearchTerms) *
+                      100,
+                  )
+                : 100,
+            explanation: result.explanation,
+            websiteContextStatus: wcStatus,
+            websiteFetchDetail: wcDetail,
+          }
+        : {
+            websiteContextStatus: wcStatus,
+            websiteFetchDetail: wcDetail,
+            explanation: result.explanation,
+          },
+    )
+  }, [existingNegatives, searchTerms, sharedSets, selectedSharedSetId])
 
   async function handleCreateSharedSet(name) {
     if (!currentClientId) throw new Error('No client selected')
@@ -956,24 +1625,22 @@ function AuthenticatedApp({ user, onLogout }) {
     setSubmitSuccess('')
     setSubmitError('')
     try {
-      const r = await authenticatedFetch('/api/ai-recommend-negatives', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ searchTerms, websiteUrl: urlToUse.trim() }),
+      const result = await postAiRecommendNegatives({
+        searchTerms,
+        websiteUrl: urlToUse.trim(),
       })
-      if (!r.ok) {
-        const d = await r.json()
-        throw new Error(d.details || d.error || 'AI analysis failed')
-      }
-      const result = await r.json()
       handleAiResults(result)
-      setLastScannedAt(new Date())
-      if ((result.negativeKeywords || []).length === 0) {
-        setSubmitError('AI scan completed but found no new negative keywords for this account.')
+      if (result.scanSkippedDueToBadWebsiteUrl) {
+        /* submitError set in handleAiResults */
+      } else {
+        setLastScannedAt(new Date())
+        if ((result.negativeKeywords || []).length === 0) {
+          setSubmitError('AI scan completed but found no new negative keywords for this account.')
+        }
       }
     } catch (err) {
       console.error('Re-scan failed:', err.message)
-      setSubmitError('AI scan failed: ' + err.message)
+      setSubmitError(err.message || 'AI scan failed.')
     } finally {
       setAiLoading(false)
     }
@@ -1006,18 +1673,17 @@ function AuthenticatedApp({ user, onLogout }) {
       if (searchTerms.length > 0) {
         setAiLoading(true)
         try {
-          const r = await authenticatedFetch('/api/ai-recommend-negatives', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ searchTerms, websiteUrl: tempWebsiteUrl.trim() }),
+          const result = await postAiRecommendNegatives({
+            searchTerms,
+            websiteUrl: tempWebsiteUrl.trim(),
           })
-          if (r.ok) {
-            const result = await r.json()
-            handleAiResults(result)
+          handleAiResults(result)
+          if (!result.scanSkippedDueToBadWebsiteUrl) {
             setLastScannedAt(new Date())
           }
         } catch (err) {
           console.error('Auto-scan failed after URL save:', err.message)
+          setSubmitError(err.message || 'AI scan failed after saving URL.')
         } finally {
           setAiLoading(false)
         }
@@ -1042,9 +1708,9 @@ function AuthenticatedApp({ user, onLogout }) {
     if (toSubmit.length === 0) { setSubmitError('No negative keywords selected.'); return }
 
     // Partition by destination
-    const listKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'NEGATIVE_LIST')
-    const campaignKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'CAMPAIGN')
-    const adGroupKeywords = toSubmit.filter(item => (item.destination || 'CAMPAIGN') === 'ADGROUP')
+    const listKeywords = toSubmit.filter(item => (item.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST')
+    const campaignKeywords = toSubmit.filter(item => (item.destination || 'NEGATIVE_LIST') === 'CAMPAIGN')
+    const adGroupKeywords = toSubmit.filter(item => (item.destination || 'NEGATIVE_LIST') === 'ADGROUP')
 
     // Validate selections
     const missingCampaign = campaignKeywords.filter(item => !item.campaignId)
@@ -1060,7 +1726,7 @@ function AuthenticatedApp({ user, onLogout }) {
       return
     }
     if (missingList.length > 0) {
-      setSubmitError(`${missingList.length} keyword(s) with "Negative keyword list" destination need a list selected.`)
+      setSubmitError(`${missingList.length} keyword(s) with "Keyword list" destination need a list selected.`)
       return
     }
 
@@ -1272,6 +1938,67 @@ function AuthenticatedApp({ user, onLogout }) {
     }
   }
 
+  async function onSaveWork() {
+    if (!currentClientId) return
+    const items = serializePendingItemsForPersist(pendingNegatives)
+    const r = await authenticatedFetch('/api/pending-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: canonicalPendingStateClientId(currentClientId), items }),
+    })
+    if (!r.ok) {
+      let d = {}
+      try {
+        d = await r.json()
+      } catch {
+        /* ignore */
+      }
+      throw new Error(d.details || d.error || 'Failed to save pending state')
+    }
+  }
+
+  async function onClearWork() {
+    setPendingNegatives([])
+    setSavedWorkRestoreNotice(null)
+    if (!currentClientId) return
+    await authenticatedFetch('/api/pending-state', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: canonicalPendingStateClientId(currentClientId) }),
+    }).catch(() => {})
+  }
+
+  async function handleSaveDefaultSharedSet(sharedSetId) {
+    if (!currentClientId) throw new Error('Please select a client first.')
+    await saveDefaultSharedSetForClient(currentClientId, sharedSetId)
+    setSelectedSharedSetId(sharedSetId ? String(sharedSetId) : '')
+    if (sharedSetId) {
+      setPendingNegatives(prev =>
+        prev.map(item => {
+          const dest = item.destination || 'NEGATIVE_LIST'
+          if (dest !== 'NEGATIVE_LIST') return item
+          return { ...item, sharedSetId: item.sharedSetId || String(sharedSetId) }
+        }),
+      )
+    }
+  }
+
+  /** Keeps Recommended negatives / Quality % in sync as users remove or clear AI suggestions. */
+  const aiStatsForScanner = useMemo(() => {
+    if (!aiStats || aiStats.totalSearchTerms === undefined) return aiStats
+    const total = aiStats.totalSearchTerms
+    const recommended = (pendingNegatives || []).filter(
+      i => i.source === 'ai' && !i.alreadyInGoogle
+    ).length
+    const qualityPercentage =
+      total > 0 ? Math.round(((total - recommended) / total) * 100) : 100
+    return {
+      ...aiStats,
+      negativeCount: recommended,
+      qualityPercentage: Math.min(100, Math.max(0, qualityPercentage)),
+    }
+  }, [aiStats, pendingNegatives])
+
   return (
     <Routes>
       <Route path="/" element={<HomePage onNavigate={navigate} user={user} />} />
@@ -1290,7 +2017,7 @@ function AuthenticatedApp({ user, onLogout }) {
           onDateRangeSubmit={handleDateRangeSubmit}
           websiteUrl={websiteUrl}
           setWebsiteUrl={setWebsiteUrl}
-          aiStats={aiStats}
+          aiStats={aiStatsForScanner}
           aiLoading={aiLoading}
           searchTerms={searchTerms}
           campaigns={campaigns}
@@ -1313,6 +2040,7 @@ function AuthenticatedApp({ user, onLogout }) {
           submitError={submitError}
           setSubmitError={setSubmitError}
           manualAddSuccess={manualAddSuccess}
+          manualAddError={manualAddError}
           submissionHistory={submissionHistory}
           rowNegatives={rowNegatives}
           error={error}
@@ -1324,8 +2052,77 @@ function AuthenticatedApp({ user, onLogout }) {
           handleSaveWebsiteUrl={handleSaveWebsiteUrl}
           handleSkipWebsiteUrl={handleSkipWebsiteUrl}
           existingNegatives={existingNegatives}
+          onSaveWork={onSaveWork}
+          onClearWork={onClearWork}
+          reviewLinkError={reviewLinkError}
+          onCreateReviewRequest={handleCreateReviewRequest}
+          onSaveDefaultSharedSet={handleSaveDefaultSharedSet}
+          savedWorkRestoreNotice={savedWorkRestoreNotice}
+          onDismissSavedWorkRestoreNotice={dismissSavedWorkRestoreNotice}
+          searchTermsEmptyReason={searchTermsEmptyReason}
         />
       } />
+      <Route path="/review" element={
+        <NegativeKeywordsPage
+          user={user}
+          onLogout={onLogout}
+          clients={clients}
+          currentClientId={currentClientId}
+          onClientChange={handleClientChange}
+          startDate={startDate}
+          endDate={endDate}
+          onStartDateChange={handleStartDateChange}
+          onEndDateChange={handleEndDateChange}
+          today={today}
+          onDateRangeSubmit={handleDateRangeSubmit}
+          websiteUrl={websiteUrl}
+          setWebsiteUrl={setWebsiteUrl}
+          aiStats={aiStatsForScanner}
+          aiLoading={aiLoading}
+          searchTerms={searchTerms}
+          campaigns={campaigns}
+          adGroupsByCampaign={adGroupsByCampaign}
+          pendingNegatives={pendingNegatives}
+          setPendingNegatives={setPendingNegatives}
+          sharedSets={sharedSets}
+          setSharedSets={setSharedSets}
+          selectedSharedSetId={selectedSharedSetId}
+          setSelectedSharedSetId={setSelectedSharedSetId}
+          lastScannedAt={lastScannedAt}
+          onRescan={handleRescan}
+          onCreateSharedSet={handleCreateSharedSet}
+          onAddManualNegative={handleAddManualNegative}
+          onRemoveNegative={handleRemoveNegativeFromRow}
+          onRemoveGoogleNegative={handleRemoveGoogleNegative}
+          onSubmitNegatives={handleSubmitNegatives}
+          submitSuccess={submitSuccess}
+          setSubmitSuccess={setSubmitSuccess}
+          submitError={submitError}
+          setSubmitError={setSubmitError}
+          manualAddSuccess={manualAddSuccess}
+          manualAddError={manualAddError}
+          submissionHistory={submissionHistory}
+          rowNegatives={rowNegatives}
+          error={error}
+          loading={loading}
+          showUrlPopup={showUrlPopup}
+          tempWebsiteUrl={tempWebsiteUrl}
+          setTempWebsiteUrl={setTempWebsiteUrl}
+          urlPopupLoading={urlPopupLoading}
+          handleSaveWebsiteUrl={handleSaveWebsiteUrl}
+          handleSkipWebsiteUrl={handleSkipWebsiteUrl}
+          existingNegatives={existingNegatives}
+          onSaveWork={onSaveWork}
+          onClearWork={onClearWork}
+          reviewLinkError={reviewLinkError}
+          onCreateReviewRequest={handleCreateReviewRequest}
+          onSaveDefaultSharedSet={handleSaveDefaultSharedSet}
+          savedWorkRestoreNotice={savedWorkRestoreNotice}
+          onDismissSavedWorkRestoreNotice={dismissSavedWorkRestoreNotice}
+          searchTermsEmptyReason={searchTermsEmptyReason}
+        />
+      } />
+      <Route path="/review-confirm/:id" element={<StrategistConfirmPage />} />
       <Route path="/admin" element={
         user && user.isSuperUser ? (
           <AdminPanel user={user} />
