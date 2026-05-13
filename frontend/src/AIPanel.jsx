@@ -37,15 +37,16 @@ export default function AIPanel({
             {aiStats?.websiteContextStatus === 'unreadable' && (
               <div className="ai-url-unreadable-banner" role="alert">
                 <div className="ai-url-unreadable-title">
-                  <i className="fas fa-unlink ai-url-unreadable-icon" aria-hidden />
-                  Website URL could not be loaded
+                  <i className="fas fa-shield-alt ai-url-unreadable-icon" aria-hidden />
+                  Homepage blocked automated scan
                 </div>
                 <p className="ai-url-unreadable-detail">
-                  {aiStats.websiteFetchDetail ||
-                    'We could not read this homepage (broken link, 404/403, blocking, SSL, or timeout). Suggestions below use only your search terms—not page content.'}
+                  {aiStats.websiteFetchDetail
+                    ? `${aiStats.websiteFetchDetail} Suggestions below use only your search terms—not page content.`
+                    : 'We could not read this homepage from our server (blocking, 404/403, SSL, or timeout). Suggestions below use only your search terms—not page content.'}
                 </p>
                 <p className="ai-url-unreadable-hint">
-                  Click <strong>Edit</strong> next to the URL, enter a homepage that loads in a browser, press <strong>Save</strong> to store it for this client, then use <strong>Re-scan site</strong>.
+                  The URL may still open in your browser. Confirm it is correct, try <strong>Scan a specific page</strong> if another path is less protected, or continue reviewing search-term-only suggestions below.
                 </p>
               </div>
             )}
@@ -176,8 +177,18 @@ export default function AIPanel({
         {aiStats !== null && aiStats.totalSearchTerms !== undefined && (
           <div className="ai-stats-row">
             <div className="ai-stat-block">
-              <div className="ai-stat-value">{aiStats.totalSearchTerms}</div>
-              <div className="ai-stat-label">Total search terms</div>
+              <div className="ai-stat-value">
+                {aiStats.totalSearchTermsInAccount != null &&
+                Number(aiStats.totalSearchTermsInAccount) > Number(aiStats.totalSearchTerms)
+                  ? `${aiStats.totalSearchTerms} of ${aiStats.totalSearchTermsInAccount}`
+                  : aiStats.totalSearchTerms}
+              </div>
+              <div className="ai-stat-label">
+                {aiStats.totalSearchTermsInAccount != null &&
+                Number(aiStats.totalSearchTermsInAccount) > Number(aiStats.totalSearchTerms)
+                  ? 'Terms analyzed (top by clicks)'
+                  : 'Total search terms'}
+              </div>
             </div>
             <div className="ai-stat-divider" />
             <div className="ai-stat-block">

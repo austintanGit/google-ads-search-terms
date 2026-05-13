@@ -8,20 +8,6 @@ function formatNegLabel(keyword, matchType) {
   return keyword
 }
 
-function destLabel(item) {
-  const dest = item?.destination || 'NEGATIVE_LIST'
-  if (dest === 'NEGATIVE_LIST') return 'Keyword list'
-  if (dest === 'CAMPAIGN') {
-    return item?.campaignName ? `Campaign: ${item.campaignName}` : 'Campaign level'
-  }
-  if (dest === 'ADGROUP') {
-    return item?.adGroupName
-      ? `Ad group: ${item.adGroupName}${item.campaignName ? ` (${item.campaignName})` : ''}`
-      : 'Ad group level'
-  }
-  return ''
-}
-
 function StatusMessage({ status, expiresAt }) {
   if (status === 'expired') {
     return (
@@ -144,10 +130,12 @@ export default function PublicReviewPage() {
   if (loading) {
     return (
       <div className="public-review-shell">
-        <div className="review-clean-wrap">
-          <div className="review-clean-header-card">
-            <div className="spinner-border text-primary spinner-border-sm me-2" aria-hidden />
-            Loading your review…
+        <div className="review-client-wrap">
+          <div className="review-client-panel">
+            <div className="review-client-panel__header">
+              <div className="spinner-border text-primary spinner-border-sm me-2" aria-hidden />
+              Loading your review…
+            </div>
           </div>
         </div>
       </div>
@@ -157,134 +145,147 @@ export default function PublicReviewPage() {
   if (error) {
     return (
       <div className="public-review-shell">
-        <div className="review-clean-wrap">
-          <div className="review-clean-header-card">
-            <h2 className="review-clean-title">Review unavailable</h2>
-            <p className="review-clean-sub">{error}</p>
+        <div className="review-client-wrap">
+          <div className="review-client-panel">
+            <div className="review-client-panel__header">
+              <h2 className="review-client-title">Review unavailable</h2>
+              <p className="review-client-sub">{error}</p>
+            </div>
           </div>
         </div>
       </div>
     )
   }
 
+  const progressPct = items.length ? Math.round((reviewedCount / items.length) * 100) : 0
+
   return (
     <div className="public-review-shell">
-      <div className="review-clean-wrap">
-        <section className="review-clean-header-card">
-          <h2 className="review-clean-title">Review your negative keywords</h2>
-          <p className="review-clean-sub">
-            {data?.requestedByName || data?.requestedByEmail || 'Your agency'} flagged these search terms
-            as potential negatives for{' '}
-            <strong>{data?.clientName || 'your Google Ads account'}</strong>. Choose whether to block each
-            one or keep it. Your strategist will confirm before anything is added to Google Ads.
-          </p>
-          {isPending && data?.expiresAt ? (
-            <p className="review-clean-sub" style={{ fontSize: '0.85rem', color: '#9ca3af' }}>
-              This link expires on {new Date(data.expiresAt).toLocaleString()} and can only be submitted
-              once.
-            </p>
-          ) : null}
-          {isPending && items.length > 0 ? (
-            <div className="review-clean-progress-row">
-              <div className="review-clean-progress-track">
-                <div
-                  className="review-clean-progress-fill"
-                  style={{ width: `${Math.round((reviewedCount / items.length) * 100)}%` }}
-                />
-              </div>
-              <span className="review-clean-progress-label">
-                {reviewedCount} of {items.length} reviewed
-              </span>
-            </div>
-          ) : null}
-        </section>
-
+      <div className="review-client-wrap">
         <StatusMessage status={status} expiresAt={data?.expiresAt} />
 
         {submitError ? (
-          <div className="alert alert-danger" role="alert">
+          <div className="alert alert-danger mb-3" role="alert">
             {submitError}
           </div>
         ) : null}
 
         {items.length === 0 ? (
-          <div className="review-clean-header-card">
-            <p className="review-clean-sub" style={{ margin: 0 }}>
-              There are no keywords attached to this review.
-            </p>
+          <div className="review-client-panel">
+            <div className="review-client-panel__header">
+              <p className="review-client-sub" style={{ margin: 0 }}>
+                There are no keywords attached to this review.
+              </p>
+            </div>
           </div>
         ) : (
-          <div className="review-clean-list">
-            {items.map((item) => {
-              const choice = choices[item.id]
-              return (
-                <article key={item.id} className="review-clean-item">
-                  <div>
-                    <div className="review-clean-item-kw">
-                      {formatNegLabel(item.keyword, item.matchType)}
-                    </div>
-                    <div className="review-clean-item-meta">
-                      {String(item.matchType || 'PHRASE').toLowerCase()} match · {destLabel(item)}
-                    </div>
+          <div className="review-client-panel">
+            <div className="review-client-panel__header">
+              <h2 className="review-client-title">Review your negative keywords</h2>
+              <p className="review-client-sub">
+                Your agency flagged these search terms as potential negatives for your Google Ads. For each
+                one, let us know if it&apos;s relevant to your business or not. By providing this insight,
+                we&apos;ll be able to improve your Google Ads account.
+              </p>
+              {isPending && data?.expiresAt ? (
+                <p className="review-client-sub review-client-sub--muted">
+                  This link expires on {new Date(data.expiresAt).toLocaleString()} and can only be submitted
+                  once.
+                </p>
+              ) : null}
+            </div>
+
+            {isPending && items.length > 0 ? (
+              <>
+                <hr className="review-client-panel__divider" />
+                <div className="review-client-progress">
+                  <span className="review-client-progress-label">
+                    {reviewedCount} of {items.length} reviewed
+                  </span>
+                  <div className="review-client-progress-track">
+                    <div
+                      className={`review-client-progress-fill${allReviewed ? ' is-complete' : ''}`}
+                      style={{ width: `${progressPct}%` }}
+                    />
                   </div>
-                  <div className="review-clean-item-actions">
-                    <button
-                      type="button"
-                      className={`btn btn-sm review-clean-btn-block${
-                        choice === 'block' ? ' is-active' : ''
-                      }`}
-                      disabled={isLocked}
-                      onClick={() =>
-                        setChoices((prev) => ({ ...prev, [item.id]: 'block' }))
-                      }
-                    >
-                      Block it
-                    </button>
-                    <button
-                      type="button"
-                      className={`btn btn-sm review-clean-btn-keep${
-                        choice === 'keep' ? ' is-active' : ''
-                      }`}
-                      disabled={isLocked}
-                      onClick={() =>
-                        setChoices((prev) => ({ ...prev, [item.id]: 'keep' }))
-                      }
-                    >
-                      Keep it
-                    </button>
-                  </div>
-                </article>
-              )
-            })}
+                </div>
+                <div className="review-client-colhead" aria-hidden>
+                  <span className="review-client-colhead-spacer" />
+                  <span className="review-client-colhead-flagged">Flagged search term</span>
+                  <span className="review-client-colhead-decision">Your decision</span>
+                </div>
+              </>
+            ) : null}
+
+            <div className="review-client-rows">
+              {items.map((item) => {
+                const choice = choices[item.id]
+                return (
+                  <article key={item.id} className="review-client-row">
+                    <input
+                      type="checkbox"
+                      className="review-client-row-check"
+                      checked={!!choice}
+                      onChange={() => {}}
+                      tabIndex={-1}
+                      aria-label={choice ? 'Reviewed' : 'Not yet reviewed'}
+                    />
+                    <div className="review-client-row-term">{formatNegLabel(item.keyword, item.matchType)}</div>
+                    <div className="review-client-row-actions">
+                      <button
+                        type="button"
+                        className={`review-client-btn${choice === 'block' ? ' is-active' : ''}`}
+                        disabled={isLocked}
+                        onClick={() => setChoices((prev) => ({ ...prev, [item.id]: 'block' }))}
+                      >
+                        Not relevant to my business
+                      </button>
+                      <button
+                        type="button"
+                        className={`review-client-btn${choice === 'keep' ? ' is-active' : ''}`}
+                        disabled={isLocked}
+                        onClick={() => setChoices((prev) => ({ ...prev, [item.id]: 'keep' }))}
+                      >
+                        This could be a customer
+                      </button>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+
+            {isPending && items.length > 0 ? (
+              <div className="review-client-footer">
+                <button
+                  type="button"
+                  className="review-client-submit"
+                  disabled={!allReviewed || submitting || isLocked}
+                  onClick={submitDecisions}
+                >
+                  {submitting ? 'Submitting…' : 'Submit my review'}
+                </button>
+                <span className="review-client-submit-hint">
+                  {!allReviewed
+                    ? 'Review all keywords to submit.'
+                    : 'Your strategist will confirm before anything is sent to Google Ads.'}
+                </span>
+              </div>
+            ) : null}
           </div>
         )}
 
-        {isPending && items.length > 0 ? (
-          <div className="review-clean-submit-row">
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={!allReviewed || submitting || isLocked}
-              onClick={submitDecisions}
-            >
-              {submitting ? 'Submitting…' : 'Submit review'}
-            </button>
-            <span className="review-clean-submit-hint">
-              {!allReviewed
-                ? 'Review every keyword to enable submit.'
-                : 'Your strategist will confirm before anything is sent to Google Ads.'}
-            </span>
-          </div>
-        ) : null}
-
         {submitResult ? (
-          <div className="review-clean-header-card" style={{ marginTop: 16 }}>
-            <h3 style={{ marginTop: 0, fontSize: '1.1rem', color: '#111827' }}>Review submitted</h3>
-            <p className="review-clean-sub" style={{ margin: 0 }}>
-              Thanks — your strategist has been notified. They will finalize the changes in Google Ads.
-              Block: <strong>{submitResult.blockCount}</strong> · Keep:{' '}
-              <strong>{submitResult.keepCount}</strong>
-            </p>
+          <div className="review-client-panel mt-3">
+            <div className="review-client-panel__header">
+              <h3 className="review-client-title" style={{ fontSize: '1.15rem' }}>
+                Review submitted
+              </h3>
+              <p className="review-client-sub" style={{ margin: 0 }}>
+                Thanks — your strategist has been notified. They will finalize the changes in Google Ads.
+                Not relevant: <strong>{submitResult.blockCount}</strong> · Could be a customer:{' '}
+                <strong>{submitResult.keepCount}</strong>
+              </p>
+            </div>
           </div>
         ) : null}
       </div>

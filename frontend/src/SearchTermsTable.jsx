@@ -18,6 +18,17 @@ const ORIGIN_POPOVER_WIDTH = 300
 const NEG_WHERE_WIDTH = 320
 const ORIGIN_POPOVER_GAP = 8
 const ORIGIN_VIEW_MARGIN = 8
+const ROWS_PER_PAGE_OPTIONS = [5, 10, 25, 'all']
+const ROWS_PER_PAGE_STORAGE_KEY = 'searchTermsRowsPerPage'
+
+function readStoredRowsPerPage() {
+  if (typeof window === 'undefined') return 5
+  const raw = window.localStorage.getItem(ROWS_PER_PAGE_STORAGE_KEY)
+  if (raw === 'all') return 'all'
+  const n = parseInt(raw, 10)
+  if (n === 5 || n === 10 || n === 25) return n
+  return 5
+}
 
 function clamp(n, min, max) {
   return Math.max(min, Math.min(n, max))
@@ -246,6 +257,8 @@ export default function SearchTermsTable({
   const [sortDir, setSortDir] = useState('desc')
   const [searchFilter, setSearchFilter] = useState('')
   const [campaignFilter, setCampaignFilter] = useState('')
+  const [rowsPerPage, setRowsPerPage] = useState(readStoredRowsPerPage)
+  const [tablePage, setTablePage] = useState(1)
   const [hoveredRow, setHoveredRow] = useState(null)
   const [videoOpen, setVideoOpen] = useState(false)
   const [toolbar, setToolbar] = useState({ visible: false, x: 0, y: 0 })
@@ -281,6 +294,7 @@ export default function SearchTermsTable({
   const [createListLoading, setCreateListLoading] = useState(false)
   const [createListError, setCreateListError] = useState('')
   const [savingDefaultList, setSavingDefaultList] = useState(false)
+  const [bulkPanelOpen, setBulkPanelOpen] = useState(true)
 
   useEffect(() => {
     const track = (e) => {
@@ -383,6 +397,19 @@ export default function SearchTermsTable({
     return matches.find(i => !i.alreadyInGoogle) || matches[0]
   }
 
+  function rowShouldShowInTable(term) {
+    const negatives = rowNegatives.get(term.searchTerm)
+    if (!negatives || negatives.size === 0) return true
+    if ([...negatives].some(p => p.startsWith('google:'))) return true
+    for (const p of negatives) {
+      if (!p.startsWith('ai:') && !p.startsWith('manual:')) continue
+      const { keyword } = parseNegativePhrase(p)
+      const item = getPendingItem(keyword)
+      if (item && !item.alreadyInGoogle) return true
+    }
+    return false
+  }
+
   function rowCategory(term) {
     const negs = rowNegatives.get(term.searchTerm)
     if (!negs) return 2
@@ -423,11 +450,40 @@ export default function SearchTermsTable({
     return frozenRowIndices
       .map(i => {
         const term = searchTerms[i]
-        if (!term || !passesTableFilters(term)) return null
+        if (!term || !passesTableFilters(term) || !rowShouldShowInTable(term)) return null
         return { term, rowIndex: i }
       })
       .filter(Boolean)
-  }, [searchTerms, frozenRowIndices, searchFilter, campaignFilter])
+  }, [searchTerms, frozenRowIndices, searchFilter, campaignFilter, rowNegatives, pendingNegatives])
+
+  const pageSize = rowsPerPage === 'all' ? sortedRows.length : rowsPerPage
+  const pageCount = pageSize > 0 ? Math.max(1, Math.ceil(sortedRows.length / pageSize)) : 1
+  const safeTablePage = clamp(tablePage, 1, pageCount)
+  const visibleRowStart = sortedRows.length === 0 ? 0 : (safeTablePage - 1) * pageSize + 1
+  const visibleRowEnd = rowsPerPage === 'all'
+    ? sortedRows.length
+    : Math.min(safeTablePage * pageSize, sortedRows.length)
+  const visibleRows = rowsPerPage === 'all'
+    ? sortedRows
+    : sortedRows.slice((safeTablePage - 1) * pageSize, safeTablePage * pageSize)
+
+  useEffect(() => {
+    setTablePage(1)
+  }, [searchFilter, campaignFilter, rowsPerPage, searchTerms])
+
+  useEffect(() => {
+    if (safeTablePage !== tablePage) setTablePage(safeTablePage)
+  }, [safeTablePage, tablePage])
+
+  function handleRowsPerPageChange(next) {
+    setRowsPerPage(next)
+    setTablePage(1)
+    try {
+      window.localStorage.setItem(ROWS_PER_PAGE_STORAGE_KEY, String(next))
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }
 
   const openOriginRowData = useMemo(() => {
     if (!originInfoOpenRowKey) return null
@@ -878,10 +934,37 @@ export default function SearchTermsTable({
   }
 
   // Download / copy history
-  function downloadHistoryEntry(entry) {
+  function csvEscape(value) {
+    return `"${String(value ?? '').replace(/"/g, '""')}"`
+  }
+
+  function formatHistoryQualityBefore(entry) {
+    const value = entry?.quality_percentage_before ?? entry?.quality_percentage
+    if (value == null) return ''
+    return `${Number(value).toFixed(0)}%`
+  }
+
+  function formatHistoryQualityAfter(entry) {
+    if (entry?.quality_percentage_after == null) return ''
+    return `${Number(entry.quality_percentage_after).toFixed(0)}%`
+  }
+
+  function historyKeywordRows(entry) {
     const keywords = Array.isArray(entry.keywords) ? entry.keywords : []
-    const rows = keywords.map(k => typeof k === 'string' ? `"${k}","EXACT"` : `"${k.keyword}","${k.matchType}"`)
-    const csv = `"Keyword","Match Type"\n${rows.join('\n')}`
+    const qualityBefore = formatHistoryQualityBefore(entry)
+    const qualityAfter = formatHistoryQualityAfter(entry)
+    return keywords.map(k => {
+      if (typeof k === 'string') {
+        return [k, 'EXACT', '', qualityBefore, qualityAfter].map(csvEscape).join(',')
+      }
+      const matchType = k.matchType || 'PHRASE'
+      return [k.keyword, matchType, k.appliedTo || '', qualityBefore, qualityAfter].map(csvEscape).join(',')
+    })
+  }
+
+  function downloadHistoryEntry(entry) {
+    const rows = historyKeywordRows(entry)
+    const csv = `"Keyword","Match Type","Applied to","Quality % Before","Quality % After"\n${rows.join('\n')}`
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -893,7 +976,16 @@ export default function SearchTermsTable({
 
   function copyHistoryEntry(entry) {
     const keywords = Array.isArray(entry.keywords) ? entry.keywords : []
-    const text = keywords.map(k => typeof k === 'string' ? k : k.keyword).join('\n')
+    const qualityBefore = formatHistoryQualityBefore(entry)
+    const qualityAfter = formatHistoryQualityAfter(entry)
+    const text = keywords.map(k => {
+      if (typeof k === 'string') {
+        return [k, 'EXACT', '', qualityBefore, qualityAfter].filter(Boolean).join('\t')
+      }
+      return [k.keyword, k.matchType || 'PHRASE', k.appliedTo || '', qualityBefore, qualityAfter]
+        .filter(Boolean)
+        .join('\t')
+    }).join('\n')
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
     } else {
@@ -1209,77 +1301,97 @@ export default function SearchTermsTable({
   if (isReviewMode) {
     const reviewedCount = reviewItems.filter(it => !!reviewChoices[it._key]).length
     const allReviewed = reviewItems.length > 0 && reviewedCount === reviewItems.length
+    const progressPct = reviewItems.length ? Math.round((reviewedCount / reviewItems.length) * 100) : 0
     return (
       <div className="review-clean-wrap">
-        <section className="review-clean-header-card">
-          <h2 className="review-clean-title">Review your negative keywords</h2>
-          <p className="review-clean-sub">
-            Your agency flagged these search terms as potential negatives for your Google Ads account.
-            Choose whether to block each one or keep it.
-          </p>
-          <div className="review-clean-progress-row">
-            <div className="review-clean-progress-track">
-              <div
-                className="review-clean-progress-fill"
-                style={{ width: `${reviewItems.length ? Math.round((reviewedCount / reviewItems.length) * 100) : 0}%` }}
-              />
-            </div>
-            <span className="review-clean-progress-label">{reviewedCount} of {reviewItems.length} reviewed</span>
+        <div className="review-client-panel">
+          <div className="review-client-panel__header">
+            <h2 className="review-client-title">Review your negative keywords</h2>
+            <p className="review-client-sub">
+              Your agency flagged these search terms as potential negatives for your Google Ads. For each
+              one, let us know if it&apos;s relevant to your business or not. By providing this insight,
+              we&apos;ll be able to improve your Google Ads account.
+            </p>
           </div>
-        </section>
 
-        {submitError ? (
-          <div className="alert alert-danger" role="alert">{submitError}</div>
-        ) : null}
+          {submitError ? (
+            <div className="alert alert-danger mx-3 mb-0" role="alert">{submitError}</div>
+          ) : null}
 
-        <div className="review-clean-list">
-          {reviewItems.map(item => {
-            const source = Array.isArray(item.sourceSearchTerms) && item.sourceSearchTerms[0]
-            const triggerText = source?.searchTerm || source?.query || item.keyword
-            const clicks = Number(source?.clicks || 0)
-            const conversions = Number(source?.conversions || 0)
-            const choice = reviewChoices[item._key]
-            return (
-              <article key={item._key} className="review-clean-item">
-                <div className="review-clean-item-main">
-                  <div className="review-clean-item-kw">{formatNegLabel(item.keyword, item.matchType || 'PHRASE')}</div>
-                  <div className="review-clean-item-meta">
-                    Triggered by: {triggerText} · {clicks} clicks, {conversions} conversions
+          {reviewItems.length > 0 ? (
+            <>
+              <hr className="review-client-panel__divider" />
+              <div className="review-client-progress">
+                <span className="review-client-progress-label">
+                  {reviewedCount} of {reviewItems.length} reviewed
+                </span>
+                <div className="review-client-progress-track">
+                  <div
+                    className={`review-client-progress-fill${allReviewed ? ' is-complete' : ''}`}
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
+              </div>
+              <div className="review-client-colhead" aria-hidden>
+                <span className="review-client-colhead-spacer" />
+                <span className="review-client-colhead-flagged">Flagged search term</span>
+                <span className="review-client-colhead-decision">Your decision</span>
+              </div>
+            </>
+          ) : null}
+
+          <div className="review-client-rows">
+            {reviewItems.map(item => {
+              const choice = reviewChoices[item._key]
+              return (
+                <article key={item._key} className="review-client-row">
+                  <input
+                    type="checkbox"
+                    className="review-client-row-check"
+                    checked={!!choice}
+                    onChange={() => {}}
+                    tabIndex={-1}
+                    aria-label={choice ? 'Reviewed' : 'Not yet reviewed'}
+                  />
+                  <div className="review-client-row-term">
+                    {formatNegLabel(item.keyword, item.matchType || 'PHRASE')}
                   </div>
-                </div>
-                <div className="review-clean-item-actions">
-                  <button
-                    type="button"
-                    className={`btn btn-sm review-clean-btn-block${choice === 'block' ? ' is-active' : ''}`}
-                    onClick={() => setReviewChoices(prev => ({ ...prev, [item._key]: 'block' }))}
-                  >
-                    Block it
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn btn-sm review-clean-btn-keep${choice === 'keep' ? ' is-active' : ''}`}
-                    onClick={() => setReviewChoices(prev => ({ ...prev, [item._key]: 'keep' }))}
-                  >
-                    Keep it
-                  </button>
-                </div>
-              </article>
-            )
-          })}
-        </div>
+                  <div className="review-client-row-actions">
+                    <button
+                      type="button"
+                      className={`review-client-btn${choice === 'block' ? ' is-active' : ''}`}
+                      onClick={() => setReviewChoices(prev => ({ ...prev, [item._key]: 'block' }))}
+                    >
+                      Not relevant to my business
+                    </button>
+                    <button
+                      type="button"
+                      className={`review-client-btn${choice === 'keep' ? ' is-active' : ''}`}
+                      onClick={() => setReviewChoices(prev => ({ ...prev, [item._key]: 'keep' }))}
+                    >
+                      This could be a customer
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
 
-        <div className="review-clean-submit-row">
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={!allReviewed || reviewSubmitting}
-            onClick={handleSubmitReviewDecisions}
-          >
-            {reviewSubmitting ? 'Submitting…' : 'Submit review'}
-          </button>
-          <span className="review-clean-submit-hint">
-            {!allReviewed ? 'Review all keywords to enable submit.' : 'Ready to submit.'}
-          </span>
+          {reviewItems.length > 0 ? (
+            <div className="review-client-footer">
+              <button
+                type="button"
+                className="review-client-submit"
+                disabled={!allReviewed || reviewSubmitting}
+                onClick={handleSubmitReviewDecisions}
+              >
+                {reviewSubmitting ? 'Submitting…' : 'Submit my review'}
+              </button>
+              <span className="review-client-submit-hint">
+                {!allReviewed ? 'Review all keywords to submit.' : 'Ready to submit.'}
+              </span>
+            </div>
+          ) : null}
         </div>
       </div>
     )
@@ -1758,20 +1870,39 @@ export default function SearchTermsTable({
         )}
 
         {/* Bulk match type / destination — above filters */}
-        <div className="search-terms-bulk-panel" aria-label="Bulk actions for checked rows">
-          <div className="search-terms-bulk-panel-title">Bulk Actions (Apply to all checked rows)</div>
-          <div className="search-terms-bulk-rows">
-            <div className="search-terms-bulk-row">
-              <span className="search-terms-bulk-label">Match type</span>
-              <select
-                className="form-select form-select-sm matchtype-select search-terms-bulk-select"
-                value={bulkMatchType}
-                onChange={e => setBulkMatchType(e.target.value)}
-              >
-                {MATCH_TYPE_OPTIONS.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
+        <div className={'search-terms-bulk-panel' + (bulkPanelOpen ? '' : ' is-collapsed')} aria-label="Bulk actions for checked rows">
+          <button
+            type="button"
+            className="search-terms-bulk-panel-header"
+            aria-expanded={bulkPanelOpen}
+            aria-controls="search-terms-bulk-panel-body"
+            onClick={() => setBulkPanelOpen(open => !open)}
+          >
+            <div className="search-terms-bulk-panel-heading">
+              <span className="search-terms-bulk-panel-icon" aria-hidden="true">
+                <i className="fas fa-layer-group" />
+              </span>
+              <span className="search-terms-bulk-panel-title">Bulk actions</span>
+            </div>
+            <span className="search-terms-bulk-panel-header-end">
+              <span className="search-terms-bulk-panel-hint">Applies to all checked rows</span>
+              <i className={'fas fa-chevron-' + (bulkPanelOpen ? 'up' : 'down') + ' search-terms-bulk-panel-chevron'} aria-hidden />
+            </span>
+          </button>
+          {bulkPanelOpen ? (
+          <div id="search-terms-bulk-panel-body" className="search-terms-bulk-panel-body">
+            <div className="search-terms-bulk-rows">
+              <div className="search-terms-bulk-row search-terms-bulk-row-match">
+                <span className="search-terms-bulk-label">Match type</span>
+                <select
+                  className="form-select form-select-sm matchtype-select search-terms-bulk-select"
+                  value={bulkMatchType}
+                  onChange={e => setBulkMatchType(e.target.value)}
+                >
+                  {MATCH_TYPE_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
               <button
                 type="button"
                 className="btn btn-sm btn-primary"
@@ -1825,35 +1956,22 @@ export default function SearchTermsTable({
                     {createListError && <span className="create-list-error">{createListError}</span>}
                   </div>
                 ) : (
-                  <div className="search-terms-bulk-list-default-wrap">
-                    <div className="search-terms-bulk-list-pair">
-                      <button
-                        type="button"
-                        className="btn-create-list btn-create-list-compact"
-                        onClick={() => { setCreateListCtx('bulk'); setNewListName(''); setCreateListError('') }}
-                      >
-                        + New list
-                      </button>
-                      <select
-                        className="form-select form-select-sm matchtype-select search-terms-bulk-select"
-                        value={bulkSharedSetId || ''}
-                        onChange={e => setBulkSharedSetId(e.target.value || null)}
-                      >
-                        <option value="">Select list…</option>
-                        {(sharedSets || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                      </select>
-                    </div>
-                    {bulkSharedSetId && onSaveDefaultSharedSet ? (
-                      <label className="bulk-default-list-toggle">
-                        <input
-                          type="checkbox"
-                          checked={String(defaultSharedSetId || '') === String(bulkSharedSetId)}
-                          disabled={savingDefaultList}
-                          onChange={e => handleToggleDefaultKeywordList(e.target.checked)}
-                        />
-                        <span>Save this list as default for this account</span>
-                      </label>
-                    ) : null}
+                  <div className="search-terms-bulk-list-pair">
+                    <button
+                      type="button"
+                      className="btn-create-list btn-create-list-compact"
+                      onClick={() => { setCreateListCtx('bulk'); setNewListName(''); setCreateListError('') }}
+                    >
+                      + New list
+                    </button>
+                    <select
+                      className="form-select form-select-sm matchtype-select search-terms-bulk-select"
+                      value={bulkSharedSetId || ''}
+                      onChange={e => setBulkSharedSetId(e.target.value || null)}
+                    >
+                      <option value="">Select list…</option>
+                      {(sharedSets || []).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
                   </div>
                 )
               )}
@@ -1867,28 +1985,87 @@ export default function SearchTermsTable({
                 Apply
               </button>
             </div>
+            </div>
+            {bulkDestination === 'NEGATIVE_LIST' && bulkSharedSetId && onSaveDefaultSharedSet ? (
+              <label className="bulk-default-list-toggle">
+                <input
+                  type="checkbox"
+                  checked={String(defaultSharedSetId || '') === String(bulkSharedSetId)}
+                  disabled={savingDefaultList}
+                  onChange={e => handleToggleDefaultKeywordList(e.target.checked)}
+                />
+                <span>
+                  Save <strong>{(sharedSets || []).find(s => String(s.id) === String(bulkSharedSetId))?.name || 'this list'}</strong> as default destination for this account
+                </span>
+              </label>
+            ) : null}
           </div>
+          ) : null}
         </div>
 
-        {/* Filters */}
+        {/* Filters + row controls */}
         <div className="search-terms-filters">
           <input
             type="text"
-            className="form-control form-control-sm"
+            className="form-control form-control-sm search-terms-filter-input"
             placeholder="Filter search terms…"
             value={searchFilter}
             onChange={e => setSearchFilter(e.target.value)}
-            style={{ maxWidth: 260 }}
           />
           <select
-            className="form-select form-select-sm dropdown-caret-select"
+            className="form-select form-select-sm dropdown-caret-select search-terms-filter-select"
             value={campaignFilter}
             onChange={e => setCampaignFilter(e.target.value)}
-            style={{ maxWidth: 220 }}
           >
             <option value="">All campaigns</option>
             {campaignList.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
+          <div className="search-terms-rows-options">
+            <span className="search-terms-rows-label" id="search-terms-rows-label">Show rows</span>
+            <div className="search-terms-rows-buttons" role="group" aria-labelledby="search-terms-rows-label">
+              {ROWS_PER_PAGE_OPTIONS.map(option => (
+                <button
+                  key={option}
+                  type="button"
+                  className={`search-terms-rows-btn${rowsPerPage === option ? ' is-active' : ''}`}
+                  aria-pressed={rowsPerPage === option}
+                  onClick={() => handleRowsPerPageChange(option)}
+                >
+                  {option === 'all' ? 'All' : option}
+                </button>
+              ))}
+            </div>
+          </div>
+          <span className="search-terms-rows-summary">
+            {sortedRows.length === 0
+              ? 'No matching rows'
+              : rowsPerPage === 'all'
+                ? `Showing all ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`
+                : `Showing ${visibleRowStart}–${visibleRowEnd} of ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`}
+          </span>
+          {rowsPerPage !== 'all' && pageCount > 1 ? (
+            <div className="search-terms-pagination">
+              <button
+                type="button"
+                className="search-terms-pagination-btn"
+                disabled={safeTablePage <= 1}
+                onClick={() => setTablePage(p => Math.max(1, p - 1))}
+              >
+                Previous
+              </button>
+              <span className="search-terms-pagination-status">
+                Page {safeTablePage} of {pageCount}
+              </span>
+              <button
+                type="button"
+                className="search-terms-pagination-btn"
+                disabled={safeTablePage >= pageCount}
+                onClick={() => setTablePage(p => Math.min(pageCount, p + 1))}
+              >
+                Next
+              </button>
+            </div>
+          ) : null}
         </div>
 
         {/* Table */}
@@ -1934,7 +2111,7 @@ export default function SearchTermsTable({
               </tr>
             </thead>
             <tbody>
-              {sortedRows.map(({ term, rowIndex }) => {
+              {visibleRows.map(({ term, rowIndex }) => {
                 const negatives = rowNegatives.get(term.searchTerm)
                 const isHovered = hoveredRow === term.searchTerm
                 const uniqueKey = `${term.searchTerm}__${term.campaignId || 'nc'}__${term.adGroupId || 'na'}__${rowIndex}`
@@ -2263,6 +2440,14 @@ export default function SearchTermsTable({
                         {entry.keyword_count} {entry.keyword_count === 1 ? 'keyword' : 'keywords'}
                         {entry.list_name ? ` · ${entry.list_name}` : ''}
                         {entry.match_types ? ` · ${entry.match_types}` : ''}
+                        {(entry.quality_percentage_before != null || entry.quality_percentage != null) && (
+                          <>
+                            {` · Quality before ${formatHistoryQualityBefore(entry)}`}
+                            {entry.quality_percentage_after != null
+                              ? ` → after ${formatHistoryQualityAfter(entry)}`
+                              : ''}
+                          </>
+                        )}
                       </div>
                       {(entry.submitted_by_email || entry.submitted_by_name) && (
                         <div className="submission-history-user">

@@ -127,18 +127,6 @@ function canonicalPendingStateClientId(clientId) {
   return digits.length >= 6 ? digits : String(clientId ?? '').trim()
 }
 
-const LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY = 'negativeKeywords:lastClientCustomerId'
-
-function findStoredClientMatch(clientsList, storedRaw) {
-  if (!storedRaw || !clientsList?.length) return null
-  const s = String(storedRaw).trim()
-  const byExact = clientsList.find(c => String(c.customerId) === s)
-  if (byExact) return byExact
-  const digits = s.replace(/\D/g, '')
-  if (digits.length < 6) return null
-  return clientsList.find(c => String(c.customerId).replace(/\D/g, '') === digits) || null
-}
-
 async function fetchPendingStateForClient(clientId) {
   const raw = String(clientId ?? '').trim()
   const canonical = canonicalPendingStateClientId(clientId)
@@ -250,7 +238,7 @@ function mapRestoredPendingItem(item, defaultSharedSetId) {
 /** Send only persisted columns with stable types so saves match DB and restore cleanly. */
 function serializePendingItemsForPersist(items) {
   const serialized = (items || [])
-    .filter(i => i && typeof i.keyword === 'string' && i.keyword.trim())
+    .filter(i => i && typeof i.keyword === 'string' && i.keyword.trim() && !i.alreadyInGoogle)
     .map(i => {
       const dest = PENDING_DESTINATIONS.has(i.destination) ? i.destination : 'NEGATIVE_LIST'
       const mt = (i.matchType || 'PHRASE').toString().toUpperCase()
@@ -293,24 +281,74 @@ function serializePendingItemsForPersist(items) {
   })
 }
 
+function normalizeGoogleNegativeKeyword(entry) {
+  if (typeof entry === 'string') return entry.trim().toLowerCase()
+  return String(entry?.keyword || '').trim().toLowerCase()
+}
+
+function isKeywordInGoogle(keyword, googleNegatives) {
+  const kw = String(keyword || '').trim().toLowerCase()
+  if (!kw || !Array.isArray(googleNegatives)) return false
+  return googleNegatives.some(entry => normalizeGoogleNegativeKeyword(entry) === kw)
+}
+
+function isKeywordMatchTypeInGoogle(keyword, matchType, googleNegatives) {
+  const mt = (matchType || 'EXACT').toString().toUpperCase()
+  const kw = String(keyword || '').trim().toLowerCase()
+  if (!kw) return false
+  return (googleNegatives || []).some(existing => {
+    if (typeof existing === 'string') {
+      return existing.trim().toLowerCase() === kw && mt === 'EXACT'
+    }
+    const emt = (existing.matchType || 'EXACT').toString().toUpperCase()
+    return normalizeGoogleNegativeKeyword(existing) === kw && emt === mt
+  })
+}
+
+function filterPendingNotInGoogle(items, googleNegatives) {
+  return (items || []).filter(item => {
+    if (!item?.keyword?.trim()) return false
+    return !isKeywordInGoogle(item.keyword, googleNegatives)
+  })
+}
+
+function formatSubmissionAppliedTo(item, sharedSets) {
+  const dest = item.destination || 'NEGATIVE_LIST'
+  if (dest === 'NEGATIVE_LIST') {
+    const listName = (sharedSets || []).find(s => String(s.id) === String(item.sharedSetId || ''))?.name
+    if (listName) return `Keyword list: ${listName}`
+    if (item.sharedSetId) return `Keyword list: ${item.sharedSetId}`
+    return 'Keyword list'
+  }
+  if (dest === 'CAMPAIGN') {
+    const label = item.campaignName || item.campaignId
+    return label ? `Campaign: ${label}` : 'Campaign'
+  }
+  if (dest === 'ADGROUP') {
+    const ag = item.adGroupName || item.adGroupId
+    const camp = item.campaignName ? ` (${item.campaignName})` : ''
+    return ag ? `Ad group: ${ag}${camp}` : 'Ad group'
+  }
+  return ''
+}
+
+function computeSubmissionQualityPercentage(aiStats, pendingNegatives) {
+  if (!aiStats || aiStats.totalSearchTerms === undefined) return null
+  const total = aiStats.totalSearchTerms
+  const recommended = (pendingNegatives || []).filter(i => i.source === 'ai' && !i.alreadyInGoogle).length
+  if (total <= 0) return 100
+  return Math.min(100, Math.max(0, Math.round(((total - recommended) / total) * 100)))
+}
+
 function buildAiPendingRow(kw, sourcesMap, googleNegatives, defaultSharedSetId) {
+  if (isKeywordInGoogle(kw, googleNegatives)) return null
   const matchType = 'PHRASE'
-  const googleEntry = (googleNegatives || []).find(
-    n =>
-      typeof n === 'object' &&
-      n.keyword?.toLowerCase() === kw.toLowerCase() &&
-      (n.matchType || 'EXACT').toString().toUpperCase() === matchType
-  )
-  const inGoogle = !!googleEntry
   return {
     keyword: kw,
     matchType,
     source: 'ai',
     sourceSearchTerms: sourcesMap[kw] || [],
-    selected: !inGoogle,
-    alreadyInGoogle: inGoogle,
-    googleResourceName: googleEntry?.resourceName || null,
-    googleSource: googleEntry?.source || null,
+    selected: true,
     destination: 'NEGATIVE_LIST',
     sharedSetId: defaultSharedSetId ?? null,
     campaignId: null,
@@ -420,6 +458,9 @@ function NegativeKeywordsPage({
   savedWorkRestoreNotice = null,
   onDismissSavedWorkRestoreNotice,
   searchTermsEmptyReason = '',
+  highVolumeModal = null,
+  onHighVolumeConfirm,
+  onHighVolumeCancel,
 }) {
   const location = useLocation()
   const clientName = currentClientId
@@ -732,6 +773,51 @@ function NegativeKeywordsPage({
         )}
       </div>
 
+      {/* High-volume search terms warning (before full Google pull) */}
+      {highVolumeModal && (
+        <div
+          className="website-url-modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="high-volume-modal-title"
+          onClick={e => e.target === e.currentTarget && onHighVolumeCancel?.()}
+        >
+          <div className="website-url-modal-box" onClick={e => e.stopPropagation()}>
+            <div className="website-url-modal-header">
+              <h3 id="high-volume-modal-title" className="website-url-modal-title">
+                Large search terms report
+              </h3>
+            </div>
+            <div className="website-url-modal-body">
+              <p className="mb-2">
+                <strong>Date range:</strong>{' '}
+                <span className="text-muted">
+                  {highVolumeModal.startDate} — {highVolumeModal.endDate}
+                </span>
+              </p>
+              <p className="mb-2">
+                A quick preview found <strong>{highVolumeModal.rowCount}</strong> search-term row
+                {highVolumeModal.rowCount === 1 ? '' : 's'} with clicks in the sample (there may be
+                more). This range likely reaches <strong>{highVolumeModal.threshold}+</strong>{' '}
+                rows.
+              </p>
+              <p className="mb-0">
+                If you continue, the app will load up to <strong>{highVolumeModal.mergeCap}</strong>{' '}
+                merged rows for this account and range, which can take a while.
+              </p>
+            </div>
+            <div className="website-url-modal-footer">
+              <button type="button" className="btn btn-outline-secondary" onClick={() => onHighVolumeCancel?.()}>
+                Go back
+              </button>
+              <button type="button" className="btn btn-primary" onClick={() => onHighVolumeConfirm?.()}>
+                Load anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Website URL Popup */}
       {showUrlPopup && (
         <div className="website-url-modal-backdrop">
@@ -889,6 +975,32 @@ function AuthenticatedApp({ user, onLogout }) {
   const [pendingClientId, setPendingClientId] = useState('')
   const [tempWebsiteUrl, setTempWebsiteUrl] = useState('')
   const [urlPopupLoading, setUrlPopupLoading] = useState(false)
+  /** When set, NegativeKeywordsPage shows the high-volume modal; resolver completes loadSearchTerms’ Promise. */
+  const [highVolumeModal, setHighVolumeModal] = useState(null)
+  const highVolumeResolveRef = useRef(null)
+
+  const confirmHighVolumeLoad = useCallback(() => {
+    setHighVolumeModal(null)
+    const r = highVolumeResolveRef.current
+    highVolumeResolveRef.current = null
+    if (r) r(true)
+  }, [])
+
+  const cancelHighVolumeLoad = useCallback(() => {
+    setHighVolumeModal(null)
+    const r = highVolumeResolveRef.current
+    highVolumeResolveRef.current = null
+    if (r) r(false)
+  }, [])
+
+  useEffect(() => {
+    if (!highVolumeModal) return
+    const onKey = e => {
+      if (e.key === 'Escape') cancelHighVolumeLoad()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [highVolumeModal, cancelHighVolumeLoad])
 
   // Campaigns derived from the already-client-scoped search terms data (guaranteed client-specific)
   const campaigns = useMemo(() => {
@@ -956,6 +1068,7 @@ function AuthenticatedApp({ user, onLogout }) {
 
       // Check pending negatives
       pendingNegatives.forEach(item => {
+        if (item.alreadyInGoogle) return
         const kwLower = item.keyword.toLowerCase()
         const escaped = escapeRegex(kwLower)
         const regex = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i')
@@ -999,7 +1112,8 @@ function AuthenticatedApp({ user, onLogout }) {
     setSavedWorkRestoreNotice(null)
   }
 
-  // Returns the loaded terms array so callers can use it for auto-scanning
+  // Returns the loaded terms array so callers can use it for auto-scanning.
+  // Returns null if the user cancels the high-volume confirmation.
   // skipPendingRestore: if true, skip the plain-keyword pendingNegatives init (rich state already restored)
   async function loadSearchTerms(
     clientId,
@@ -1009,8 +1123,36 @@ function AuthenticatedApp({ user, onLogout }) {
     dbNegs,
     skipPendingRestore = false,
     defaultSharedSetIdOverride = null,
+    { skipHighVolumePreview = false } = {},
   ) {
     if (!clientId) { setError('Please select a client first'); return [] }
+    if (!skipHighVolumePreview) {
+      try {
+        const q = new URLSearchParams({
+          clientId: String(clientId),
+          startDate: String(start),
+          endDate: String(end),
+        })
+        const pr = await authenticatedFetch(`/api/search-terms-preview?${q}`)
+        const preview = await pr.json().catch(() => ({}))
+        if (pr.ok && preview.highVolume) {
+          const thr = preview.threshold ?? 500
+          const confirmed = await new Promise(resolve => {
+            highVolumeResolveRef.current = resolve
+            setHighVolumeModal({
+              threshold: thr,
+              rowCount: preview.rowCount,
+              mergeCap: preview.mergeCap ?? 5000,
+              startDate: String(start),
+              endDate: String(end),
+            })
+          })
+          if (!confirmed) return null
+        }
+      } catch (e) {
+        console.warn('search-terms preview failed:', e.message)
+      }
+    }
     setLoading(true)
     setError('')
     setSearchTermsEmptyReason('')
@@ -1060,11 +1202,6 @@ function AuthenticatedApp({ user, onLogout }) {
     setCurrentClientId(clientId)
     resetState()
     if (!clientId) {
-      try {
-        localStorage.removeItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY)
-      } catch (_) {
-        /* ignore */
-      }
       return
     }
 
@@ -1097,32 +1234,27 @@ function AuthenticatedApp({ user, onLogout }) {
 
       // Restore rich pending state if it was saved, otherwise fall back to plain-keyword DB list
       if (hasRestoredPendingFromDb) {
-        // Keep every saved row. If Google already has this keyword+matchType, mark alreadyInGoogle
-        // instead of dropping — otherwise chips/row state vanish even though DB still lists the keyword.
-        restoredFromDb = savedPendingState.map(item => {
-          const enriched = mapRestoredPendingItem(item, defaultListId)
-          const inGoogle = isKeywordMatchTypeInGoogle(
-            enriched.keyword,
-            enriched.matchType || 'PHRASE',
-            googleNegatives
-          )
-          return {
-            ...enriched,
-            alreadyInGoogle: inGoogle,
-            selected: inGoogle ? false : item.selected !== false,
-          }
-        })
-        // Review link loads the same saved pending list as the main app. Unchecked rows stay visible
-        // with their checkbox off; the approval email still only attaches checked keywords.
+        restoredFromDb = filterPendingNotInGoogle(
+          savedPendingState.map(item => mapRestoredPendingItem(item, defaultListId)),
+          googleNegatives,
+        ).map(item => ({
+            ...item,
+            selected: item.selected !== false,
+          }))
         setPendingNegatives(restoredFromDb)
+        if (restoredFromDb.length !== savedPendingState.length) {
+          const items = serializePendingItemsForPersist(restoredFromDb)
+          void authenticatedFetch('/api/pending-state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              clientId: canonicalPendingStateClientId(clientId),
+              items,
+            }),
+          }).catch(console.error)
+        }
       } else {
         setSavedWorkRestoreNotice(null)
-      }
-
-      try {
-        localStorage.setItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY, String(clientId))
-      } catch (_) {
-        /* ignore */
       }
 
       // Determine website URL — await detection so we have it before scanning
@@ -1156,6 +1288,10 @@ function AuthenticatedApp({ user, onLogout }) {
         hasRestoredPendingFromDb,
         defaultListId,
       )
+      if (terms === null) {
+        setAiLoading(false)
+        return
+      }
 
       if (hasRestoredPendingFromDb && restoredFromDb) {
         setSavedWorkRestoreNotice({
@@ -1209,23 +1345,6 @@ function AuthenticatedApp({ user, onLogout }) {
   }
 
   handleClientChangeRef.current = handleClientChange
-
-  useEffect(() => {
-    if (location.pathname !== '/negative-keywords') return
-    if (currentClientId) return
-    if (!clients.length) return
-    let stored = ''
-    try {
-      stored = localStorage.getItem(LAST_NEGATIVE_KW_CLIENT_STORAGE_KEY) || ''
-    } catch (_) {
-      return
-    }
-    const match = findStoredClientMatch(clients, stored)
-    if (!match) return
-    void handleClientChangeRef.current(match.customerId)
-    // intentional: omit handleClientChange from deps — ref is stable
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot reconnect when arriving with no selection
-  }, [location.pathname, clients, currentClientId])
 
   // /review?client=... — resolve Google Ads client by descriptive name or numeric ID; load same data as main tool (including DB pending state)
   useEffect(() => {
@@ -1307,20 +1426,6 @@ function AuthenticatedApp({ user, onLogout }) {
     return 'EXACT'; // default
   }
 
-  // Helper function to check if a keyword + match type combination already exists in Google
-  function isKeywordMatchTypeInGoogle(keyword, matchType, googleNegatives) {
-    const mt = (matchType || 'EXACT').toString().toUpperCase()
-    return googleNegatives.some(existing => {
-      // Handle both old format (strings) and new format (objects with keyword/matchType)
-      if (typeof existing === 'string') {
-        // Legacy string rows only mean an exact negative of that text
-        return existing.toLowerCase() === keyword.toLowerCase() && mt === 'EXACT'
-      }
-      const emt = (existing.matchType || 'EXACT').toString().toUpperCase()
-      return existing.keyword.toLowerCase() === keyword.toLowerCase() && emt === mt
-    })
-  }
-
   function handleStartDateChange(newStartDate) {
     setStartDate(newStartDate)
   }
@@ -1349,6 +1454,10 @@ function AuthenticatedApp({ user, onLogout }) {
         false,
         selectedSharedSetId || null,
       )
+      if (terms === null) {
+        if (shouldRunAi) setAiLoading(false)
+        return
+      }
 
       if (!(shouldRunAi && websiteUrl && terms && terms.length > 0)) return
 
@@ -1579,20 +1688,20 @@ function AuthenticatedApp({ user, onLogout }) {
     const aiKeywords = result.negativeKeywords || []
     const sourcesMap = result.negativeKeywordSources || {}
 
-    // Only count truly new keywords (not existing in any match type)
-    const trueNewKeywords = aiKeywords.filter(kw => {
-      return !existingNegatives.some(existing => {
-        const existingKeyword = typeof existing === 'string' ? existing : existing.keyword
-        return existingKeyword.toLowerCase() === kw.toLowerCase()
-      })
-    })
+    const trueNewKeywords = aiKeywords.filter(kw => !isKeywordInGoogle(kw, existingNegatives))
 
     setPendingNegatives(prev => {
       const existingAiKw = new Set(prev.filter(i => i.source === 'ai').map(i => i.keyword.toLowerCase()))
       const newItems = aiKeywords
         .filter(kw => !existingAiKw.has(kw.toLowerCase()))
+        .filter(kw => !isKeywordInGoogle(kw, existingNegatives))
         .map(kw => buildAiPendingRow(kw, sourcesMap, existingNegatives, defaultListId))
-      return [...prev.map(i => normalizeAiPendingItem(i, defaultListId)), ...newItems]
+        .filter(Boolean)
+      const normalizedPrev = filterPendingNotInGoogle(
+        prev.map(i => normalizeAiPendingItem(i, defaultListId)),
+        existingNegatives,
+      )
+      return [...normalizedPrev, ...newItems]
     })
 
     const wcStatus = result.websiteContextStatus
@@ -1873,34 +1982,48 @@ function AuthenticatedApp({ user, onLogout }) {
         summaryParts.push(`${adGroupKeywords.length} at ad group level (${agNames.join(', ')})`)
       }
 
-      // Add submitted keywords to existingNegatives so the search terms table shows them as "In Google"
-      setExistingNegatives(prev => [
-        ...prev,
-        ...toSubmit.map(item => ({
-          keyword: item.keyword,
-          matchType: item.matchType,
-          source: item.destination === 'NEGATIVE_LIST' ? 'SHARED_SET' : item.destination,
-          resourceName: null,
-        }))
-      ])
+      const submittedSet = new Set(
+        toSubmit.map(i => `${i.keyword.toLowerCase()}:${(i.matchType || 'PHRASE').toString().toUpperCase()}`),
+      )
+      const nextPending = pendingNegatives.filter(
+        item => !submittedSet.has(`${item.keyword.toLowerCase()}:${(item.matchType || 'PHRASE').toString().toUpperCase()}`),
+      )
+      setPendingNegatives(nextPending)
       setSubmitSuccess(`Keywords submitted — ${summaryParts.join(' · ')}`)
 
-      // Mark submitted keywords as "In Google" instead of removing them, so they stay visible in both panels
-      const submittedSet = new Set(toSubmit.map(i => `${i.keyword.toLowerCase()}:${i.matchType}`))
-      setPendingNegatives(prev => prev.map(item => {
-        if (!submittedSet.has(`${item.keyword.toLowerCase()}:${item.matchType}`)) return item
-        return {
-          ...item,
-          alreadyInGoogle: true,
-          selected: false,
-          googleResourceName: null,
-          googleSource: item.destination === 'NEGATIVE_LIST' ? 'SHARED_SET' : item.destination,
+      try {
+        const negRes = await authenticatedFetch(`/api/negative-keywords?clientId=${currentClientId}`)
+        if (negRes.ok) {
+          const negData = await negRes.json()
+          setExistingNegatives(negData['Global Negative Keywords'] || [])
         }
-      }))
+      } catch (err) {
+        console.error('Failed to refresh Google negatives after submit:', err)
+      }
+
+      try {
+        const items = serializePendingItemsForPersist(nextPending)
+        await authenticatedFetch('/api/pending-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            clientId: canonicalPendingStateClientId(currentClientId),
+            items,
+          }),
+        })
+      } catch (err) {
+        console.error('Failed to save pending state after submit:', err)
+      }
 
       // Save history for all submissions
       if (toSubmit.length > 0) {
-        const allSubmitted = toSubmit.map(i => ({ keyword: i.keyword, matchType: i.matchType }))
+        const qualityPercentageBefore = computeSubmissionQualityPercentage(aiStats, pendingNegatives)
+        const qualityPercentageAfter = computeSubmissionQualityPercentage(aiStats, nextPending)
+        const allSubmitted = toSubmit.map(i => ({
+          keyword: i.keyword,
+          matchType: i.matchType,
+          appliedTo: formatSubmissionAppliedTo(i, sharedSets),
+        }))
         const uniqueTypes = [...new Set(toSubmit.map(item => item.matchType))]
         const matchTypeLabel = uniqueTypes.length === 1
           ? ({ EXACT: 'Exact match', PHRASE: 'Phrase match', BROAD: 'Broad match' }[uniqueTypes[0]] || uniqueTypes[0])
@@ -1930,6 +2053,8 @@ function AuthenticatedApp({ user, onLogout }) {
             keywords: allSubmitted,
             listName: destLabel,
             matchTypes: matchTypeLabel,
+            qualityPercentageBefore,
+            qualityPercentageAfter,
           }),
         })
           .then(r => r.json())
@@ -1941,6 +2066,9 @@ function AuthenticatedApp({ user, onLogout }) {
               list_name: destLabel,
               match_types: matchTypeLabel,
               keywords: allSubmitted,
+              quality_percentage: qualityPercentageBefore,
+              quality_percentage_before: qualityPercentageBefore,
+              quality_percentage_after: qualityPercentageAfter,
               submitted_by_email: user.email,
               submitted_by_name: user.name || ''
             }, ...prev])
@@ -2082,6 +2210,9 @@ function AuthenticatedApp({ user, onLogout }) {
           savedWorkRestoreNotice={savedWorkRestoreNotice}
           onDismissSavedWorkRestoreNotice={dismissSavedWorkRestoreNotice}
           searchTermsEmptyReason={searchTermsEmptyReason}
+          highVolumeModal={highVolumeModal}
+          onHighVolumeConfirm={confirmHighVolumeLoad}
+          onHighVolumeCancel={cancelHighVolumeLoad}
         />
       } />
       <Route path="/review" element={
@@ -2142,6 +2273,9 @@ function AuthenticatedApp({ user, onLogout }) {
           savedWorkRestoreNotice={savedWorkRestoreNotice}
           onDismissSavedWorkRestoreNotice={dismissSavedWorkRestoreNotice}
           searchTermsEmptyReason={searchTermsEmptyReason}
+          highVolumeModal={highVolumeModal}
+          onHighVolumeConfirm={confirmHighVolumeLoad}
+          onHighVolumeCancel={cancelHighVolumeLoad}
         />
       } />
       <Route path="/review-confirm/:id" element={<StrategistConfirmPage />} />

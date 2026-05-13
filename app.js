@@ -51,6 +51,9 @@ function pirateFuseSesSource(mailbox, agencyName) {
     return `"${displayName}" <${mailbox}>`;
 }
 
+/** Max rows returned after merging Shopping/PMax + keyword search_term queries (`/api/search-terms`). */
+const SEARCH_TERMS_MERGE_ROW_CAP = 5000;
+
 /** Normalize search text for comparing AI suggestions against account search terms. */
 function normalizeSearchQueryForAi(s) {
     return String(s || '')
@@ -105,6 +108,34 @@ function extractFirstJsonObject(text) {
         }
     }
     return null;
+}
+
+function parseAiRecommendationJson(rawText) {
+    const text = String(rawText || '').trim();
+    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    try {
+        return JSON.parse(jsonText);
+    } catch (parseErr) {
+        const extracted = extractFirstJsonObject(jsonText) || extractFirstJsonObject(text);
+        if (!extracted) throw parseErr;
+        return JSON.parse(extracted);
+    }
+}
+
+async function invokeBedrockChat(messages, abortSignal) {
+    const command = new InvokeModelCommand({
+        modelId: process.env.BEDROCK_CHAT_MODEL,
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 4096,
+            messages,
+        }),
+    });
+    const bedrockResponse = await bedrockClient.send(command, { abortSignal });
+    const responseBody = JSON.parse(new TextDecoder().decode(bedrockResponse.body));
+    return responseBody.content?.[0]?.text?.trim() ?? '';
 }
 
 // Import authentication functions
@@ -252,7 +283,10 @@ async function initDB() {
                 match_types TEXT,
                 keywords JSONB NOT NULL,
                 submitted_by_email VARCHAR(255),
-                submitted_by_name VARCHAR(255)
+                submitted_by_name VARCHAR(255),
+                quality_percentage INTEGER,
+                quality_percentage_before INTEGER,
+                quality_percentage_after INTEGER
             )
         `);
 
@@ -318,6 +352,32 @@ async function initDB() {
             await dbPool.query(`
                 ALTER TABLE submission_history 
                 ADD COLUMN IF NOT EXISTS submitted_by_name VARCHAR(255)
+            `);
+            await dbPool.query(`
+                ALTER TABLE submission_history
+                ADD COLUMN IF NOT EXISTS quality_percentage INTEGER
+            `);
+            await dbPool.query(`
+                ALTER TABLE submission_history
+                ADD COLUMN IF NOT EXISTS quality_percentage_before INTEGER
+            `);
+            await dbPool.query(`
+                ALTER TABLE submission_history
+                ADD COLUMN IF NOT EXISTS quality_percentage_after INTEGER
+            `);
+            await dbPool.query(`
+                UPDATE submission_history
+                SET quality_percentage_before = quality_percentage
+                WHERE quality_percentage_before IS NULL AND quality_percentage IS NOT NULL
+            `);
+            await dbPool.query(`
+                ALTER TABLE review_request_decisions
+                ADD COLUMN IF NOT EXISTS client_decision VARCHAR(10)
+            `);
+            await dbPool.query(`
+                UPDATE review_request_decisions
+                SET client_decision = decision
+                WHERE client_decision IS NULL
             `);
             // Migration: add campaign/adgroup columns to client_pending_state
             await dbPool.query(`ALTER TABLE client_pending_state ADD COLUMN IF NOT EXISTS campaign_id TEXT`);
@@ -1122,6 +1182,26 @@ async function submitItemsToGoogleAds(clientId, items) {
     return { submittedKeywords, summaryParts };
 }
 
+/** Human-readable destination for submission history exports. */
+function formatSubmissionAppliedTo(item) {
+    const dest = item.destination || 'NEGATIVE_LIST';
+    if (dest === 'NEGATIVE_LIST') {
+        if (item.sharedSetName) return `Keyword list: ${item.sharedSetName}`;
+        if (item.sharedSetId) return `Keyword list: ${item.sharedSetId}`;
+        return 'Keyword list';
+    }
+    if (dest === 'CAMPAIGN') {
+        const label = item.campaignName || item.campaignId;
+        return label ? `Campaign: ${label}` : 'Campaign';
+    }
+    if (dest === 'ADGROUP') {
+        const ag = item.adGroupName || item.adGroupId;
+        const camp = item.campaignName ? ` (${item.campaignName})` : '';
+        return ag ? `Ad group: ${ag}${camp}` : 'Ad group';
+    }
+    return '';
+}
+
 /** Map a review_request_items DB row into the camelCase shape used by submit/finalize logic. */
 function mapReviewItemRow(row) {
     return {
@@ -1150,7 +1230,7 @@ async function loadReviewRequestForStrategist(id) {
     const { rows: itemRows } = await dbPool.query(
         `SELECT i.id, i.keyword, i.match_type, i.destination, i.campaign_id, i.campaign_name,
                 i.ad_group_id, i.ad_group_name, i.shared_set_id, i.source_meta,
-                d.decision
+                d.decision, d.client_decision
          FROM review_request_items i
          LEFT JOIN review_request_decisions d ON d.review_request_item_id = i.id
          WHERE i.review_request_id = $1
@@ -1160,6 +1240,7 @@ async function loadReviewRequestForStrategist(id) {
     const items = itemRows.map((row) => ({
         ...mapReviewItemRow(row),
         decision: row.decision || null,
+        clientDecision: row.client_decision || null,
     }));
     return { request, items };
 }
@@ -1343,8 +1424,8 @@ app.patch('/api/review-requests/:id/items/:itemId/decision', async (req, res) =>
         if (!item) return res.status(404).json({ error: 'Item not found on this review' });
 
         await dbPool.query(
-            `INSERT INTO review_request_decisions (review_request_item_id, decision, decided_at)
-             VALUES ($1, $2, NOW())
+            `INSERT INTO review_request_decisions (review_request_item_id, decision, client_decision, decided_at)
+             VALUES ($1, $2, NULL, NOW())
              ON CONFLICT (review_request_item_id) DO UPDATE
                SET decision = EXCLUDED.decision, decided_at = EXCLUDED.decided_at`,
             [itemIdNum, decision],
@@ -1381,10 +1462,18 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
             return types.length > 0 ? 'Mixed match types' : '';
         })();
         if (blockItems.length > 0) {
-            const allSubmitted = blockItems.map((i) => ({ keyword: i.keyword, matchType: i.matchType }));
+            const allSubmitted = blockItems.map((i) => ({
+                keyword: i.keyword,
+                matchType: i.matchType,
+                appliedTo: formatSubmissionAppliedTo(i),
+            }));
             await dbPool.query(
-                `INSERT INTO submission_history (client_id, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                `INSERT INTO submission_history (
+                    client_id, keyword_count, list_name, match_types, keywords,
+                    submitted_by_email, submitted_by_name,
+                    quality_percentage, quality_percentage_before, quality_percentage_after
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
                 [
                     request.client_id,
                     allSubmitted.length,
@@ -1393,6 +1482,9 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
                     JSON.stringify(allSubmitted),
                     req.user?.email || null,
                     req.user?.name || '',
+                    null,
+                    null,
+                    null,
                 ],
             ).catch((err) => {
                 console.error('finalize: history insert failed:', err.message);
@@ -1603,10 +1695,12 @@ app.post('/api/public/review/submit', publicReviewRateLimit, async (req, res) =>
             if (!validIds.has(itemId)) continue;
             if (!REVIEW_DECISIONS.has(decision)) continue;
             await dbClient.query(
-                `INSERT INTO review_request_decisions (review_request_item_id, decision, decided_at)
-                 VALUES ($1, $2, NOW())
+                `INSERT INTO review_request_decisions (review_request_item_id, decision, client_decision, decided_at)
+                 VALUES ($1, $2, $2, NOW())
                  ON CONFLICT (review_request_item_id) DO UPDATE
-                   SET decision = EXCLUDED.decision, decided_at = EXCLUDED.decided_at`,
+                   SET decision = EXCLUDED.decision,
+                       client_decision = EXCLUDED.client_decision,
+                       decided_at = EXCLUDED.decided_at`,
                 [itemId, decision],
             );
             if (decision === 'block') blockCount++;
@@ -1724,9 +1818,31 @@ app.get('/api/search-terms', async (req, res) => {
             refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
         });
 
-        // Query for search terms - back to clicks > 0 filter
-        const searchTermQuery = `
-            SELECT 
+        // Shopping / PMax: do not segment by keyword — API rows often show clicks in the UI but
+        // metrics.clicks = 0 per keyword-segmented row. Search (etc.): keep keyword for granularity.
+        const searchTermQueryShopping = `
+            SELECT
+                search_term_view.search_term,
+                metrics.clicks,
+                metrics.impressions,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc,
+                campaign.id,
+                campaign.name,
+                ad_group.id,
+                ad_group.name
+            FROM search_term_view
+            WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
+                AND metrics.clicks > 0
+                AND campaign.advertising_channel_type IN ('SHOPPING', 'PERFORMANCE_MAX')
+            ORDER BY metrics.clicks DESC
+            LIMIT ${SEARCH_TERMS_MERGE_ROW_CAP}
+        `;
+
+        const searchTermQueryWithKeyword = `
+            SELECT
                 search_term_view.search_term,
                 segments.keyword.info.text,
                 segments.keyword.info.match_type,
@@ -1743,11 +1859,19 @@ app.get('/api/search-terms', async (req, res) => {
             FROM search_term_view
             WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
                 AND metrics.clicks > 0
+                AND campaign.advertising_channel_type NOT IN ('SHOPPING', 'PERFORMANCE_MAX')
             ORDER BY metrics.clicks DESC
-            LIMIT 5000
+            LIMIT ${SEARCH_TERMS_MERGE_ROW_CAP}
         `;
 
-        const searchTermResponse = await customer.query(searchTermQuery);
+        const [shoppingRows, keywordRows] = await Promise.all([
+            customer.query(searchTermQueryShopping),
+            customer.query(searchTermQueryWithKeyword)
+        ]);
+
+        const searchTermResponse = [...shoppingRows, ...keywordRows]
+            .sort((a, b) => (b.metrics?.clicks || 0) - (a.metrics?.clicks || 0))
+            .slice(0, SEARCH_TERMS_MERGE_ROW_CAP);
         let emptyReason = null;
         if (searchTermResponse.length === 0) {
             const anyTermsQuery = `
@@ -1799,6 +1923,82 @@ app.get('/api/search-terms', async (req, res) => {
         console.error('Error details:', error);
         res.status(500).json({
             error: 'Failed to fetch data',
+            details: error.message
+        });
+    }
+});
+
+/** Cheap row-count probe: same date + clicks filter as /api/search-terms (all channels, minimal fields). */
+app.get('/api/search-terms-preview', async (req, res) => {
+    try {
+        const { clientId } = req.query;
+        if (!clientId) {
+            return res.status(400).json({ error: 'Client ID is required' });
+        }
+
+        const today = new Date();
+        const firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        const lastOfPrevMonth = new Date(firstOfThisMonth - 1);
+        const firstOfPrevMonth = new Date(lastOfPrevMonth.getFullYear(), lastOfPrevMonth.getMonth(), 1);
+
+        const endDate = req.query.endDate || lastOfPrevMonth.toISOString().split('T')[0];
+        const startDate = req.query.startDate || firstOfPrevMonth.toISOString().split('T')[0];
+
+        const rawMin = parseInt(process.env.SEARCH_TERMS_HIGH_VOLUME_MIN || '500', 10);
+        const threshold =
+            Number.isFinite(rawMin) && rawMin > 0 ? Math.min(Math.floor(rawMin), 4999) : 500;
+        const fetchLimit = threshold + 1;
+
+        const customer = client.Customer({
+            customer_id: clientId,
+            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
+        });
+
+        // Match /api/search-terms channel split so row counts align (keyword segment inflates Search rows).
+        const previewShopping = `
+            SELECT search_term_view.search_term
+            FROM search_term_view
+            WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
+                AND metrics.clicks > 0
+                AND campaign.advertising_channel_type IN ('SHOPPING', 'PERFORMANCE_MAX')
+            LIMIT ${fetchLimit}
+        `;
+        const previewKeyword = `
+            SELECT
+                search_term_view.search_term,
+                segments.keyword.info.text
+            FROM search_term_view
+            WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
+                AND metrics.clicks > 0
+                AND campaign.advertising_channel_type NOT IN ('SHOPPING', 'PERFORMANCE_MAX')
+            LIMIT ${fetchLimit}
+        `;
+
+        const [shopRows, kwRows] = await Promise.all([
+            customer.query(previewShopping),
+            customer.query(previewKeyword)
+        ]);
+        const rowCount = shopRows.length + kwRows.length;
+        const highVolume =
+            shopRows.length >= threshold ||
+            kwRows.length >= threshold ||
+            rowCount >= threshold;
+
+        res.json({
+            highVolume,
+            threshold,
+            rowCount,
+            shoppingSampleRows: shopRows.length,
+            keywordSampleRows: kwRows.length,
+            mergeCap: SEARCH_TERMS_MERGE_ROW_CAP,
+            startDate,
+            endDate
+        });
+    } catch (error) {
+        console.error('search-terms-preview error:', error);
+        res.status(500).json({
+            error: 'Failed to preview search terms volume',
             details: error.message
         });
     }
@@ -2192,10 +2392,10 @@ async function fetchPage(url, timeoutMs = 9000, logFailures = false) {
         }
     };
 
-    let html = await tryOnce(SCRAPER_BOT_UA, 'bot');
+    let html = await tryOnce(SCRAPER_BROWSER_UA, 'browser');
     if (html) return { html, diagnostic: null };
 
-    html = await tryOnce(SCRAPER_BROWSER_UA, 'browser');
+    html = await tryOnce(SCRAPER_BOT_UA, 'bot');
     if (html) return { html, diagnostic: null };
 
     const diagnostic = lastDiag || 'unknown error';
@@ -2250,7 +2450,7 @@ async function scrapeWebsiteContext(url) {
         const homeFetch = await fetchPage(url, 9000, true);
         if (!homeFetch.html) {
             console.log(
-                `[Scraper] Homepage not readable (blocked, TLS, robots, timeout, etc.). Continuing AI with URL only: ${url}`,
+                `[Scraper] Homepage not readable (blocked, TLS, robots, timeout, etc.). Continuing with search terms only: ${url}`,
             );
             return {
                 scraped: null,
@@ -2298,6 +2498,49 @@ async function scrapeWebsiteContext(url) {
     }
 }
 
+async function loadGoogleNegativeKeywordTexts(clientId) {
+    const id = String(clientId || '').trim();
+    if (!id) return new Set();
+
+    const customer = client.Customer({
+        customer_id: id,
+        login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+        refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN,
+    });
+
+    const queries = [
+        `SELECT shared_criterion.keyword.text
+         FROM shared_criterion
+         WHERE shared_set.type = NEGATIVE_KEYWORDS AND shared_set.status = ENABLED`,
+        `SELECT campaign_criterion.keyword.text
+         FROM campaign_criterion
+         WHERE campaign_criterion.negative = true AND campaign_criterion.status = ENABLED`,
+        `SELECT ad_group_criterion.keyword.text
+         FROM ad_group_criterion
+         WHERE ad_group_criterion.negative = true AND ad_group_criterion.status = ENABLED`,
+    ];
+
+    try {
+        const responses = await Promise.all(
+            queries.map((query) => customer.query(query).catch(() => [])),
+        );
+        const texts = new Set();
+        for (const rows of responses) {
+            for (const row of rows) {
+                const text =
+                    row.shared_criterion?.keyword?.text
+                    || row.campaign_criterion?.keyword?.text
+                    || row.ad_group_criterion?.keyword?.text;
+                if (text) texts.add(String(text).trim().toLowerCase());
+            }
+        }
+        return texts;
+    } catch (err) {
+        console.error('[AI] Failed to load account negative keywords:', err.message);
+        return new Set();
+    }
+}
+
 app.post('/api/ai-recommend-negatives', async (req, res) => {
     try {
         const { searchTerms, websiteUrl, clientId } = req.body;
@@ -2306,22 +2549,41 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
             return res.status(400).json({ error: 'Search terms are required' });
         }
 
+        const accountTermCount = searchTerms.length;
+        const rawCap = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '400', 10);
+        const promptMax =
+            Number.isFinite(rawCap) && rawCap > 0 ? Math.min(rawCap, 5000) : 400;
+        const termsForPrompt = [...searchTerms]
+            .sort((a, b) => (Number(b.clicks) || 0) - (Number(a.clicks) || 0))
+            .slice(0, promptMax);
+        if (accountTermCount > termsForPrompt.length) {
+            console.log(
+                `[AI] Prompt uses top ${termsForPrompt.length} of ${accountTermCount} search terms by clicks (cap=${promptMax})`
+            );
+        }
+
         /** @type {Set<string>} Lowercased keywords the user already dismissed as AI suggestions */
         let rejectedNormalized = new Set();
+        /** @type {Set<string>} Lowercased negatives already in Google Ads */
+        let googleNegativeTexts = new Set();
         if (clientId && String(clientId).trim()) {
             const cid = String(clientId).trim();
             try {
-                const rej = await dbPool.query(
-                    'SELECT keyword_normalized FROM client_rejected_ai_negatives WHERE client_id = $1',
-                    [cid],
-                );
+                const [rej, negTexts] = await Promise.all([
+                    dbPool.query(
+                        'SELECT keyword_normalized FROM client_rejected_ai_negatives WHERE client_id = $1',
+                        [cid],
+                    ),
+                    loadGoogleNegativeKeywordTexts(cid),
+                ]);
                 rejectedNormalized = new Set(rej.rows.map((r) => r.keyword_normalized));
+                googleNegativeTexts = negTexts;
             } catch (rejErr) {
-                console.error('Error loading rejected AI negatives:', rejErr);
+                console.error('Error loading AI exclusions:', rejErr);
             }
         }
 
-        const searchTermsTable = searchTerms
+        const searchTermsTable = termsForPrompt
             .map((st, i) =>
                 `${i + 1}. ${st.searchTerm} | Clicks: ${st.clicks} | Conversions: ${st.conversions} | Campaign: ${st.campaign}`
             )
@@ -2369,32 +2631,39 @@ ${pagesText}`;
                 websiteFetchDetail =
                     homepageDiagnostic ||
                     'We could not load this URL (bad link, empty page, 404/403, SSL, firewall, etc.). Save a working homepage URL, then scan again.';
+                websiteContext = `Website URL: ${trimUrl}
+Automated homepage fetch failed (${websiteFetchDetail}). No page body is available — use ONLY the search terms below.`;
             }
         }
 
-        if (websiteUrlTrim && websiteContextStatus === 'unreadable') {
-            const totalSt = searchTerms.length;
-            return res.json({
-                negativeKeywords: [],
-                negativeKeywordSources: {},
-                summary: {
-                    totalSearchTerms: totalSt,
-                    negativeCount: 0,
-                    qualityPercentage: 100,
-                },
-                explanation: '',
-                websiteContextStatus: 'unreadable',
-                websiteFetchDetail,
-                scanSkippedDueToBadWebsiteUrl: true,
-            });
-        }
+        const hasWebsiteContent = websiteContextStatus === 'ok';
+        const websitePrelude = hasWebsiteContent
+            ? `BEFORE YOU BEGIN — SCAN THE WEBSITE:
+Before evaluating any search terms, read the provided website content to understand:
+- Every product and service this business offers
+- What geographic area(s) they serve, if any
+- Use this as the foundation for every decision below`
+            : `WEBSITE CONTEXT UNAVAILABLE:
+The automated homepage fetch failed. You have no page content — rely ONLY on the search terms below. Do not infer services, geography, or core industry themes from the domain or URL alone. Prefer fewer negatives.`;
+
+        const geoRule = hasWebsiteContent
+            ? `1. GEOGRAPHIC TERMS: If the business serves a specific local or regional area, add out-of-area location words as negatives. Extract only the location word, not the full phrase. If the business serves nationally or the area is unclear, skip geographic terms.`
+            : `1. GEOGRAPHIC TERMS: Skip geographic negatives unless the query clearly signals wrong-location intent without website proof. When unsure, omit.`;
+
+        const industryRule = hasWebsiteContent
+            ? `2. NEVER add the business's own core industry terms as negatives (themes and role words that describe what paying customers actually search for to find this firm — analogous to \"marketing\"/\"agency\" for a marketer). If the site offers that service or audience, omit.`
+            : `2. NEVER add broad industry or service role words as negatives unless the query unmistakably signals job-seeking, DIY, unrelated trade, or a competitor — you cannot verify core offerings without the site.`;
+
+        const intentRule = hasWebsiteContent
+            ? `5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking (\"careers\", \"jobs\", \"hiring\"), DIY/free intent (\"free\", \"template\", \"diy\") when unrelated, or irrelevant proper nouns — not mainstream ways of asking for services the website clearly provides.`
+            : `5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking (\"careers\", \"jobs\", \"hiring\"), DIY/free intent (\"free\", \"template\", \"diy\") when unrelated, or irrelevant proper nouns. When intent is ambiguous, omit.`;
 
         const uniqueWords = [
             ...new Set([
                 // Individual words
-                ...searchTerms.flatMap(st => st.searchTerm.toLowerCase().split(/\s+/)),
+                ...termsForPrompt.flatMap(st => st.searchTerm.toLowerCase().split(/\s+/)),
                 // Full search term phrases (so AI can return multi-word negatives)
-                ...searchTerms.map(st => st.searchTerm.toLowerCase()),
+                ...termsForPrompt.map(st => st.searchTerm.toLowerCase()),
             ])
         ].join(', ');
 
@@ -2407,22 +2676,23 @@ ${[...rejectedNormalized].sort().join(', ')}
 
 `;
 
+        const scopeNote =
+            accountTermCount > termsForPrompt.length
+                ? `SCOPE: This account has ${accountTermCount} search queries with clicks in the period. You are given only the ${termsForPrompt.length} highest-click queries below. Every negative MUST appear verbatim in that list — do not assume anything about queries not shown.\n\n`
+                : '';
+
         const prompt = `You are a Google Ads specialist helping identify negative keywords to add to a campaign.
 
 Your job is to find words or phrases that signal a search is NOT from a potential customer of this business. Prefer precision over recall: when intent is ambiguous, do NOT include the term as a negative (avoid costing real leads).
 
-BEFORE YOU BEGIN — SCAN THE WEBSITE:
-Before evaluating any search terms, read the provided website content to understand:
-- Every product and service this business offers
-- What geographic area(s) they serve, if any
-- Use this as the foundation for every decision below
+${websitePrelude}
 
 RULES:
-1. GEOGRAPHIC TERMS: If the business serves a specific local or regional area, add out-of-area location words as negatives. Extract only the location word, not the full phrase. If the business serves nationally or the area is unclear, skip geographic terms.
-2. NEVER add the business's own core industry terms as negatives (themes and role words that describe what paying customers actually search for to find this firm — analogous to \"marketing\"/\"agency\" for a marketer). If the site offers that service or audience, omit.
+${geoRule}
+${industryRule}
 3. NEVER add generic descriptors as negatives inside your returned strings — not even inside a multi-word suggestion (e.g. never output a keyword that contains the phrase \"near me\", \"best \", \"top \", standalone \"cheap\", standalone \"reviews\", standalone \"firm\", standalone \"services\", standalone \"company\", standalone \"local\"). Extract the real offending signal (competitor, wrong city, job-seeking token, unrelated niche token) instead, or omit.
 4. DATA ONLY: Every keyword you return MUST be a word or phrase that appears verbatim in the search terms list below. Do NOT invent negatives.
-5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking (\"careers\", \"jobs\", \"hiring\"), DIY/free intent (\"free\", \"template\", \"diy\") when unrelated, or irrelevant proper nouns — not mainstream ways of asking for services the website clearly provides.
+${intentRule}
 6. EXTRACTION RULE — always extract the smallest offending unit. Almost NEVER paste an entire multi-word search query back as one negative phrase (that destroys good traffic unless the ENTIRE query is verbatim a competitor or an unrelated tangent). Strip down to competitor brand, wrong geo token, franchise, salaries, unrelated product, etc.
    - Competitor name in a phrase → extract only the competitor name
    - Out-of-area location in a phrase → extract only the location word
@@ -2435,7 +2705,7 @@ RULES:
 ${rejectedPromptBlock}
 ${websiteContext}
 
-Search Terms (format: term | clicks | conversions | campaign):
+${scopeNote}Search Terms (format: term | clicks | conversions | campaign):
 ${searchTermsTable}
 
 Every unique word present across all search terms (your negatives MUST come only from this set):
@@ -2445,7 +2715,7 @@ FINAL CHECK before writing JSON:
 - Does each keyword appear word-for-word in the search terms list? If NO, remove it.
 - Is this suggestion literally the FULL text of some search-query line without a disqualifier (jobs, unrelated trade, competitor, wrong city, etc.)? If YES, remove it — shorten to smallest offending substring or omit.
 
-Respond ONLY with a valid JSON object in this exact format, with no additional text before or after:
+OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, preamble, or closing commentary.
 {
   "negativeKeywords": ["keyword1", "keyword2"],
   "summary": {
@@ -2456,29 +2726,26 @@ Respond ONLY with a valid JSON object in this exact format, with no additional t
   "explanation": "Brief summary of your analysis. If one keyword (in the 'triggered by keyword' column) is responsible for generating 30% or more of the total recommended negative keywords, explicitly call it out in this explanation and recommend tightening its match type."
 }`;
 
-        const command = new InvokeModelCommand({
-            modelId: process.env.BEDROCK_CHAT_MODEL,
-            contentType: 'application/json',
-            accept: 'application/json',
-            body: JSON.stringify({
-                anthropic_version: 'bedrock-2023-05-31',
-                max_tokens: 4096,
-                messages: [{ role: 'user', content: prompt }]
-            })
-        });
-
-        const bedrockResponse = await bedrockClient.send(command, { abortSignal: abortAfterMs(120000) });
-        const responseBody = JSON.parse(new TextDecoder().decode(bedrockResponse.body));
-        const text = responseBody.content[0].text.trim();
-
-        const jsonText = text.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+        const bedrockAbort = abortAfterMs(120000);
+        const rawText = await invokeBedrockChat([{ role: 'user', content: prompt }], bedrockAbort);
         let parsed;
         try {
-            parsed = JSON.parse(jsonText);
-        } catch (_parseErr) {
-            const extracted = extractFirstJsonObject(jsonText) || extractFirstJsonObject(text);
-            if (!extracted) throw _parseErr;
-            parsed = JSON.parse(extracted);
+            parsed = parseAiRecommendationJson(rawText);
+        } catch (parseErr) {
+            console.warn('[AI] Bedrock returned non-JSON; retrying once.', rawText.slice(0, 500));
+            const retryText = await invokeBedrockChat(
+                [{
+                    role: 'user',
+                    content: `${prompt}\n\nCRITICAL: Your entire reply must be one JSON object only. No analysis, markdown, or text outside the JSON.`,
+                }],
+                bedrockAbort,
+            );
+            try {
+                parsed = parseAiRecommendationJson(retryText);
+            } catch (retryErr) {
+                console.warn('[AI] Bedrock retry still non-JSON:', retryText.slice(0, 500));
+                throw retryErr;
+            }
         }
 
         // Hard filter: remove any keyword the AI invented that isn't present in the actual search terms
@@ -2487,24 +2754,28 @@ Respond ONLY with a valid JSON object in this exact format, with no additional t
             const kwLower = kw.toLowerCase().trim();
             const escaped = kwLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i');
-            const matches = searchTerms.filter(st => re.test(st.searchTerm.toLowerCase())).map(st => st.searchTerm);
+            const matches = termsForPrompt.filter(st => re.test(st.searchTerm.toLowerCase())).map(st => st.searchTerm);
             sourcesMap[kw] = matches;
             return matches.length > 0;
         });
         parsed.negativeKeywords = parsed.negativeKeywords.filter(
-            kw => !shouldDropAiNegativeSuggestion(kw, searchTerms)
+            kw => !shouldDropAiNegativeSuggestion(kw, termsForPrompt)
         );
         parsed.negativeKeywords = parsed.negativeKeywords.filter((kw) => {
             const n = kw.toLowerCase().trim();
-            return !rejectedNormalized.has(n);
+            return !rejectedNormalized.has(n) && !googleNegativeTexts.has(n);
         });
         for (const k of Object.keys(sourcesMap)) {
             if (!parsed.negativeKeywords.includes(k)) delete sourcesMap[k];
         }
         parsed.negativeKeywordSources = sourcesMap;
 
-        // Recalculate summary counts based on validated keywords
+        // Recalculate summary counts based on validated keywords (LLM only saw top-N by clicks)
         if (parsed.summary) {
+            parsed.summary.totalSearchTerms = termsForPrompt.length;
+            if (accountTermCount > termsForPrompt.length) {
+                parsed.summary.totalSearchTermsInAccount = accountTermCount;
+            }
             parsed.summary.negativeCount = parsed.negativeKeywords.length;
             parsed.summary.qualityPercentage = parsed.summary.totalSearchTerms > 0
                 ? Math.round(((parsed.summary.totalSearchTerms - parsed.negativeKeywords.length) / parsed.summary.totalSearchTerms) * 100)
@@ -2778,15 +3049,37 @@ app.delete('/api/pending-state', async (req, res) => {
 });
 
 // Save a submission record
+function normalizeSubmissionQualityPercentage(value) {
+    if (!Number.isFinite(Number(value))) return null;
+    return Math.min(100, Math.max(0, Math.round(Number(value))));
+}
+
 app.post('/api/submission-history', authenticateToken, async (req, res) => {
-    const { clientId, keywords, listName, matchTypes } = req.body;
+    const {
+        clientId,
+        keywords,
+        listName,
+        matchTypes,
+        qualityPercentage,
+        qualityPercentageBefore,
+        qualityPercentageAfter,
+    } = req.body;
     if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
     if (!keywords || !keywords.length) return res.status(400).json({ error: 'Keywords are required' });
 
+    const qualityBefore = normalizeSubmissionQualityPercentage(
+        qualityPercentageBefore ?? qualityPercentage,
+    );
+    const qualityAfter = normalizeSubmissionQualityPercentage(qualityPercentageAfter);
+
     try {
         await dbPool.query(
-            `INSERT INTO submission_history (client_id, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            `INSERT INTO submission_history (
+                client_id, keyword_count, list_name, match_types, keywords,
+                submitted_by_email, submitted_by_name,
+                quality_percentage, quality_percentage_before, quality_percentage_after
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
             [
                 clientId, 
                 keywords.length, 
@@ -2794,7 +3087,10 @@ app.post('/api/submission-history', authenticateToken, async (req, res) => {
                 matchTypes || '', 
                 JSON.stringify(keywords),
                 req.user.email,
-                req.user.name || ''
+                req.user.name || '',
+                qualityBefore,
+                qualityBefore,
+                qualityAfter,
             ]
         );
         res.json({ success: true });
@@ -2811,7 +3107,7 @@ app.get('/api/submission-history', authenticateToken, async (req, res) => {
 
     try {
         const result = await dbPool.query(
-            `SELECT id, submitted_at, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name
+            `SELECT id, submitted_at, keyword_count, list_name, match_types, keywords, submitted_by_email, submitted_by_name, quality_percentage, quality_percentage_before, quality_percentage_after
              FROM submission_history
              WHERE client_id = $1
              ORDER BY submitted_at DESC
