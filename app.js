@@ -52,7 +52,7 @@ function pirateFuseSesSource(mailbox, agencyName) {
 }
 
 /** Max rows returned after merging Shopping/PMax + keyword search_term queries (`/api/search-terms`). */
-const SEARCH_TERMS_MERGE_ROW_CAP = 5000;
+const SEARCH_TERMS_MERGE_ROW_CAP = 500;
 
 /** Normalize search text for comparing AI suggestions against account search terms. */
 function normalizeSearchQueryForAi(s) {
@@ -2552,7 +2552,7 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
         const accountTermCount = searchTerms.length;
         const rawCap = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '400', 10);
         const promptMax =
-            Number.isFinite(rawCap) && rawCap > 0 ? Math.min(rawCap, 5000) : 400;
+            Number.isFinite(rawCap) && rawCap > 0 ? Math.min(rawCap, SEARCH_TERMS_MERGE_ROW_CAP) : 400;
         const termsForPrompt = [...searchTerms]
             .sort((a, b) => (Number(b.clicks) || 0) - (Number(a.clicks) || 0))
             .slice(0, promptMax);

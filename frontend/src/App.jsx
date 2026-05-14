@@ -802,8 +802,9 @@ function NegativeKeywordsPage({
                 rows.
               </p>
               <p className="mb-0">
-                If you continue, the app will load up to <strong>{highVolumeModal.mergeCap}</strong>{' '}
-                merged rows for this account and range, which can take a while.
+                If you continue, the app loads up to <strong>{highVolumeModal.mergeCap}</strong>{' '}
+                search-term rows with the most clicks in this range. Additional rows in Google Ads
+                are not loaded.
               </p>
             </div>
             <div className="website-url-modal-footer">
@@ -1142,7 +1143,7 @@ function AuthenticatedApp({ user, onLogout }) {
             setHighVolumeModal({
               threshold: thr,
               rowCount: preview.rowCount,
-              mergeCap: preview.mergeCap ?? 5000,
+              mergeCap: preview.mergeCap ?? 500,
               startDate: String(start),
               endDate: String(end),
             })
