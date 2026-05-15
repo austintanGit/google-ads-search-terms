@@ -52,7 +52,93 @@ function pirateFuseSesSource(mailbox, agencyName) {
 }
 
 /** Max rows returned after merging Shopping/PMax + keyword search_term queries (`/api/search-terms`). */
-const SEARCH_TERMS_MERGE_ROW_CAP = 500;
+const SEARCH_TERMS_MERGE_ROW_CAP = 2000;
+
+/** Max search terms (by clicks) sent to Bedrock on `/api/ai-recommend-negatives`. */
+function resolveAiSearchTermsPromptCap() {
+    const raw = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '500', 10);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), SEARCH_TERMS_MERGE_ROW_CAP) : 500;
+}
+
+const GOOGLE_ADS_CACHE_TTL_MS = (() => {
+    const raw = parseInt(process.env.GOOGLE_ADS_CACHE_TTL_MS || '180000', 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 180000;
+})();
+const googleAdsResponseCache = new Map();
+
+function readGoogleAdsCache(key) {
+    const hit = googleAdsResponseCache.get(key);
+    if (!hit) return null;
+    if (Date.now() >= hit.expiresAt) {
+        googleAdsResponseCache.delete(key);
+        return null;
+    }
+    return hit.body;
+}
+
+function writeGoogleAdsCache(key, body) {
+    if (GOOGLE_ADS_CACHE_TTL_MS <= 0) return;
+    googleAdsResponseCache.set(key, { body, expiresAt: Date.now() + GOOGLE_ADS_CACHE_TTL_MS });
+}
+
+function invalidateGoogleAdsNegativeKeywordsCache(clientId) {
+    const id = String(clientId || '').trim();
+    if (!id) return;
+    googleAdsResponseCache.delete(`negative-keywords:${id}`);
+}
+
+const rawAiScanConcurrent = parseInt(process.env.AI_SCAN_MAX_CONCURRENT || '2', 10);
+const AI_SCAN_MAX_CONCURRENT =
+    Number.isFinite(rawAiScanConcurrent) && rawAiScanConcurrent > 0
+        ? Math.min(Math.floor(rawAiScanConcurrent), 8)
+        : 2;
+let aiScanSlotsInUse = 0;
+const aiScanSlotWaiters = [];
+
+async function acquireAiScanSlot() {
+    if (aiScanSlotsInUse < AI_SCAN_MAX_CONCURRENT) {
+        aiScanSlotsInUse += 1;
+        return;
+    }
+    await new Promise((resolve) => {
+        aiScanSlotWaiters.push(resolve);
+    });
+    aiScanSlotsInUse += 1;
+}
+
+function releaseAiScanSlot() {
+    aiScanSlotsInUse = Math.max(0, aiScanSlotsInUse - 1);
+    const next = aiScanSlotWaiters.shift();
+    if (next) next();
+}
+
+const AI_SCAN_PROGRESS_TTL_MS = 5 * 60 * 1000;
+const aiScanProgressById = new Map();
+
+function writeAiScanProgress(scanId, payload) {
+    const id = String(scanId || '').trim();
+    if (!id) return;
+    aiScanProgressById.set(id, { ...payload, updatedAt: Date.now() });
+}
+
+function readAiScanProgress(scanId) {
+    const id = String(scanId || '').trim();
+    if (!id) return null;
+    const hit = aiScanProgressById.get(id);
+    if (!hit) return null;
+    if (Date.now() - hit.updatedAt > AI_SCAN_PROGRESS_TTL_MS) {
+        aiScanProgressById.delete(id);
+        return null;
+    }
+    return hit;
+}
+
+function finishAiScanProgress(scanId, payload) {
+    const id = String(scanId || '').trim();
+    if (!id) return;
+    writeAiScanProgress(id, { active: false, ...payload });
+    setTimeout(() => aiScanProgressById.delete(id), 15000);
+}
 
 /** Normalize search text for comparing AI suggestions against account search terms. */
 function normalizeSearchQueryForAi(s) {
@@ -815,6 +901,7 @@ app.use('/api/shared-sets', authenticateToken);
 app.use('/api/create-shared-set', authenticateToken);
 app.use('/api/add-to-exclusion-list', authenticateToken);
 app.use('/api/ai-recommend-negatives', authenticateToken);
+app.use('/api/ai-scan-progress', authenticateToken);
 app.use('/api/detect-website', authenticateToken);
 app.use('/api/client-settings', authenticateToken);
 app.use('/api/client-website-url', authenticateToken);
@@ -1809,7 +1896,11 @@ app.get('/api/search-terms', async (req, res) => {
         const endDate = req.query.endDate || lastOfPrevMonth.toISOString().split('T')[0];
         const startDate = req.query.startDate || firstOfPrevMonth.toISOString().split('T')[0];
 
-       
+        const cacheKey = `search-terms:${String(clientId)}:${startDate}:${endDate}`;
+        const cachedTerms = readGoogleAdsCache(cacheKey);
+        if (cachedTerms) {
+            return res.json(cachedTerms);
+        }
 
         // Initialize customer with selected client ID
         const customer = client.Customer({
@@ -1915,10 +2006,12 @@ app.get('/api/search-terms', async (req, res) => {
             matchType: row.segments?.keyword?.info?.match_type || ''
         }));
 
-        res.json({
+        const payload = {
             searchTerms: transformedData,
             emptyReason
-        });
+        };
+        writeGoogleAdsCache(cacheKey, payload);
+        res.json(payload);
     } catch (error) {
         console.error('Error details:', error);
         res.status(500).json({
@@ -1944,9 +2037,12 @@ app.get('/api/search-terms-preview', async (req, res) => {
         const endDate = req.query.endDate || lastOfPrevMonth.toISOString().split('T')[0];
         const startDate = req.query.startDate || firstOfPrevMonth.toISOString().split('T')[0];
 
-        const rawMin = parseInt(process.env.SEARCH_TERMS_HIGH_VOLUME_MIN || '500', 10);
+        const rawMin = parseInt(
+            process.env.SEARCH_TERMS_HIGH_VOLUME_MIN || String(SEARCH_TERMS_MERGE_ROW_CAP),
+            10,
+        );
         const threshold =
-            Number.isFinite(rawMin) && rawMin > 0 ? Math.min(Math.floor(rawMin), 4999) : 500;
+            Number.isFinite(rawMin) && rawMin > 0 ? Math.min(Math.floor(rawMin), 4999) : SEARCH_TERMS_MERGE_ROW_CAP;
         const fetchLimit = threshold + 1;
 
         const customer = client.Customer({
@@ -1980,7 +2076,11 @@ app.get('/api/search-terms-preview', async (req, res) => {
             customer.query(previewKeyword)
         ]);
         const rowCount = shopRows.length + kwRows.length;
+        const sampleAtCap =
+            shopRows.length >= fetchLimit ||
+            kwRows.length >= fetchLimit;
         const highVolume =
+            sampleAtCap ||
             shopRows.length >= threshold ||
             kwRows.length >= threshold ||
             rowCount >= threshold;
@@ -1991,7 +2091,9 @@ app.get('/api/search-terms-preview', async (req, res) => {
             rowCount,
             shoppingSampleRows: shopRows.length,
             keywordSampleRows: kwRows.length,
+            sampleAtCap,
             mergeCap: SEARCH_TERMS_MERGE_ROW_CAP,
+            aiPromptCap: resolveAiSearchTermsPromptCap(),
             startDate,
             endDate
         });
@@ -2009,6 +2111,15 @@ app.get('/api/negative-keywords', async (req, res) => {
         const { clientId } = req.query;
         if (!clientId) {
             return res.status(400).json({ error: 'Client ID is required' });
+        }
+
+        const negativesCacheKey = `negative-keywords:${String(clientId)}`;
+        const skipCache = String(req.query.refresh || '') === '1';
+        if (!skipCache) {
+            const cachedNegatives = readGoogleAdsCache(negativesCacheKey);
+            if (cachedNegatives) {
+                return res.json(cachedNegatives);
+            }
         }
 
         const customer = client.Customer({
@@ -2177,6 +2288,7 @@ app.get('/api/negative-keywords', async (req, res) => {
             "Global Negative Keywords": allNegatives
         };
 
+        writeGoogleAdsCache(negativesCacheKey, transformedData);
         res.json(transformedData);
     } catch (error) {
         console.error('Error fetching negative keywords:', error);
@@ -2333,6 +2445,7 @@ app.post('/api/add-to-exclusion-list', async (req, res) => {
         }
 
         console.log(`Success: submitted via customer ${usedCustomerId}`);
+        invalidateGoogleAdsNegativeKeywordsCache(clientId);
         res.json({ success: true, response, details: { sharedSetId, negativeKeywords, usedCustomerId } });
 
     } catch (error) {
@@ -2542,17 +2655,26 @@ async function loadGoogleNegativeKeywordTexts(clientId) {
 }
 
 app.post('/api/ai-recommend-negatives', async (req, res) => {
+    const scanId = typeof req.body?.scanId === 'string' ? req.body.scanId.trim() : '';
+    const touchProgress = (phase, percent, label) => {
+        if (!scanId) return;
+        writeAiScanProgress(scanId, { active: true, phase, percent, label });
+    };
+
+    touchProgress('queued', 4, 'Waiting for an available scan slot…');
+    await acquireAiScanSlot();
     try {
         const { searchTerms, websiteUrl, clientId } = req.body;
 
         if (!searchTerms || !searchTerms.length) {
+            finishAiScanProgress(scanId, { phase: 'error', percent: 100, label: 'Search terms are required.' });
             return res.status(400).json({ error: 'Search terms are required' });
         }
 
+        touchProgress('preparing', 10, 'Preparing search terms for analysis…');
+
         const accountTermCount = searchTerms.length;
-        const rawCap = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '400', 10);
-        const promptMax =
-            Number.isFinite(rawCap) && rawCap > 0 ? Math.min(rawCap, SEARCH_TERMS_MERGE_ROW_CAP) : 400;
+        const promptMax = resolveAiSearchTermsPromptCap();
         const termsForPrompt = [...searchTerms]
             .sort((a, b) => (Number(b.clicks) || 0) - (Number(a.clicks) || 0))
             .slice(0, promptMax);
@@ -2567,6 +2689,7 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
         /** @type {Set<string>} Lowercased negatives already in Google Ads */
         let googleNegativeTexts = new Set();
         if (clientId && String(clientId).trim()) {
+            touchProgress('exclusions', 18, 'Loading account exclusions…');
             const cid = String(clientId).trim();
             try {
                 const [rej, negTexts] = await Promise.all([
@@ -2598,6 +2721,7 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
             : null;
 
         if (websiteUrlTrim) {
+            touchProgress('scraping', 32, 'Scanning website for context…');
             const trimUrl = websiteUrlTrim;
             const scrapeTimeoutMs = 42000;
             const timedOutPayload = Object.freeze({
@@ -2727,12 +2851,14 @@ OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, pr
 }`;
 
         const bedrockAbort = abortAfterMs(120000);
+        touchProgress('analyzing', 55, 'Analyzing search terms with AI…');
         const rawText = await invokeBedrockChat([{ role: 'user', content: prompt }], bedrockAbort);
         let parsed;
         try {
             parsed = parseAiRecommendationJson(rawText);
         } catch (parseErr) {
             console.warn('[AI] Bedrock returned non-JSON; retrying once.', rawText.slice(0, 500));
+            touchProgress('analyzing', 72, 'Retrying AI response…');
             const retryText = await invokeBedrockChat(
                 [{
                     role: 'user',
@@ -2749,6 +2875,7 @@ OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, pr
         }
 
         // Hard filter: remove any keyword the AI invented that isn't present in the actual search terms
+        touchProgress('validating', 96, 'Validating AI suggestions…');
         const sourcesMap = {};
         parsed.negativeKeywords = (parsed.negativeKeywords || []).filter(kw => {
             const kwLower = kw.toLowerCase().trim();
@@ -2785,6 +2912,7 @@ OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, pr
         parsed.websiteContextStatus = websiteContextStatus;
         parsed.websiteFetchDetail = websiteFetchDetail;
 
+        finishAiScanProgress(scanId, { phase: 'complete', percent: 100, label: 'AI scan complete.' });
         res.json(parsed);
     } catch (error) {
         console.error('Error calling Bedrock:', error);
@@ -2795,11 +2923,26 @@ OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, pr
         const details = aborted
             ? 'Bedrock analysis timed out. The site scrape may have been slow; try again or use a lighter homepage URL.'
             : error.message;
+        finishAiScanProgress(scanId, { phase: 'error', percent: 100, label: details || 'AI scan failed.' });
         res.status(500).json({
             error: 'Failed to get AI recommendations',
             details,
         });
+    } finally {
+        releaseAiScanSlot();
     }
+});
+
+app.get('/api/ai-scan-progress', (req, res) => {
+    const scanId = typeof req.query.scanId === 'string' ? req.query.scanId.trim() : '';
+    if (!scanId) {
+        return res.status(400).json({ error: 'scanId is required' });
+    }
+    const hit = readAiScanProgress(scanId);
+    if (!hit) {
+        return res.json({ active: false, phase: 'unknown', percent: 0, label: 'Waiting for scan…' });
+    }
+    return res.json(hit);
 });
 
 // Auto-detect website URL from the client's ads
@@ -3201,6 +3344,7 @@ app.post('/api/add-campaign-negative', async (req, res) => {
         }));
         const response = await withRetry(() => customer.campaignCriteria.create(criteria));
         console.log(`Campaign-level negatives submitted: ${negativeKeywords.length} keywords to campaign ${campaignId}`);
+        invalidateGoogleAdsNegativeKeywordsCache(clientId);
         res.json({ success: true, response });
     } catch (err) {
         console.error('Error adding campaign-level negatives:', err.errors || err.message);
@@ -3231,6 +3375,7 @@ app.post('/api/add-adgroup-negative', async (req, res) => {
         }));
         const response = await withRetry(() => customer.adGroupCriteria.create(criteria));
         console.log(`Ad group-level negatives submitted: ${negativeKeywords.length} keywords to ad group ${adGroupId}`);
+        invalidateGoogleAdsNegativeKeywordsCache(clientId);
         res.json({ success: true, response });
     } catch (err) {
         console.error('Error adding ad group-level negatives:', err.errors || err.message);
@@ -3260,6 +3405,7 @@ app.delete('/api/remove-google-negative', async (req, res) => {
         } else {
             return res.status(400).json({ error: `Unknown source type: ${source}` });
         }
+        invalidateGoogleAdsNegativeKeywordsCache(clientId);
         res.json({ success: true });
     } catch (err) {
         console.error('Error removing Google negative:', err.errors || err.message);

@@ -4,11 +4,11 @@ import Select from 'react-select'
 import { getDefaultDates, escapeRegex, googleNegativeMatchesSearchQuery } from './utils'
 import SearchTermsTable from './SearchTermsTable'
 import AIPanel from './AIPanel'
-import AIScanTablePlaceholder from './components/AIScanTablePlaceholder'
 import AuthPage from './components/AuthPage'
 import AdminPanel from './components/AdminPanel'
 import PublicReviewPage from './components/PublicReviewPage'
 import StrategistConfirmPage from './components/StrategistConfirmPage'
+import AiScanProgressIndicator from './components/AiScanProgressIndicator'
 
 // Authentication check
 function useAuth() {
@@ -71,6 +71,90 @@ const authenticatedFetch = (url, options = {}) => {
 
 /** Server may scrape pages + Bedrock — cap wait so a dead 404/host never locks the analyser spinner. */
 const AI_RECOMMEND_TIMEOUT_MS = 150000
+/** Fallback when preview API omits caps (keep aligned with `app.js`). */
+const SEARCH_TERMS_MERGE_ROW_CAP = 2000
+const AI_SEARCH_TERMS_PROMPT_CAP = 500
+const AI_SCAN_PROGRESS_POLL_MS = 1500
+const AI_SCAN_PROGRESS_POLL_MAX_MS = 4000
+/** Rough wall-clock budget for a scan; used to smooth the progress bar (32% pre-AI, 68% AI). */
+const AI_SCAN_PRE_AI_TIME_SHARE = 0.32
+const AI_SCAN_AI_TIME_SHARE = 0.68
+const AI_SCAN_PRE_AI_RAMP_MS = 20000
+const AI_SCAN_AI_RAMP_MS = 120000
+const AI_SCAN_PROGRESS_MAX_WHILE_ACTIVE = 93
+const AI_SCAN_PROGRESS_MAX_FINISHING = 97
+const AI_SCAN_PHASE_RANK = {
+  unknown: 0,
+  queued: 1,
+  starting: 2,
+  preparing: 3,
+  exclusions: 4,
+  scraping: 5,
+  analyzing: 6,
+  validating: 7,
+  complete: 8,
+  error: 8,
+}
+
+function aiScanPhaseRank(phase) {
+  return AI_SCAN_PHASE_RANK[String(phase || '')] ?? 0
+}
+
+function estimateAiScanTimePercent(elapsedMs, analyzeStartedAtMs = 0) {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0
+  const analyzeStartedAt = Number(analyzeStartedAtMs) || 0
+  if (analyzeStartedAt > 0) {
+    const aiElapsed = Math.max(0, Date.now() - analyzeStartedAt)
+    const aiSpan = AI_SCAN_AI_TIME_SHARE * 100
+    const aiProgress = Math.min(1, aiElapsed / AI_SCAN_AI_RAMP_MS)
+    return AI_SCAN_PRE_AI_TIME_SHARE * 100 + aiProgress * aiSpan
+  }
+  const preAiSpan = AI_SCAN_PRE_AI_TIME_SHARE * 100
+  const preAiProgress = Math.min(1, elapsedMs / AI_SCAN_PRE_AI_RAMP_MS)
+  return preAiProgress * preAiSpan
+}
+
+function mergeAiScanProgress(serverData, startedAtMs, analyzeStartedAtMs = 0, awaitingResponse = false, displayHigh = 0) {
+  const base = serverData && typeof serverData === 'object' ? serverData : {}
+  const phase = String(base.phase || '')
+  const startedAt = Number(startedAtMs) || 0
+  const analyzeStartedAt = Number(analyzeStartedAtMs) || 0
+  let serverPercent = Number(base.percent) || 0
+  let label = base.label
+
+  if (awaitingResponse && base.active === false) {
+    serverPercent = Math.max(serverPercent, AI_SCAN_PROGRESS_MAX_FINISHING)
+    label = label || 'Finishing scan…'
+  } else if (!awaitingResponse && base.active === false) {
+    return {
+      ...base,
+      percent: phase === 'error' ? Math.round(Math.max(serverPercent, displayHigh, 1)) : 100,
+      label,
+    }
+  }
+
+  if (phase === 'validating') serverPercent = Math.max(serverPercent, 96)
+
+  const timePercent = startedAt > 0
+    ? estimateAiScanTimePercent(Date.now() - startedAt, analyzeStartedAt)
+    : 0
+  let percent = Math.max(serverPercent, timePercent, displayHigh)
+  if (awaitingResponse) {
+    const activeCap = phase === 'validating'
+      ? AI_SCAN_PROGRESS_MAX_FINISHING
+      : AI_SCAN_PROGRESS_MAX_WHILE_ACTIVE
+    percent = Math.min(percent, activeCap)
+  } else {
+    percent = Math.min(99, percent)
+  }
+
+  return {
+    ...base,
+    active: awaitingResponse ? true : base.active,
+    percent: Math.round(percent),
+    label,
+  }
+}
 
 function aiRecommendAbortSignal() {
   if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
@@ -84,6 +168,20 @@ function aiRecommendAbortSignal() {
 function isAiRequestTimeoutAbort(err) {
   const n = err?.name
   return n === 'AbortError' || n === 'TimeoutError'
+}
+
+function createAiScanId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `scan-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function fetchAiScanProgress(scanId) {
+  const r = await authenticatedFetch(`/api/ai-scan-progress?scanId=${encodeURIComponent(scanId)}`)
+  if (!r.ok) return null
+  const data = await r.json().catch(() => null)
+  return data && typeof data === 'object' ? data : null
 }
 
 async function postAiRecommendNegatives(payload) {
@@ -683,6 +781,7 @@ function NegativeKeywordsPage({
                 }}
                 aiStats={aiStats}
                 aiLoading={aiLoading}
+                aiPromptCap={AI_SEARCH_TERMS_PROMPT_CAP}
                 lastScannedAt={lastScannedAt}
                 onRescan={onRescan}
               />
@@ -709,7 +808,11 @@ function NegativeKeywordsPage({
         )}
 
         {!loading && searchTerms.length > 0 && aiLoading && (
-          <AIScanTablePlaceholder clientName={clientName} />
+          <div className="alert alert-info py-2 px-3 mb-2 small" role="status">
+            AI scan is running in the background. You can review search terms while suggestions load.
+            {' '}The scanner reviews up to <strong>{AI_SEARCH_TERMS_PROMPT_CAP}</strong> queries with the
+            most clicks; lower-click rows stay in the table for manual review.
+          </div>
         )}
 
         {showNoTermsEmpty ? (
@@ -739,7 +842,7 @@ function NegativeKeywordsPage({
           </div>
         ) : null}
 
-        {!loading && searchTerms.length > 0 && !aiLoading && (
+        {!loading && searchTerms.length > 0 && (
           <SearchTermsTable
             searchTerms={searchTerms}
             rowNegatives={rowNegatives}
@@ -796,15 +899,30 @@ function NegativeKeywordsPage({
                 </span>
               </p>
               <p className="mb-2">
-                A quick preview found <strong>{highVolumeModal.rowCount}</strong> search-term row
-                {highVolumeModal.rowCount === 1 ? '' : 's'} with clicks in the sample (there may be
-                more). This range likely reaches <strong>{highVolumeModal.threshold}+</strong>{' '}
-                rows.
+                {highVolumeModal.sampleAtCap ? (
+                  <>
+                    A quick preview sampled <strong>{highVolumeModal.keywordSampleRows}</strong> Search
+                    and <strong>{highVolumeModal.shoppingSampleRows}</strong> Shopping/PMax clicked
+                    rows and hit its sample limit. This range likely has{' '}
+                    <strong>{highVolumeModal.mergeCap}+</strong> rows in Google Ads before sorting
+                    and merging.
+                  </>
+                ) : (
+                  <>
+                    A quick preview found <strong>{highVolumeModal.rowCount}</strong> search-term
+                    row{highVolumeModal.rowCount === 1 ? '' : 's'} with clicks in the sample for
+                    this range.
+                  </>
+                )}
               </p>
-              <p className="mb-0">
+              <p className="mb-2">
                 If you continue, the app loads up to <strong>{highVolumeModal.mergeCap}</strong>{' '}
                 search-term rows with the most clicks in this range. Additional rows in Google Ads
                 are not loaded.
+              </p>
+              <p className="mb-0">
+                AI suggestions use only the top <strong>{highVolumeModal.aiPromptCap}</strong> loaded
+                queries by clicks. Lower-click rows remain for manual review.
               </p>
             </div>
             <div className="website-url-modal-footer">
@@ -953,6 +1071,8 @@ function AuthenticatedApp({ user, onLogout }) {
   const [websiteUrl, setWebsiteUrl] = useState('')
   const [aiStats, setAiStats] = useState(null)
   const [aiLoading, setAiLoading] = useState(false)
+  const [aiScanProgress, setAiScanProgress] = useState(null)
+  const aiScanPollRef = useRef(null)
   const [lastScannedAt, setLastScannedAt] = useState(null)
 
   // Submission history
@@ -979,6 +1099,156 @@ function AuthenticatedApp({ user, onLogout }) {
   /** When set, NegativeKeywordsPage shows the high-volume modal; resolver completes loadSearchTerms’ Promise. */
   const [highVolumeModal, setHighVolumeModal] = useState(null)
   const highVolumeResolveRef = useRef(null)
+  const autoAiScanClientRef = useRef('')
+  const handleAiResultsRef = useRef(() => {})
+  const aiScanStartedAtRef = useRef(0)
+  const aiAnalyzeStartedAtRef = useRef(0)
+  const lastAiScanServerProgressRef = useRef(null)
+  const lastAiScanServerUpdatedAtRef = useRef(0)
+  const aiScanDisplayPercentRef = useRef(0)
+  const aiScanClockTickRef = useRef(null)
+  const aiScanAwaitingResponseRef = useRef(false)
+
+  const publishAiScanProgress = useCallback((serverData) => {
+    const merged = mergeAiScanProgress(
+      serverData,
+      aiScanStartedAtRef.current,
+      aiAnalyzeStartedAtRef.current,
+      aiScanAwaitingResponseRef.current,
+      aiScanDisplayPercentRef.current,
+    )
+    aiScanDisplayPercentRef.current = merged.percent
+    setAiScanProgress(merged)
+    return merged
+  }, [])
+
+  const noteAiScanServerProgress = useCallback((data) => {
+    if (!data || typeof data !== 'object') return false
+    if (data.phase === 'unknown' && data.active === false) return false
+
+    const updatedAt = Number(data.updatedAt) || 0
+    if (
+      updatedAt > 0
+      && lastAiScanServerUpdatedAtRef.current > 0
+      && updatedAt < lastAiScanServerUpdatedAtRef.current
+    ) {
+      return false
+    }
+
+    const prev = lastAiScanServerProgressRef.current
+    if (prev && data.active !== false) {
+      const prevRank = aiScanPhaseRank(prev.phase)
+      const nextRank = aiScanPhaseRank(data.phase)
+      if (nextRank < prevRank) return false
+    }
+
+    if (updatedAt > 0) lastAiScanServerUpdatedAtRef.current = updatedAt
+    const phase = String(data.phase || '')
+    if (
+      (phase === 'analyzing' || phase === 'validating')
+      && !aiAnalyzeStartedAtRef.current
+    ) {
+      aiAnalyzeStartedAtRef.current = Date.now()
+    }
+    lastAiScanServerProgressRef.current = data
+    return true
+  }, [])
+
+  const stopAiScanProgressPoll = useCallback(() => {
+    if (aiScanPollRef.current) {
+      clearTimeout(aiScanPollRef.current)
+      aiScanPollRef.current = null
+    }
+    if (aiScanClockTickRef.current) {
+      clearInterval(aiScanClockTickRef.current)
+      aiScanClockTickRef.current = null
+    }
+    aiScanStartedAtRef.current = 0
+    aiAnalyzeStartedAtRef.current = 0
+    lastAiScanServerProgressRef.current = null
+    lastAiScanServerUpdatedAtRef.current = 0
+    aiScanDisplayPercentRef.current = 0
+  }, [])
+
+  const refreshAiScanProgressFromClock = useCallback(() => {
+    if (!aiScanStartedAtRef.current) return
+    const base = lastAiScanServerProgressRef.current || {
+      active: true,
+      phase: 'starting',
+      percent: 0,
+      label: 'Starting AI scan…',
+    }
+    publishAiScanProgress(base)
+  }, [publishAiScanProgress])
+
+  const startAiScanProgressPoll = useCallback((scanId) => {
+    stopAiScanProgressPoll()
+    aiScanStartedAtRef.current = Date.now()
+    lastAiScanServerProgressRef.current = {
+      active: true,
+      phase: 'starting',
+      percent: 0,
+      label: 'Starting AI scan…',
+    }
+    publishAiScanProgress(lastAiScanServerProgressRef.current)
+    aiScanClockTickRef.current = setInterval(refreshAiScanProgressFromClock, 500)
+    let delayMs = AI_SCAN_PROGRESS_POLL_MS
+    let lastPercent = -1
+
+    const scheduleNextPoll = () => {
+      aiScanPollRef.current = setTimeout(() => {
+        void pollOnce()
+      }, delayMs)
+    }
+
+    const pollOnce = async () => {
+      aiScanPollRef.current = null
+      const data = await fetchAiScanProgress(scanId)
+      if (!data) {
+        scheduleNextPoll()
+        return
+      }
+      if (!noteAiScanServerProgress(data)) {
+        scheduleNextPoll()
+        return
+      }
+      const merged = publishAiScanProgress(data)
+      if (data.active === false && !aiScanAwaitingResponseRef.current) return
+
+      const percent = Number(merged.percent)
+      if (Number.isFinite(percent) && percent !== lastPercent) {
+        lastPercent = percent
+        delayMs = AI_SCAN_PROGRESS_POLL_MS
+      } else {
+        delayMs = Math.min(AI_SCAN_PROGRESS_POLL_MAX_MS, delayMs + 500)
+      }
+      scheduleNextPoll()
+    }
+
+    void pollOnce()
+  }, [noteAiScanServerProgress, publishAiScanProgress, refreshAiScanProgressFromClock, stopAiScanProgressPoll])
+
+  const runAiScan = useCallback(async (payload) => {
+    const scanId = createAiScanId()
+    aiScanAwaitingResponseRef.current = true
+    startAiScanProgressPoll(scanId)
+    try {
+      return await postAiRecommendNegatives({ ...payload, scanId })
+    } finally {
+      aiScanAwaitingResponseRef.current = false
+      stopAiScanProgressPoll()
+      setAiScanProgress({
+        active: false,
+        phase: 'complete',
+        percent: 100,
+        label: 'AI scan complete.',
+      })
+      await new Promise(resolve => setTimeout(resolve, 450))
+      setAiScanProgress(null)
+    }
+  }, [startAiScanProgressPoll, stopAiScanProgressPoll])
+
+  useEffect(() => () => stopAiScanProgressPoll(), [stopAiScanProgressPoll])
 
   const confirmHighVolumeLoad = useCallback(() => {
     setHighVolumeModal(null)
@@ -1036,48 +1306,67 @@ function AuthenticatedApp({ user, onLogout }) {
   // rowNegatives: Map<searchTerm, Set<prefixed-phrase>>
   const rowNegatives = useMemo(() => {
     const map = new Map()
+    const campaignNegatives = new Map()
+    const adGroupNegatives = new Map()
+    const sharedNegativesByCampaign = new Map()
 
-    // Only show a Google chip when the negative is actually in scope for this
-    // row's campaign / ad group — matches what Google Ads actually applies.
-    const negativeAppliesToRow = (neg, term) => {
-      if (typeof neg === 'string') return false
-      const cid = String(term.campaignId || '')
-      const aid = String(term.adGroupId || '')
-      if (neg.source === 'AD_GROUP')   return String(neg.adGroupId || '') === aid
-      if (neg.source === 'CAMPAIGN')   return String(neg.campaignId || '') === cid
-      if (neg.source === 'SHARED_SET') return (neg.appliedCampaignIds || []).map(String).includes(cid)
-      return false
+    for (const existing of existingNegatives) {
+      if (typeof existing === 'string') continue
+      const matchType = convertMatchTypeToText(existing.matchType || 'EXACT')
+      const originalKeyword = existing.keyword
+      if (!originalKeyword) continue
+      const entry = { existing, matchType, originalKeyword }
+      if (existing.source === 'AD_GROUP') {
+        const aid = String(existing.adGroupId || '')
+        if (!aid) continue
+        if (!adGroupNegatives.has(aid)) adGroupNegatives.set(aid, [])
+        adGroupNegatives.get(aid).push(entry)
+      } else if (existing.source === 'CAMPAIGN') {
+        const cid = String(existing.campaignId || '')
+        if (!cid) continue
+        if (!campaignNegatives.has(cid)) campaignNegatives.set(cid, [])
+        campaignNegatives.get(cid).push(entry)
+      } else if (existing.source === 'SHARED_SET') {
+        for (const cid of (existing.appliedCampaignIds || []).map(String)) {
+          if (!cid) continue
+          if (!sharedNegativesByCampaign.has(cid)) sharedNegativesByCampaign.set(cid, [])
+          sharedNegativesByCampaign.get(cid).push(entry)
+        }
+      }
     }
+
+    const pendingMatchers = pendingNegatives
+      .filter(item => item && !item.alreadyInGoogle && item.keyword)
+      .map(item => {
+        const kwLower = item.keyword.toLowerCase()
+        return {
+          source: item.source,
+          keyword: item.keyword,
+          matchType: convertMatchTypeToText(item.matchType),
+          regex: new RegExp(`(?<![a-z0-9])${escapeRegex(kwLower)}(?![a-z0-9])`, 'i'),
+        }
+      })
 
     searchTerms.forEach(term => {
       const termStr = term.searchTerm
       const negatives = new Set()
+      const cid = String(term.campaignId || '')
+      const aid = String(term.adGroupId || '')
+      const googleCandidates = []
+      if (cid && campaignNegatives.has(cid)) googleCandidates.push(...campaignNegatives.get(cid))
+      if (aid && adGroupNegatives.has(aid)) googleCandidates.push(...adGroupNegatives.get(aid))
+      if (cid && sharedNegativesByCampaign.has(cid)) googleCandidates.push(...sharedNegativesByCampaign.get(cid))
 
-      // Check existing Google negatives (text match AND scope match)
-      existingNegatives.forEach(existing => {
-        const matchType = typeof existing === 'string'
-          ? 'EXACT'
-          : convertMatchTypeToText(existing.matchType || 'EXACT')
-        const originalKeyword = typeof existing === 'string' ? existing : existing.keyword
-        if (
-          googleNegativeMatchesSearchQuery(termStr, originalKeyword, matchType) &&
-          negativeAppliesToRow(existing, term)
-        ) {
+      for (const { originalKeyword, matchType } of googleCandidates) {
+        if (googleNegativeMatchesSearchQuery(termStr, originalKeyword, matchType)) {
           negatives.add(`google:${originalKeyword} (${matchType})`)
         }
-      })
+      }
 
-      // Check pending negatives
-      pendingNegatives.forEach(item => {
-        if (item.alreadyInGoogle) return
-        const kwLower = item.keyword.toLowerCase()
-        const escaped = escapeRegex(kwLower)
-        const regex = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i')
-        if (regex.test(termStr)) {
-          const matchType = convertMatchTypeToText(item.matchType)
-          negatives.add(`${item.source}:${item.keyword} (${matchType})`)
-        }
-      })
+      for (const pending of pendingMatchers) {
+        if (!pending.regex.test(termStr)) continue
+        negatives.add(`${pending.source}:${pending.keyword} (${pending.matchType})`)
+      }
 
       if (negatives.size > 0) map.set(termStr, negatives)
     })
@@ -1110,6 +1399,8 @@ function AuthenticatedApp({ user, onLogout }) {
     setManualAddError('')
     setError('')
     setAiLoading(false)
+    stopAiScanProgressPoll()
+    setAiScanProgress(null)
     setSavedWorkRestoreNotice(null)
   }
 
@@ -1137,13 +1428,17 @@ function AuthenticatedApp({ user, onLogout }) {
         const pr = await authenticatedFetch(`/api/search-terms-preview?${q}`)
         const preview = await pr.json().catch(() => ({}))
         if (pr.ok && preview.highVolume) {
-          const thr = preview.threshold ?? 500
+          const thr = preview.threshold ?? SEARCH_TERMS_MERGE_ROW_CAP
           const confirmed = await new Promise(resolve => {
             highVolumeResolveRef.current = resolve
             setHighVolumeModal({
               threshold: thr,
               rowCount: preview.rowCount,
-              mergeCap: preview.mergeCap ?? 500,
+              shoppingSampleRows: preview.shoppingSampleRows ?? 0,
+              keywordSampleRows: preview.keywordSampleRows ?? 0,
+              sampleAtCap: !!preview.sampleAtCap,
+              mergeCap: preview.mergeCap ?? SEARCH_TERMS_MERGE_ROW_CAP,
+              aiPromptCap: preview.aiPromptCap ?? AI_SEARCH_TERMS_PROMPT_CAP,
               startDate: String(start),
               endDate: String(end),
             })
@@ -1200,6 +1495,7 @@ function AuthenticatedApp({ user, onLogout }) {
   }
 
   async function handleClientChange(clientId) {
+    autoAiScanClientRef.current = ''
     setCurrentClientId(clientId)
     resetState()
     if (!clientId) {
@@ -1276,9 +1572,6 @@ function AuthenticatedApp({ user, onLogout }) {
         locationRef.current.pathname !== '/review' &&
         !!String(urlToUse || '').trim() &&
         !hasRestoredPendingFromDb
-      if (willAutoAi) {
-        setAiLoading(true)
-      }
 
       const terms = await loadSearchTerms(
         clientId,
@@ -1316,28 +1609,32 @@ function AuthenticatedApp({ user, onLogout }) {
         return
       }
 
-      if (willAutoAi && (!terms || terms.length === 0)) {
-        setAiLoading(false)
-      }
-
-      // Auto-scan immediately after loading — skip on /review; skip when DB had saved pending work
       if (willAutoAi && urlToUse && terms && terms.length > 0) {
-        try {
-          const result = await postAiRecommendNegatives({
-            searchTerms: terms,
-            websiteUrl: urlToUse.trim(),
-            clientId,
+        const scanClientId = String(clientId)
+        autoAiScanClientRef.current = scanClientId
+        setAiLoading(true)
+        void runAiScan({
+          searchTerms: terms,
+          websiteUrl: urlToUse.trim(),
+          clientId,
+        })
+          .then(result => {
+            if (autoAiScanClientRef.current !== scanClientId) return
+            handleAiResultsRef.current(result)
+            if (!result.scanSkippedDueToBadWebsiteUrl) {
+              setLastScannedAt(new Date())
+            }
           })
-          handleAiResults(result)
-          if (!result.scanSkippedDueToBadWebsiteUrl) {
-            setLastScannedAt(new Date())
-          }
-        } catch (err) {
-          console.error('Auto-scan failed:', err.message)
-          setSubmitError(err.message || 'AI scan failed.')
-        } finally {
-          setAiLoading(false)
-        }
+          .catch(err => {
+            if (autoAiScanClientRef.current !== scanClientId) return
+            console.error('Auto-scan failed:', err.message)
+            setSubmitError(err.message || 'AI scan failed.')
+          })
+          .finally(() => {
+            if (autoAiScanClientRef.current === scanClientId) {
+              setAiLoading(false)
+            }
+          })
       }
     } catch (err) {
       setError('Error loading client data: ' + err.message)
@@ -1462,7 +1759,7 @@ function AuthenticatedApp({ user, onLogout }) {
 
       if (!(shouldRunAi && websiteUrl && terms && terms.length > 0)) return
 
-      const result = await postAiRecommendNegatives({
+      const result = await runAiScan({
         searchTerms: terms,
         websiteUrl: websiteUrl.trim(),
         clientId: currentClientId,
@@ -1733,6 +2030,10 @@ function AuthenticatedApp({ user, onLogout }) {
     )
   }, [existingNegatives, searchTerms, sharedSets, selectedSharedSetId])
 
+  useEffect(() => {
+    handleAiResultsRef.current = handleAiResults
+  }, [handleAiResults])
+
   async function handleCreateSharedSet(name) {
     if (!currentClientId) throw new Error('No client selected')
     const r = await authenticatedFetch('/api/create-shared-set', {
@@ -1755,7 +2056,7 @@ function AuthenticatedApp({ user, onLogout }) {
     setSubmitSuccess('')
     setSubmitError('')
     try {
-      const result = await postAiRecommendNegatives({
+      const result = await runAiScan({
         searchTerms,
         websiteUrl: urlToUse.trim(),
         clientId: currentClientId,
@@ -1804,7 +2105,7 @@ function AuthenticatedApp({ user, onLogout }) {
       if (searchTerms.length > 0) {
         setAiLoading(true)
         try {
-          const result = await postAiRecommendNegatives({
+          const result = await runAiScan({
             searchTerms,
             websiteUrl: tempWebsiteUrl.trim(),
             clientId: pendingClientId,
@@ -1993,7 +2294,7 @@ function AuthenticatedApp({ user, onLogout }) {
       setSubmitSuccess(`Keywords submitted — ${summaryParts.join(' · ')}`)
 
       try {
-        const negRes = await authenticatedFetch(`/api/negative-keywords?clientId=${currentClientId}`)
+        const negRes = await authenticatedFetch(`/api/negative-keywords?clientId=${currentClientId}&refresh=1`)
         if (negRes.ok) {
           const negData = await negRes.json()
           setExistingNegatives(negData['Global Negative Keywords'] || [])
@@ -2151,7 +2452,8 @@ function AuthenticatedApp({ user, onLogout }) {
   }, [aiStats, pendingNegatives])
 
   return (
-    <Routes>
+    <>
+      <Routes>
       <Route path="/" element={<HomePage onNavigate={navigate} user={user} />} />
       <Route path="/negative-keywords" element={
         <NegativeKeywordsPage
@@ -2298,5 +2600,7 @@ function AuthenticatedApp({ user, onLogout }) {
         )
       } />
     </Routes>
+      <AiScanProgressIndicator loading={aiLoading} progress={aiScanProgress} />
+    </>
   )
 }

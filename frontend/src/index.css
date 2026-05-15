@@ -1713,6 +1713,67 @@ body {
   background: rgba(5, 95, 70, 0.1);
 }
 
+.ai-scan-progress-toast {
+  position: fixed;
+  right: max(20px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
+  z-index: 410;
+  width: min(320px, calc(100vw - 40px));
+  padding: 12px 14px;
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  box-shadow:
+    0 10px 40px rgba(0, 0, 0, 0.12),
+    0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.ai-scan-progress-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.ai-scan-progress-icon {
+  color: #2563eb;
+  font-size: 0.95rem;
+}
+
+.ai-scan-progress-title {
+  flex: 1;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.ai-scan-progress-percent {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #2563eb;
+}
+
+.ai-scan-progress-label {
+  margin: 0 0 8px;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: #475569;
+}
+
+.ai-scan-progress-track {
+  height: 6px;
+  overflow: hidden;
+  background: #e2e8f0;
+  border-radius: 999px;
+}
+
+.ai-scan-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #2563eb);
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+
 .submit-success-modal {
   position: relative;
   width: min(520px, calc(100vw - 32px));

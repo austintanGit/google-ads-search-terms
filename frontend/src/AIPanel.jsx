@@ -15,6 +15,7 @@ export default function AIPanel({
   aiLoading,
   lastScannedAt,
   onRescan,
+  aiPromptCap = 500,
 }) {
   const [showSpecificPage, setShowSpecificPage] = useState(false)
   const [specificPageUrl, setSpecificPageUrl] = useState('')
@@ -32,7 +33,8 @@ export default function AIPanel({
           <div className="ai-scanner-text">
             <div className="ai-scanner-title">Negative Keyword Scanner</div>
             <p className="ai-scanner-desc">
-              Go through the negatives, select and submit directly to Google Ads.
+              Go through the negatives, select and submit directly to Google Ads. AI scans the top{' '}
+              {aiPromptCap} queries by clicks when more rows are loaded.
             </p>
             {aiStats?.websiteContextStatus === 'unreadable' && (
               <div className="ai-url-unreadable-banner" role="alert">

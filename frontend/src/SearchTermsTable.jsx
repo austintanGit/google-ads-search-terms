@@ -20,6 +20,8 @@ const ORIGIN_POPOVER_GAP = 8
 const ORIGIN_VIEW_MARGIN = 8
 const ROWS_PER_PAGE_OPTIONS = [5, 10, 25, 'all']
 const ROWS_PER_PAGE_STORAGE_KEY = 'searchTermsRowsPerPage'
+const ROWS_ALL_DISABLE_THRESHOLD = 300
+const ROWS_ALL_CAP = 100
 
 function readStoredRowsPerPage() {
   if (typeof window === 'undefined') return 5
@@ -424,8 +426,11 @@ export default function SearchTermsTable({
     return 2
   }
 
-  // Sort order is captured once per `searchTerms` load only (filters + sort column as they are at that moment).
-  // Uncheck/remove and other pending changes do not re-run this — rows stay fixed (see sortedRows below).
+  const aiPendingSortSignal = useMemo(() => {
+    return (pendingNegatives || []).filter(i => i.source === 'ai' && !i.alreadyInGoogle).length
+  }, [pendingNegatives])
+
+  // Re-freeze when search terms reload or new AI suggestions land (not on every checkbox toggle).
   const frozenRowIndices = useMemo(() => {
     if (!searchTerms.length) return []
     const indexedFiltered = searchTerms
@@ -442,8 +447,8 @@ export default function SearchTermsTable({
       return String(aVal).localeCompare(String(bVal)) * dir
     })
     return sortedIndexed.map(({ index }) => index)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally only when the search-term dataset reloads
-  }, [searchTerms])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreeze on data load + AI suggestion batches
+  }, [searchTerms, aiPendingSortSignal])
 
   const sortedRows = useMemo(() => {
     if (!frozenRowIndices.length) return []
@@ -456,7 +461,13 @@ export default function SearchTermsTable({
       .filter(Boolean)
   }, [searchTerms, frozenRowIndices, searchFilter, campaignFilter, rowNegatives, pendingNegatives])
 
-  const pageSize = rowsPerPage === 'all' ? sortedRows.length : rowsPerPage
+  const rowsPerPageOptions = searchTerms.length > ROWS_ALL_DISABLE_THRESHOLD
+    ? ROWS_PER_PAGE_OPTIONS.filter(option => option !== 'all')
+    : ROWS_PER_PAGE_OPTIONS
+
+  const pageSize = rowsPerPage === 'all'
+    ? Math.min(ROWS_ALL_CAP, sortedRows.length)
+    : rowsPerPage
   const pageCount = pageSize > 0 ? Math.max(1, Math.ceil(sortedRows.length / pageSize)) : 1
   const safeTablePage = clamp(tablePage, 1, pageCount)
   const visibleRowStart = sortedRows.length === 0 ? 0 : (safeTablePage - 1) * pageSize + 1
@@ -468,8 +479,20 @@ export default function SearchTermsTable({
     : sortedRows.slice((safeTablePage - 1) * pageSize, safeTablePage * pageSize)
 
   useEffect(() => {
+    if (searchTerms.length > ROWS_ALL_DISABLE_THRESHOLD && rowsPerPage === 'all') {
+      setRowsPerPage(25)
+      setTablePage(1)
+      try {
+        window.localStorage.setItem(ROWS_PER_PAGE_STORAGE_KEY, '25')
+      } catch {
+        /* ignore quota / private mode */
+      }
+    }
+  }, [searchTerms.length, rowsPerPage])
+
+  useEffect(() => {
     setTablePage(1)
-  }, [searchFilter, campaignFilter, rowsPerPage, searchTerms])
+  }, [searchFilter, campaignFilter, rowsPerPage, searchTerms, aiPendingSortSignal])
 
   useEffect(() => {
     if (safeTablePage !== tablePage) setTablePage(safeTablePage)
@@ -513,6 +536,7 @@ export default function SearchTermsTable({
 
   // Compute problematic keywords: those generating ≥30% of all pending-negative rows
   const problematicKws = useMemo(() => {
+    if (searchTerms.length > ROWS_ALL_DISABLE_THRESHOLD) return new Set()
     const negCountByKw = {}
     searchTerms.forEach(term => {
       const negs = rowNegatives.get(term.searchTerm)
@@ -2023,7 +2047,7 @@ export default function SearchTermsTable({
           <div className="search-terms-rows-options">
             <span className="search-terms-rows-label" id="search-terms-rows-label">Show rows</span>
             <div className="search-terms-rows-buttons" role="group" aria-labelledby="search-terms-rows-label">
-              {ROWS_PER_PAGE_OPTIONS.map(option => (
+              {rowsPerPageOptions.map(option => (
                 <button
                   key={option}
                   type="button"
@@ -2040,7 +2064,9 @@ export default function SearchTermsTable({
             {sortedRows.length === 0
               ? 'No matching rows'
               : rowsPerPage === 'all'
-                ? `Showing all ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`
+                ? sortedRows.length > ROWS_ALL_CAP
+                  ? `Showing first ${ROWS_ALL_CAP} of ${sortedRows.length} rows — filter or use 25 per page`
+                  : `Showing all ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`
                 : `Showing ${visibleRowStart}–${visibleRowEnd} of ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`}
           </span>
           {rowsPerPage !== 'all' && pageCount > 1 ? (
@@ -2084,7 +2110,7 @@ export default function SearchTermsTable({
                 <th
                   className="sortable-th"
                   style={{ cursor: 'default' }}
-                  title="Order is set when search terms load. Use filters above; column click does not re-sort."
+                  title="Order is set when search terms load and when new AI suggestions arrive. Use filters above; column click does not re-sort."
                   onClick={() => handleSort('searchTerm')}
                 >
                   SEARCH TERM <SortIcon col="searchTerm" />
