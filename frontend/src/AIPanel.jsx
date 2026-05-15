@@ -15,7 +15,7 @@ export default function AIPanel({
   aiLoading,
   lastScannedAt,
   onRescan,
-  aiPromptCap = 500,
+  aiPromptCap = 1000,
 }) {
   const [showSpecificPage, setShowSpecificPage] = useState(false)
   const [specificPageUrl, setSpecificPageUrl] = useState('')

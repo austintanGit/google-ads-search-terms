@@ -1,14 +1,27 @@
 module.exports = {
-    apps: [{
-      name: "google-ads-app",
-      script: "app.js",
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: "1G",
-      env_production: {
-        NODE_ENV: "production",
-        PORT: 3000
+    apps: [
+      {
+        name: "google-ads-app",
+        script: "app.js",
+        instances: 1,
+        autorestart: true,
+        watch: false,
+        max_memory_restart: "1G",
+        env_production: {
+          NODE_ENV: "production",
+          PORT: 3000
+        }
+      },
+      {
+        name: "google-ads-ai-worker",
+        script: "ai-worker.js",
+        instances: 1,
+        autorestart: true,
+        watch: false,
+        max_memory_restart: "1G",
+        env_production: {
+          NODE_ENV: "production"
+        }
       }
-    }]
+    ]
   }

@@ -2,3 +2,29 @@ https://ads.google.com/aw/negativekeywordlistdetails?ocid=98788879&ascid=9878887
 
 ./update.sh 3.137.119.68 tmc-search-term.pem
 
+
+Deploy / dev
+Production (PM2):
+
+pm2 restart ecosystem.config.js   # starts both google-ads-app and google-ads-ai-worker
+Local dev:
+
+npm run dev   # api + worker + Vite UI
+Worker only:
+
+npm run start:worker
+
+//--------
+Commands to use next time
+Always run PM2 from the app directory:
+
+cd google-ads-search-terms
+pm2 restart ecosystem.config.js --env production
+pm2 save
+pm2 status
+
+#Or start fresh after a deploy:
+cd google-ads-search-terms
+pm2 stop all
+pm2 start ecosystem.config.js --env production
+pm2 save

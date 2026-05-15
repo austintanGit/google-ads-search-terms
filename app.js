@@ -4,11 +4,10 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { Pool } = require('pg');
 const { GoogleAdsApi } = require('google-ads-api');
-const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const { dbPool } = require('./lib/db-pool');
+const { getAiScanJob, jobRowToProgress } = require('./lib/ai-scan-jobs');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-const cheerio = require('cheerio');
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
 
 function escapeHtml(s) {
@@ -56,8 +55,8 @@ const SEARCH_TERMS_MERGE_ROW_CAP = 2000;
 
 /** Max search terms (by clicks) sent to Bedrock on `/api/ai-recommend-negatives`. */
 function resolveAiSearchTermsPromptCap() {
-    const raw = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '500', 10);
-    return Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), SEARCH_TERMS_MERGE_ROW_CAP) : 500;
+    const raw = parseInt(process.env.AI_SEARCH_TERMS_PROMPT_MAX || '1000', 10);
+    return Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), SEARCH_TERMS_MERGE_ROW_CAP) : 1000;
 }
 
 const GOOGLE_ADS_CACHE_TTL_MS = (() => {
@@ -87,141 +86,23 @@ function invalidateGoogleAdsNegativeKeywordsCache(clientId) {
     googleAdsResponseCache.delete(`negative-keywords:${id}`);
 }
 
-const rawAiScanConcurrent = parseInt(process.env.AI_SCAN_MAX_CONCURRENT || '2', 10);
-const AI_SCAN_MAX_CONCURRENT =
-    Number.isFinite(rawAiScanConcurrent) && rawAiScanConcurrent > 0
-        ? Math.min(Math.floor(rawAiScanConcurrent), 8)
-        : 2;
-let aiScanSlotsInUse = 0;
-const aiScanSlotWaiters = [];
-
-async function acquireAiScanSlot() {
-    if (aiScanSlotsInUse < AI_SCAN_MAX_CONCURRENT) {
-        aiScanSlotsInUse += 1;
-        return;
-    }
-    await new Promise((resolve) => {
-        aiScanSlotWaiters.push(resolve);
-    });
-    aiScanSlotsInUse += 1;
+function assertAiScanJobAccess(job, req) {
+    if (!job) return false;
+    if (req.user?.isSuperUser) return true;
+    const uid = Number(req.user?.userId);
+    if (!Number.isFinite(uid)) return false;
+    return Number(job.user_id) === uid;
 }
 
-function releaseAiScanSlot() {
-    aiScanSlotsInUse = Math.max(0, aiScanSlotsInUse - 1);
-    const next = aiScanSlotWaiters.shift();
-    if (next) next();
+const UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidUuid(value) {
+    return typeof value === 'string' && UUID_RE.test(value.trim());
 }
 
-const AI_SCAN_PROGRESS_TTL_MS = 5 * 60 * 1000;
-const aiScanProgressById = new Map();
-
-function writeAiScanProgress(scanId, payload) {
-    const id = String(scanId || '').trim();
-    if (!id) return;
-    aiScanProgressById.set(id, { ...payload, updatedAt: Date.now() });
-}
-
-function readAiScanProgress(scanId) {
-    const id = String(scanId || '').trim();
-    if (!id) return null;
-    const hit = aiScanProgressById.get(id);
-    if (!hit) return null;
-    if (Date.now() - hit.updatedAt > AI_SCAN_PROGRESS_TTL_MS) {
-        aiScanProgressById.delete(id);
-        return null;
-    }
-    return hit;
-}
-
-function finishAiScanProgress(scanId, payload) {
-    const id = String(scanId || '').trim();
-    if (!id) return;
-    writeAiScanProgress(id, { active: false, ...payload });
-    setTimeout(() => aiScanProgressById.delete(id), 15000);
-}
-
-/** Normalize search text for comparing AI suggestions against account search terms. */
-function normalizeSearchQueryForAi(s) {
-    return String(s || '')
-        .trim()
-        .replace(/\s+/g, ' ')
-        .toLowerCase();
-}
-
-/**
- * Drop sloppy model output: generic junk (rule 3), or pasting an entire multi-word query back as the negative.
- */
-function shouldDropAiNegativeSuggestion(keyword, searchTerms) {
-    const t = typeof keyword === 'string' ? keyword.trim() : '';
-    if (!t) return true;
-    const low = t.toLowerCase();
-    // Rule 3 — never negate generic local intent fluff in the keyword string itself
-    if (/\bnear\s+me\b/.test(low)) return true;
-
-    const wordCount = low.split(/\s+/).filter(Boolean).length;
-    if (wordCount >= 3) {
-        const kn = normalizeSearchQueryForAi(t);
-        if (searchTerms.some((st) => normalizeSearchQueryForAi(st.searchTerm) === kn)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function extractFirstJsonObject(text) {
-    const s = String(text || '');
-    const start = s.indexOf('{');
-    if (start < 0) return null;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < s.length; i++) {
-        const ch = s[i];
-        if (inString) {
-            if (escaped) escaped = false;
-            else if (ch === '\\') escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-        }
-        if (ch === '"') {
-            inString = true;
-            continue;
-        }
-        if (ch === '{') depth++;
-        else if (ch === '}') {
-            depth--;
-            if (depth === 0) return s.slice(start, i + 1);
-        }
-    }
-    return null;
-}
-
-function parseAiRecommendationJson(rawText) {
-    const text = String(rawText || '').trim();
-    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-    try {
-        return JSON.parse(jsonText);
-    } catch (parseErr) {
-        const extracted = extractFirstJsonObject(jsonText) || extractFirstJsonObject(text);
-        if (!extracted) throw parseErr;
-        return JSON.parse(extracted);
-    }
-}
-
-async function invokeBedrockChat(messages, abortSignal) {
-    const command = new InvokeModelCommand({
-        modelId: process.env.BEDROCK_CHAT_MODEL,
-        contentType: 'application/json',
-        accept: 'application/json',
-        body: JSON.stringify({
-            anthropic_version: 'bedrock-2023-05-31',
-            max_tokens: 4096,
-            messages,
-        }),
-    });
-    const bedrockResponse = await bedrockClient.send(command, { abortSignal });
-    const responseBody = JSON.parse(new TextDecoder().decode(bedrockResponse.body));
-    return responseBody.content?.[0]?.text?.trim() ?? '';
+function newScanId() {
+    return crypto.randomUUID();
 }
 
 // Import authentication functions
@@ -279,19 +160,6 @@ function clampExpirationDays(input) {
     if (!Number.isFinite(n) || n <= 0) return REVIEW_DEFAULT_EXPIRY_DAYS;
     return Math.min(REVIEW_MAX_EXPIRY_DAYS, Math.max(1, n));
 }
-
-// PostgreSQL connection pool
-const sslCertPath = process.env.DB_SSL_CERT || '/certs/global-bundle.pem';
-const dbPool = new Pool({
-    host: process.env.DB_HOST,
-    port: parseInt(process.env.DB_PORT || '5432'),
-    database: process.env.DB_NAME || 'postgres',
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD,
-    ssl: fs.existsSync(sslCertPath)
-        ? { rejectUnauthorized: true, ca: fs.readFileSync(sslCertPath).toString() }
-        : { rejectUnauthorized: false }
-});
 
 async function initDB() {
     try {
@@ -428,6 +296,31 @@ async function initDB() {
                 decided_at TIMESTAMP DEFAULT NOW()
             )
         `);
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS ai_scan_jobs (
+                scan_id UUID PRIMARY KEY,
+                user_id INTEGER,
+                client_id VARCHAR(30),
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                phase VARCHAR(30),
+                percent INTEGER DEFAULT 0,
+                label TEXT,
+                chunks_total INTEGER DEFAULT 0,
+                chunks_completed INTEGER DEFAULT 0,
+                payload JSONB NOT NULL,
+                result JSONB,
+                error_message TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ
+            )
+        `);
+        await dbPool.query(`
+            CREATE INDEX IF NOT EXISTS ai_scan_jobs_queue_idx
+            ON ai_scan_jobs (status, created_at)
+            WHERE status IN ('queued', 'running')
+        `);
         
         // Migration: Add new columns if they don't exist
         try {
@@ -518,14 +411,6 @@ async function initDB() {
     }
 }
 initDB();
-
-const bedrockClient = new BedrockRuntimeClient({
-    region: process.env.AWS_REGION,
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-    }
-});
 
 // Retry helper for transient Google Ads API errors (e.g. CONCURRENT_MODIFICATION)
 async function withRetry(fn, maxAttempts = 3, delayMs = 1500) {
@@ -902,6 +787,7 @@ app.use('/api/create-shared-set', authenticateToken);
 app.use('/api/add-to-exclusion-list', authenticateToken);
 app.use('/api/ai-recommend-negatives', authenticateToken);
 app.use('/api/ai-scan-progress', authenticateToken);
+app.use('/api/ai-scan-result', authenticateToken);
 app.use('/api/detect-website', authenticateToken);
 app.use('/api/client-settings', authenticateToken);
 app.use('/api/client-website-url', authenticateToken);
@@ -2461,156 +2347,6 @@ app.post('/api/add-to-exclusion-list', async (req, res) => {
     }
 });
 
-// Keywords that suggest a page is relevant to understanding the business
-const ABOUT_PAGE_KEYWORDS = ['about', 'about-us', 'our-story', 'our-team', 'who-we-are', 'company'];
-
-/** Bounded wait for Bedrock so a hung model call cannot wedge the Express worker indefinitely. */
-function abortAfterMs(ms) {
-    const c = new AbortController();
-    setTimeout(() => c.abort(), ms);
-    return c.signal;
-}
-
-const SCRAPER_BOT_UA = 'Mozilla/5.0 (compatible; GoogleAdsBot/1.0)';
-const SCRAPER_BROWSER_UA =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-/** Sites like CDNs/WAF often return 403 to non-browser UA; retry with Chrome-like headers and log status/errors. */
-async function fetchPage(url, timeoutMs = 9000, logFailures = false) {
-    let lastDiag = '';
-
-    const tryOnce = async (userAgent, label) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        try {
-            const response = await fetch(url, {
-                headers: {
-                    'User-Agent': userAgent,
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                },
-                signal: controller.signal,
-                redirect: 'follow',
-            });
-            if (!response.ok) {
-                lastDiag = `HTTP ${response.status} (${label})`;
-                return null;
-            }
-            return await response.text();
-        } catch (e) {
-            lastDiag = `${e.name === 'AbortError' ? 'timeout' : e.message || e} (${label})`;
-            return null;
-        } finally {
-            clearTimeout(timer);
-        }
-    };
-
-    let html = await tryOnce(SCRAPER_BROWSER_UA, 'browser');
-    if (html) return { html, diagnostic: null };
-
-    html = await tryOnce(SCRAPER_BOT_UA, 'bot');
-    if (html) return { html, diagnostic: null };
-
-    const diagnostic = lastDiag || 'unknown error';
-    if (logFailures) {
-        console.log(`[Scraper] Fetch failed ${url} — ${diagnostic}`);
-    }
-    return { html: null, diagnostic };
-}
-
-function extractPageContent($, maxBodyChars = 800) {
-    $('script, style, noscript, nav, footer, header').remove();
-    return {
-        h1s: $('h1').map((_, el) => $(el).text().trim()).get().filter(Boolean).slice(0, 4),
-        h2s: $('h2').map((_, el) => $(el).text().trim()).get().filter(Boolean).slice(0, 6),
-        bodyText: $('body').text().replace(/\s+/g, ' ').trim().slice(0, maxBodyChars)
-    };
-}
-
-function pickRelevantLinks($, baseUrl, limit = 1) {
-    const base = new URL(baseUrl);
-    const seen = new Set();
-    const picked = [];
-
-    $('a[href]').each((_, el) => {
-        if (picked.length >= limit) return;
-        try {
-            const href = $(el).attr('href');
-            const resolved = new URL(href, base);
-            // Same domain only, no anchors/query strings
-            if (resolved.hostname !== base.hostname) return;
-            const clean = resolved.origin + resolved.pathname.replace(/\/$/, '');
-            if (clean === base.origin + base.pathname.replace(/\/$/, '')) return;
-            if (seen.has(clean)) return;
-            const pathLower = resolved.pathname.toLowerCase();
-            // Only allow "About" style pages so crawl scope stays small and predictable.
-            if (ABOUT_PAGE_KEYWORDS.some(kw => pathLower.includes(kw))) {
-                seen.add(clean);
-                picked.push(clean);
-            }
-        } catch {}
-    });
-
-    return picked;
-}
-
-/**
- * @returns {{ scraped: object | null, homepageDiagnostic: string | null }}
- */
-async function scrapeWebsiteContext(url) {
-    console.log(`[Scraper] Starting scrape for: ${url}`);
-    try {
-        const homeFetch = await fetchPage(url, 9000, true);
-        if (!homeFetch.html) {
-            console.log(
-                `[Scraper] Homepage not readable (blocked, TLS, robots, timeout, etc.). Continuing with search terms only: ${url}`,
-            );
-            return {
-                scraped: null,
-                homepageDiagnostic: homeFetch.diagnostic || 'Could not load homepage (bad URL, 404/403, or blocked).',
-            };
-        }
-
-        const $home = cheerio.load(homeFetch.html);
-        const title = $home('title').text().trim();
-        const metaDesc = $home('meta[name="description"]').attr('content') || '';
-        const homeContent = extractPageContent($home, 1000);
-
-        // Fetch homepage + at most one About page.
-        const relevantLinks = pickRelevantLinks($home, url, 1);
-        console.log(`[Scraper] Homepage: ${url}`);
-        console.log(`[Scraper] Relevant pages found: ${relevantLinks.length > 0 ? relevantLinks.join(', ') : 'none'}`);
-        const extraPages = await Promise.all(
-            relevantLinks.map(async link => {
-                const res = await fetchPage(link, 9000, true);
-                if (!res.html) { console.log(`[Scraper] Skipping unreadable linked page: ${link}`); return null; }
-                console.log(`[Scraper] Fetched: ${link}`);
-                const $ = cheerio.load(res.html);
-                const content = extractPageContent($, 600);
-                return { url: link, ...content };
-            })
-        );
-
-        return {
-            scraped: {
-                title: $home('title').text().trim(),
-                metaDesc,
-                pages: [
-                    { url, ...homeContent },
-                    ...extraPages.filter(Boolean)
-                ],
-            },
-            homepageDiagnostic: null,
-        };
-    } catch (err) {
-        console.log(`[Scraper] Error scraping ${url}:`, err.message);
-        return {
-            scraped: null,
-            homepageDiagnostic: err.message || 'Unexpected error while reading the site.',
-        };
-    }
-}
-
 async function loadGoogleNegativeKeywordTexts(clientId) {
     const id = String(clientId || '').trim();
     if (!id) return new Set();
@@ -2655,23 +2391,16 @@ async function loadGoogleNegativeKeywordTexts(clientId) {
 }
 
 app.post('/api/ai-recommend-negatives', async (req, res) => {
-    const scanId = typeof req.body?.scanId === 'string' ? req.body.scanId.trim() : '';
-    const touchProgress = (phase, percent, label) => {
-        if (!scanId) return;
-        writeAiScanProgress(scanId, { active: true, phase, percent, label });
-    };
-
-    touchProgress('queued', 4, 'Waiting for an available scan slot…');
-    await acquireAiScanSlot();
     try {
         const { searchTerms, websiteUrl, clientId } = req.body;
+        const clientScanId =
+            typeof req.body?.scanId === 'string' ? req.body.scanId.trim() : '';
 
         if (!searchTerms || !searchTerms.length) {
-            finishAiScanProgress(scanId, { phase: 'error', percent: 100, label: 'Search terms are required.' });
             return res.status(400).json({ error: 'Search terms are required' });
         }
 
-        touchProgress('preparing', 10, 'Preparing search terms for analysis…');
+        const scanId = isValidUuid(clientScanId) ? clientScanId : newScanId();
 
         const accountTermCount = searchTerms.length;
         const promptMax = resolveAiSearchTermsPromptCap();
@@ -2680,16 +2409,13 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
             .slice(0, promptMax);
         if (accountTermCount > termsForPrompt.length) {
             console.log(
-                `[AI] Prompt uses top ${termsForPrompt.length} of ${accountTermCount} search terms by clicks (cap=${promptMax})`
+                `[AI] Job uses top ${termsForPrompt.length} of ${accountTermCount} search terms by clicks (cap=${promptMax})`,
             );
         }
 
-        /** @type {Set<string>} Lowercased keywords the user already dismissed as AI suggestions */
-        let rejectedNormalized = new Set();
-        /** @type {Set<string>} Lowercased negatives already in Google Ads */
-        let googleNegativeTexts = new Set();
+        let rejectedNormalized = [];
+        let googleNegativeTexts = [];
         if (clientId && String(clientId).trim()) {
-            touchProgress('exclusions', 18, 'Loading account exclusions…');
             const cid = String(clientId).trim();
             try {
                 const [rej, negTexts] = await Promise.all([
@@ -2699,250 +2425,99 @@ app.post('/api/ai-recommend-negatives', async (req, res) => {
                     ),
                     loadGoogleNegativeKeywordTexts(cid),
                 ]);
-                rejectedNormalized = new Set(rej.rows.map((r) => r.keyword_normalized));
-                googleNegativeTexts = negTexts;
+                rejectedNormalized = rej.rows.map((r) => r.keyword_normalized);
+                googleNegativeTexts = [...negTexts];
             } catch (rejErr) {
                 console.error('Error loading AI exclusions:', rejErr);
             }
         }
 
-        const searchTermsTable = termsForPrompt
-            .map((st, i) =>
-                `${i + 1}. ${st.searchTerm} | Clicks: ${st.clicks} | Conversions: ${st.conversions} | Campaign: ${st.campaign}`
-            )
-            .join('\n');
+        const payload = {
+            termsForPrompt,
+            websiteUrl: typeof websiteUrl === 'string' ? websiteUrl.trim() : '',
+            accountTermCount,
+            rejectedNormalized,
+            googleNegativeTexts,
+        };
 
-        // Scrape website for richer context (cap wait so unreachable sites never block AI too long)
-        let websiteContext = `Website URL: ${websiteUrl || 'Not provided'}`;
-        const websiteUrlTrim = typeof websiteUrl === 'string' ? websiteUrl.trim() : '';
-        let websiteContextStatus = websiteUrlTrim ? 'unreadable' : 'no_url';
-        let websiteFetchDetail = websiteUrlTrim
-            ? 'We could not load this URL. Save a working homepage URL before scanning.'
-            : null;
+        const userId = Number(req.user?.userId) || null;
+        const clientIdStr = clientId ? String(clientId).trim() : null;
 
-        if (websiteUrlTrim) {
-            touchProgress('scraping', 32, 'Scanning website for context…');
-            const trimUrl = websiteUrlTrim;
-            const scrapeTimeoutMs = 42000;
-            const timedOutPayload = Object.freeze({
-                scraped: null,
-                homepageDiagnostic: `Site scan timed out after ${scrapeTimeoutMs / 1000}s (server very slow or blocking).`,
-            });
-            const { scraped, homepageDiagnostic } = await Promise.race([
-                scrapeWebsiteContext(trimUrl),
-                new Promise((resolve) => setTimeout(() => resolve(timedOutPayload), scrapeTimeoutMs)),
-            ]);
-
-            if (scraped) {
-                websiteContextStatus = 'ok';
-                websiteFetchDetail = null;
-                const pagesText = scraped.pages.map(p => {
-                    const lines = [`[Page: ${p.url}]`];
-                    if (p.h1s.length) lines.push(`H1: ${p.h1s.join(' | ')}`);
-                    if (p.h2s.length) lines.push(`H2: ${p.h2s.join(' | ')}`);
-                    if (p.bodyText) lines.push(`Content: ${p.bodyText}`);
-                    return lines.join('\n');
-                }).join('\n\n');
-
-                websiteContext = `Website URL: ${trimUrl}
-Page Title: ${scraped.title}
-Meta Description: ${scraped.metaDesc}
-
-Scanned Pages (${scraped.pages.length}):
-${pagesText}`;
-            } else {
-                websiteContextStatus = 'unreadable';
-                websiteFetchDetail =
-                    homepageDiagnostic ||
-                    'We could not load this URL (bad link, empty page, 404/403, SSL, firewall, etc.). Save a working homepage URL, then scan again.';
-                websiteContext = `Website URL: ${trimUrl}
-Automated homepage fetch failed (${websiteFetchDetail}). No page body is available — use ONLY the search terms below.`;
-            }
-        }
-
-        const hasWebsiteContent = websiteContextStatus === 'ok';
-        const websitePrelude = hasWebsiteContent
-            ? `BEFORE YOU BEGIN — SCAN THE WEBSITE:
-Before evaluating any search terms, read the provided website content to understand:
-- Every product and service this business offers
-- What geographic area(s) they serve, if any
-- Use this as the foundation for every decision below`
-            : `WEBSITE CONTEXT UNAVAILABLE:
-The automated homepage fetch failed. You have no page content — rely ONLY on the search terms below. Do not infer services, geography, or core industry themes from the domain or URL alone. Prefer fewer negatives.`;
-
-        const geoRule = hasWebsiteContent
-            ? `1. GEOGRAPHIC TERMS: If the business serves a specific local or regional area, add out-of-area location words as negatives. Extract only the location word, not the full phrase. If the business serves nationally or the area is unclear, skip geographic terms.`
-            : `1. GEOGRAPHIC TERMS: Skip geographic negatives unless the query clearly signals wrong-location intent without website proof. When unsure, omit.`;
-
-        const industryRule = hasWebsiteContent
-            ? `2. NEVER add the business's own core industry terms as negatives (themes and role words that describe what paying customers actually search for to find this firm — analogous to \"marketing\"/\"agency\" for a marketer). If the site offers that service or audience, omit.`
-            : `2. NEVER add broad industry or service role words as negatives unless the query unmistakably signals job-seeking, DIY, unrelated trade, or a competitor — you cannot verify core offerings without the site.`;
-
-        const intentRule = hasWebsiteContent
-            ? `5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking (\"careers\", \"jobs\", \"hiring\"), DIY/free intent (\"free\", \"template\", \"diy\") when unrelated, or irrelevant proper nouns — not mainstream ways of asking for services the website clearly provides.`
-            : `5. Flag words that clearly signal wrong intent: competitor brand names, unrelated industries, job-seeking (\"careers\", \"jobs\", \"hiring\"), DIY/free intent (\"free\", \"template\", \"diy\") when unrelated, or irrelevant proper nouns. When intent is ambiguous, omit.`;
-
-        const uniqueWords = [
-            ...new Set([
-                // Individual words
-                ...termsForPrompt.flatMap(st => st.searchTerm.toLowerCase().split(/\s+/)),
-                // Full search term phrases (so AI can return multi-word negatives)
-                ...termsForPrompt.map(st => st.searchTerm.toLowerCase()),
-            ])
-        ].join(', ');
-
-        const rejectedPromptBlock =
-            rejectedNormalized.size === 0
-                ? ''
-                : `
-USER-REJECTED AI SUGGESTIONS — never include any of these in negativeKeywords (the account owner already dismissed them), even if they appear in the search terms:
-${[...rejectedNormalized].sort().join(', ')}
-
-`;
-
-        const scopeNote =
-            accountTermCount > termsForPrompt.length
-                ? `SCOPE: This account has ${accountTermCount} search queries with clicks in the period. You are given only the ${termsForPrompt.length} highest-click queries below. Every negative MUST appear verbatim in that list — do not assume anything about queries not shown.\n\n`
-                : '';
-
-        const prompt = `You are a Google Ads specialist helping identify negative keywords to add to a campaign.
-
-Your job is to find words or phrases that signal a search is NOT from a potential customer of this business. Prefer precision over recall: when intent is ambiguous, do NOT include the term as a negative (avoid costing real leads).
-
-${websitePrelude}
-
-RULES:
-${geoRule}
-${industryRule}
-3. NEVER add generic descriptors as negatives inside your returned strings — not even inside a multi-word suggestion (e.g. never output a keyword that contains the phrase \"near me\", \"best \", \"top \", standalone \"cheap\", standalone \"reviews\", standalone \"firm\", standalone \"services\", standalone \"company\", standalone \"local\"). Extract the real offending signal (competitor, wrong city, job-seeking token, unrelated niche token) instead, or omit.
-4. DATA ONLY: Every keyword you return MUST be a word or phrase that appears verbatim in the search terms list below. Do NOT invent negatives.
-${intentRule}
-6. EXTRACTION RULE — always extract the smallest offending unit. Almost NEVER paste an entire multi-word search query back as one negative phrase (that destroys good traffic unless the ENTIRE query is verbatim a competitor or an unrelated tangent). Strip down to competitor brand, wrong geo token, franchise, salaries, unrelated product, etc.
-   - Competitor name in a phrase → extract only the competitor name
-   - Out-of-area location in a phrase → extract only the location word
-   - Examples:
-     - \"mobile fuel delivery franchise\" → \"franchise\"
-     - \"John Ford Plumbing Company\" → \"John Ford\"
-     - \"best Chicago plumber near me\" (local Columbus business) → \"Chicago\" (do not negate \"near me\" or generic praise words)
-7. COMPETITORS: Identify competitor brand names in the search terms using your industry knowledge and add them as negatives (smallest unmistakable substring that appears verbatim in the query).
-8. When in doubt, leave it OUT of negativeKeywords entirely.
-${rejectedPromptBlock}
-${websiteContext}
-
-${scopeNote}Search Terms (format: term | clicks | conversions | campaign):
-${searchTermsTable}
-
-Every unique word present across all search terms (your negatives MUST come only from this set):
-${uniqueWords}
-
-FINAL CHECK before writing JSON:
-- Does each keyword appear word-for-word in the search terms list? If NO, remove it.
-- Is this suggestion literally the FULL text of some search-query line without a disqualifier (jobs, unrelated trade, competitor, wrong city, etc.)? If YES, remove it — shorten to smallest offending substring or omit.
-
-OUTPUT FORMAT (required): Return exactly one JSON object. No markdown fences, preamble, or closing commentary.
-{
-  "negativeKeywords": ["keyword1", "keyword2"],
-  "summary": {
-    "totalSearchTerms": 0,
-    "negativeCount": 0,
-    "qualityPercentage": 0
-  },
-  "explanation": "Brief summary of your analysis. If one keyword (in the 'triggered by keyword' column) is responsible for generating 30% or more of the total recommended negative keywords, explicitly call it out in this explanation and recommend tightening its match type."
-}`;
-
-        const bedrockAbort = abortAfterMs(120000);
-        touchProgress('analyzing', 55, 'Analyzing search terms with AI…');
-        const rawText = await invokeBedrockChat([{ role: 'user', content: prompt }], bedrockAbort);
-        let parsed;
-        try {
-            parsed = parseAiRecommendationJson(rawText);
-        } catch (parseErr) {
-            console.warn('[AI] Bedrock returned non-JSON; retrying once.', rawText.slice(0, 500));
-            touchProgress('analyzing', 72, 'Retrying AI response…');
-            const retryText = await invokeBedrockChat(
-                [{
-                    role: 'user',
-                    content: `${prompt}\n\nCRITICAL: Your entire reply must be one JSON object only. No analysis, markdown, or text outside the JSON.`,
-                }],
-                bedrockAbort,
-            );
-            try {
-                parsed = parseAiRecommendationJson(retryText);
-            } catch (retryErr) {
-                console.warn('[AI] Bedrock retry still non-JSON:', retryText.slice(0, 500));
-                throw retryErr;
-            }
-        }
-
-        // Hard filter: remove any keyword the AI invented that isn't present in the actual search terms
-        touchProgress('validating', 96, 'Validating AI suggestions…');
-        const sourcesMap = {};
-        parsed.negativeKeywords = (parsed.negativeKeywords || []).filter(kw => {
-            const kwLower = kw.toLowerCase().trim();
-            const escaped = kwLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i');
-            const matches = termsForPrompt.filter(st => re.test(st.searchTerm.toLowerCase())).map(st => st.searchTerm);
-            sourcesMap[kw] = matches;
-            return matches.length > 0;
-        });
-        parsed.negativeKeywords = parsed.negativeKeywords.filter(
-            kw => !shouldDropAiNegativeSuggestion(kw, termsForPrompt)
+        await dbPool.query(
+            `INSERT INTO ai_scan_jobs (
+                scan_id, user_id, client_id, status, phase, percent, label,
+                chunks_total, chunks_completed, payload
+            ) VALUES ($1, $2, $3, 'queued', 'queued', 4, $4, 0, 0, $5::jsonb)`,
+            [
+                scanId,
+                userId,
+                clientIdStr,
+                'Waiting in queue…',
+                JSON.stringify(payload),
+            ],
         );
-        parsed.negativeKeywords = parsed.negativeKeywords.filter((kw) => {
-            const n = kw.toLowerCase().trim();
-            return !rejectedNormalized.has(n) && !googleNegativeTexts.has(n);
-        });
-        for (const k of Object.keys(sourcesMap)) {
-            if (!parsed.negativeKeywords.includes(k)) delete sourcesMap[k];
-        }
-        parsed.negativeKeywordSources = sourcesMap;
 
-        // Recalculate summary counts based on validated keywords (LLM only saw top-N by clicks)
-        if (parsed.summary) {
-            parsed.summary.totalSearchTerms = termsForPrompt.length;
-            if (accountTermCount > termsForPrompt.length) {
-                parsed.summary.totalSearchTermsInAccount = accountTermCount;
-            }
-            parsed.summary.negativeCount = parsed.negativeKeywords.length;
-            parsed.summary.qualityPercentage = parsed.summary.totalSearchTerms > 0
-                ? Math.round(((parsed.summary.totalSearchTerms - parsed.negativeKeywords.length) / parsed.summary.totalSearchTerms) * 100)
-                : 100;
-        }
-
-        parsed.websiteContextStatus = websiteContextStatus;
-        parsed.websiteFetchDetail = websiteFetchDetail;
-
-        finishAiScanProgress(scanId, { phase: 'complete', percent: 100, label: 'AI scan complete.' });
-        res.json(parsed);
+        return res.status(202).json({ scanId, status: 'queued' });
     } catch (error) {
-        console.error('Error calling Bedrock:', error);
-        const aborted =
-            error.name === 'AbortError' ||
-            /abort/i.test(String(error.message || '')) ||
-            /timeout/i.test(String(error.message || ''));
-        const details = aborted
-            ? 'Bedrock analysis timed out. The site scrape may have been slow; try again or use a lighter homepage URL.'
-            : error.message;
-        finishAiScanProgress(scanId, { phase: 'error', percent: 100, label: details || 'AI scan failed.' });
-        res.status(500).json({
-            error: 'Failed to get AI recommendations',
-            details,
+        console.error('Error enqueueing AI scan:', error);
+        return res.status(500).json({
+            error: 'Failed to start AI scan',
+            details: error.message,
         });
-    } finally {
-        releaseAiScanSlot();
     }
 });
 
-app.get('/api/ai-scan-progress', (req, res) => {
+app.get('/api/ai-scan-progress', async (req, res) => {
     const scanId = typeof req.query.scanId === 'string' ? req.query.scanId.trim() : '';
     if (!scanId) {
         return res.status(400).json({ error: 'scanId is required' });
     }
-    const hit = readAiScanProgress(scanId);
-    if (!hit) {
-        return res.json({ active: false, phase: 'unknown', percent: 0, label: 'Waiting for scan…' });
+    try {
+        const job = await getAiScanJob(dbPool, scanId);
+        if (!job) {
+            return res.json({ active: false, phase: 'unknown', percent: 0, label: 'Waiting for scan…' });
+        }
+        if (!assertAiScanJobAccess(job, req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        return res.json(jobRowToProgress(job));
+    } catch (error) {
+        console.error('Error reading AI scan progress:', error);
+        return res.status(500).json({ error: 'Failed to read scan progress' });
     }
-    return res.json(hit);
+});
+
+app.get('/api/ai-scan-result', async (req, res) => {
+    const scanId = typeof req.query.scanId === 'string' ? req.query.scanId.trim() : '';
+    if (!scanId) {
+        return res.status(400).json({ error: 'scanId is required' });
+    }
+    try {
+        const job = await getAiScanJob(dbPool, scanId);
+        if (!job) {
+            return res.status(404).json({ error: 'Scan not found' });
+        }
+        if (!assertAiScanJobAccess(job, req)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        if (job.status === 'error') {
+            return res.status(500).json({
+                error: 'AI scan failed',
+                details: job.error_message || job.label || 'AI scan failed.',
+            });
+        }
+        if (!job.result) {
+            return res.status(204).end();
+        }
+        const result = typeof job.result === 'object' ? job.result : JSON.parse(job.result);
+        return res.json({
+            ...result,
+            partial: job.status !== 'complete',
+        });
+    } catch (error) {
+        console.error('Error reading AI scan result:', error);
+        return res.status(500).json({ error: 'Failed to read scan result' });
+    }
 });
 
 // Auto-detect website URL from the client's ads

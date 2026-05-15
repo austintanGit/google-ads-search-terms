@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "dev": "concurrently \"nodemon app.js\" \"cd frontend && npm run dev\" --names \"api,ui\" --prefix-colors \"cyan,magenta\"",
+    "dev": "concurrently \"nodemon app.js\" \"nodemon ai-worker.js\" \"cd frontend && npm run dev\" --names \"api,worker,ui\" --prefix-colors \"cyan,yellow,magenta\"",
     "start": "node app.js",
+    "start:worker": "node ai-worker.js",
     "build": "cd frontend && npm run build",
     "build:frontend": "cd frontend && npm run build",
     "dev:frontend": "cd frontend && npm run dev",

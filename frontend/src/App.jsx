@@ -70,10 +70,11 @@ const authenticatedFetch = (url, options = {}) => {
 };
 
 /** Server may scrape pages + Bedrock — cap wait so a dead 404/host never locks the analyser spinner. */
-const AI_RECOMMEND_TIMEOUT_MS = 150000
+/** Wall-clock poll budget for async scan (1000 terms ≈ 20 Bedrock batches). Override via build/env if needed. */
+const AI_RECOMMEND_TIMEOUT_MS = 1200000
 /** Fallback when preview API omits caps (keep aligned with `app.js`). */
 const SEARCH_TERMS_MERGE_ROW_CAP = 2000
-const AI_SEARCH_TERMS_PROMPT_CAP = 500
+const AI_SEARCH_TERMS_PROMPT_CAP = 1000
 const AI_SCAN_PROGRESS_POLL_MS = 1500
 const AI_SCAN_PROGRESS_POLL_MAX_MS = 4000
 /** Rough wall-clock budget for a scan; used to smooth the progress bar (32% pre-AI, 68% AI). */
@@ -156,25 +157,20 @@ function mergeAiScanProgress(serverData, startedAtMs, analyzeStartedAtMs = 0, aw
   }
 }
 
-function aiRecommendAbortSignal() {
-  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-    return AbortSignal.timeout(AI_RECOMMEND_TIMEOUT_MS)
-  }
-  const ctrl = new AbortController()
-  setTimeout(() => ctrl.abort(), AI_RECOMMEND_TIMEOUT_MS)
-  return ctrl.signal
-}
-
-function isAiRequestTimeoutAbort(err) {
-  const n = err?.name
-  return n === 'AbortError' || n === 'TimeoutError'
-}
-
+/** RFC4122 v4 — works on HTTP (crypto.randomUUID needs a secure context). */
 function createAiScanId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
+    try {
+      return crypto.randomUUID()
+    } catch {
+      /* non-secure context */
+    }
   }
-  return `scan-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
 }
 
 async function fetchAiScanProgress(scanId) {
@@ -184,22 +180,39 @@ async function fetchAiScanProgress(scanId) {
   return data && typeof data === 'object' ? data : null
 }
 
-async function postAiRecommendNegatives(payload) {
+async function fetchAiScanResult(scanId) {
+  const r = await authenticatedFetch(`/api/ai-scan-result?scanId=${encodeURIComponent(scanId)}`)
+  if (r.status === 204) return null
+  if (!r.ok) {
+    let msg = `AI scan failed (${r.status})`
+    try {
+      const d = await r.json()
+      msg = d.details || d.error || msg
+    } catch {
+      /* keep msg */
+    }
+    throw new Error(msg)
+  }
+  const data = await r.json().catch(() => null)
+  return data && typeof data === 'object' ? data : null
+}
+
+async function enqueueAiScan(payload) {
   let r
   try {
     r = await authenticatedFetch('/api/ai-recommend-negatives', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: aiRecommendAbortSignal(),
     })
   } catch (err) {
-    if (isAiRequestTimeoutAbort(err)) {
-      throw new Error(
-        'AI scan timed out. The client site may be down, very slow to load, or the model took too long. Try Re-scan, fix the URL, or continue without AI.',
-      )
-    }
     throw new Error(err.message || 'Could not reach the AI scan server.')
+  }
+  if (r.status === 202) {
+    const data = await r.json().catch(() => ({}))
+    const scanId = data.scanId || payload.scanId
+    if (!scanId) throw new Error('AI scan started but no scan id was returned.')
+    return { scanId, status: data.status || 'queued' }
   }
   if (!r.ok) {
     let msg = `AI scan failed (${r.status})`
@@ -212,6 +225,10 @@ async function postAiRecommendNegatives(payload) {
     throw new Error(msg)
   }
   return r.json()
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
@@ -1181,7 +1198,7 @@ function AuthenticatedApp({ user, onLogout }) {
     publishAiScanProgress(base)
   }, [publishAiScanProgress])
 
-  const startAiScanProgressPoll = useCallback((scanId) => {
+  const startAiScanProgressPoll = useCallback((scanId, pollHandlers) => {
     stopAiScanProgressPoll()
     aiScanStartedAtRef.current = Date.now()
     lastAiScanServerProgressRef.current = {
@@ -1194,6 +1211,7 @@ function AuthenticatedApp({ user, onLogout }) {
     aiScanClockTickRef.current = setInterval(refreshAiScanProgressFromClock, 500)
     let delayMs = AI_SCAN_PROGRESS_POLL_MS
     let lastPercent = -1
+    let lastChunksCompleted = 0
 
     const scheduleNextPoll = () => {
       aiScanPollRef.current = setTimeout(() => {
@@ -1203,6 +1221,15 @@ function AuthenticatedApp({ user, onLogout }) {
 
     const pollOnce = async () => {
       aiScanPollRef.current = null
+      if (Date.now() - aiScanStartedAtRef.current > AI_RECOMMEND_TIMEOUT_MS) {
+        pollHandlers?.onError?.(
+          new Error(
+            'AI scan timed out. The client site may be down, very slow to load, or the model took too long. Try Re-scan, fix the URL, or continue without AI.',
+          ),
+        )
+        return
+      }
+
       const data = await fetchAiScanProgress(scanId)
       if (!data) {
         scheduleNextPoll()
@@ -1213,7 +1240,33 @@ function AuthenticatedApp({ user, onLogout }) {
         return
       }
       const merged = publishAiScanProgress(data)
-      if (data.active === false && !aiScanAwaitingResponseRef.current) return
+
+      const chunksCompleted = Number(data.chunksCompleted) || 0
+      if (chunksCompleted > lastChunksCompleted) {
+        lastChunksCompleted = chunksCompleted
+        try {
+          const partial = await fetchAiScanResult(scanId)
+          if (partial) pollHandlers?.onResult?.(partial)
+        } catch (err) {
+          pollHandlers?.onError?.(err)
+          return
+        }
+      }
+
+      const status = String(data.status || '')
+      if (status === 'error' || (data.active === false && data.phase === 'error')) {
+        pollHandlers?.onError?.(new Error(data.label || 'AI scan failed.'))
+        return
+      }
+      if (status === 'complete' || (data.active === false && data.phase === 'complete')) {
+        try {
+          const finalResult = await fetchAiScanResult(scanId)
+          pollHandlers?.onComplete?.(finalResult)
+        } catch (err) {
+          pollHandlers?.onError?.(err)
+        }
+        return
+      }
 
       const percent = Number(merged.percent)
       if (Number.isFinite(percent) && percent !== lastPercent) {
@@ -1229,11 +1282,29 @@ function AuthenticatedApp({ user, onLogout }) {
   }, [noteAiScanServerProgress, publishAiScanProgress, refreshAiScanProgressFromClock, stopAiScanProgressPoll])
 
   const runAiScan = useCallback(async (payload) => {
-    const scanId = createAiScanId()
     aiScanAwaitingResponseRef.current = true
-    startAiScanProgressPoll(scanId)
+    let lastResult = null
+
     try {
-      return await postAiRecommendNegatives({ ...payload, scanId })
+      const { scanId } = await enqueueAiScan({
+        ...payload,
+        scanId: createAiScanId(),
+      })
+
+      return await new Promise((resolve, reject) => {
+        startAiScanProgressPoll(scanId, {
+          onResult: (result) => {
+            lastResult = result
+            handleAiResultsRef.current(result)
+          },
+          onComplete: (finalResult) => {
+            resolve(finalResult || lastResult)
+          },
+          onError: (err) => {
+            reject(err)
+          },
+        })
+      })
     } finally {
       aiScanAwaitingResponseRef.current = false
       stopAiScanProgressPoll()
@@ -1243,7 +1314,7 @@ function AuthenticatedApp({ user, onLogout }) {
         percent: 100,
         label: 'AI scan complete.',
       })
-      await new Promise(resolve => setTimeout(resolve, 450))
+      await sleepMs(450)
       setAiScanProgress(null)
     }
   }, [startAiScanProgressPoll, stopAiScanProgressPoll])

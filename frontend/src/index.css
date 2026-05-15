@@ -821,7 +821,7 @@ body {
 }
 
 .col-destination {
-  width: 190px;
+  width: 148px;
   vertical-align: middle;
 }
 
@@ -1465,7 +1465,29 @@ body {
 .destination-cell {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  min-width: 0;
+  max-width: 148px;
+}
+
+.destination-cell .matchtype-select {
+  font-size: 0.68rem;
+  padding: 2px 5px;
+  padding-right: 18px;
+  line-height: 1.25;
+  border-radius: 3px;
+  background-position: right 5px center;
+  background-size: 8px 5px;
+  font-weight: 500;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.destination-cell .dest-select-campaign,
+.destination-cell .dest-select-adgroup,
+.destination-cell .dest-select-list {
+  font-weight: 500;
 }
 
 .inline-list-picker {
@@ -1496,6 +1518,10 @@ body {
   flex: none;
   width: 100%;
   max-width: 100%;
+}
+
+.destination-cell .list-picker-controls-solo .matchtype-select {
+  min-width: 0;
 }
 
 /* Simple text display for keyword details */
@@ -1720,13 +1746,13 @@ body {
   z-index: 410;
   width: min(320px, calc(100vw - 40px));
   padding: 12px 14px;
-  background: #ffffff;
-  color: #0f172a;
-  border: 1px solid #dbeafe;
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #334155;
   border-radius: 10px;
   box-shadow:
-    0 10px 40px rgba(0, 0, 0, 0.12),
-    0 2px 8px rgba(0, 0, 0, 0.06);
+    0 12px 40px rgba(15, 23, 42, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.25);
 }
 
 .ai-scan-progress-header {
@@ -1737,7 +1763,7 @@ body {
 }
 
 .ai-scan-progress-icon {
-  color: #2563eb;
+  color: #60a5fa;
   font-size: 0.95rem;
 }
 
@@ -1745,31 +1771,32 @@ body {
   flex: 1;
   font-size: 0.875rem;
   font-weight: 600;
+  color: #f8fafc;
 }
 
 .ai-scan-progress-percent {
   font-size: 0.75rem;
   font-weight: 600;
-  color: #2563eb;
+  color: #93c5fd;
 }
 
 .ai-scan-progress-label {
   margin: 0 0 8px;
   font-size: 0.8125rem;
   line-height: 1.4;
-  color: #475569;
+  color: #cbd5e1;
 }
 
 .ai-scan-progress-track {
   height: 6px;
   overflow: hidden;
-  background: #e2e8f0;
+  background: #334155;
   border-radius: 999px;
 }
 
 .ai-scan-progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, #3b82f6, #2563eb);
+  background: linear-gradient(90deg, #60a5fa, #3b82f6);
   border-radius: 999px;
   transition: width 0.35s ease;
 }
