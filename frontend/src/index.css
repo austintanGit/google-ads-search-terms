@@ -2344,6 +2344,68 @@ body {
   color: #1c1917;
 }
 
+.review-agency-dest-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  font-size: 0.88rem;
+  color: #374151;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+}
+
+.review-agency-dest-banner-link {
+  padding: 0;
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: #137333;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.review-agency-dest-banner-link:hover:not(:disabled) {
+  color: #0d5928;
+}
+
+.review-agency-dest-banner-link:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.review-agency-chip--dest {
+  color: #374151;
+  background: #f3f4f6;
+  border-color: #e5e7eb;
+}
+
+.review-agency-modal-note {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  font-size: 0.84rem;
+  color: #4b5563;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.review-agency-modal-dest-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.review-agency-modal-hint {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
 .review-agency-status-note {
   margin: 12px 0 0;
   font-size: 0.9rem;
@@ -2548,6 +2610,28 @@ body {
 .review-agency-action-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.review-agency-action-btn.is-selected {
+  font-weight: 700;
+}
+
+.review-agency-action-btn.is-selected--keep {
+  color: #92400e;
+  background: #fffbeb;
+  border-color: #f59e0b;
+}
+
+.review-agency-action-btn.is-selected--block {
+  color: #1e3a5f;
+  background: #eff6ff;
+  border-color: #3b82f6;
+}
+
+.review-agency-saved-note {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #137333;
 }
 
 .review-agency-footer {

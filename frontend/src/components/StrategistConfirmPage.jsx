@@ -33,6 +33,47 @@ function destLabel(item) {
   return ''
 }
 
+function resolveListName(id, sharedSets) {
+  if (!id) return ''
+  return (sharedSets || []).find(s => String(s.id) === String(id))?.name || String(id)
+}
+
+function destLabelWithList(item, sharedSets) {
+  const dest = item?.destination || 'NEGATIVE_LIST'
+  if (dest === 'NEGATIVE_LIST') {
+    const name = resolveListName(item?.sharedSetId, sharedSets)
+    if (name && String(name) !== String(item?.sharedSetId)) {
+      return `Keyword list: ${name}`
+    }
+  }
+  return destLabel(item)
+}
+
+function computeDefaultFinalizeListId(listBlockItems, defaultSharedSetId, sharedSets) {
+  if (!listBlockItems.length) return ''
+
+  const ids = listBlockItems.map(it => it.sharedSetId).filter(Boolean)
+  const uniqueIds = [...new Set(ids.map(String))]
+  if (uniqueIds.length === 1) return uniqueIds[0]
+
+  if (
+    defaultSharedSetId &&
+    (sharedSets || []).some(s => String(s.id) === String(defaultSharedSetId))
+  ) {
+    return String(defaultSharedSetId)
+  }
+
+  if (ids.length > 0) {
+    const counts = {}
+    for (const sid of ids.map(String)) {
+      counts[sid] = (counts[sid] || 0) + 1
+    }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]
+  }
+
+  return sharedSets?.[0]?.id ? String(sharedSets[0].id) : ''
+}
+
 function matchTypeLabel(matchType) {
   const mt = String(matchType || 'PHRASE').toUpperCase()
   if (mt === 'EXACT') return 'Exact match'
@@ -105,20 +146,33 @@ export default function StrategistConfirmPage() {
   const [actionResult, setActionResult] = useState(null)
   const [patchingItemId, setPatchingItemId] = useState(null)
   const [focusedItemId, setFocusedItemId] = useState(null)
+  const [sharedSets, setSharedSets] = useState([])
+  const [defaultSharedSetId, setDefaultSharedSetId] = useState(null)
+  const [showFinalizeModal, setShowFinalizeModal] = useState(false)
+  const [finalizeListId, setFinalizeListId] = useState('')
+  const [finalizeModalError, setFinalizeModalError] = useState('')
+  const [savedItemId, setSavedItemId] = useState(null)
 
-  async function reload() {
+  async function reload(options = {}) {
+    const { silent = false } = options
     if (!id) return
-    setLoading(true)
-    setError('')
+    if (!silent) {
+      setLoading(true)
+      setError('')
+    }
     try {
       const r = await authedFetch(`/api/review-requests/${id}`)
       const body = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(body?.error || `Failed to load (${r.status})`)
       setData(body)
     } catch (err) {
-      setError(err.message || 'Failed to load review request.')
+      if (!silent) {
+        setError(err.message || 'Failed to load review request.')
+      } else {
+        setActionError(err.message || 'Failed to refresh review request.')
+      }
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }
 
@@ -127,12 +181,47 @@ export default function StrategistConfirmPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
 
+  useEffect(() => {
+    if (!data?.clientId) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [setsRes, settingsRes] = await Promise.all([
+          authedFetch(`/api/shared-sets?clientId=${encodeURIComponent(data.clientId)}`),
+          authedFetch(`/api/client-settings?clientId=${encodeURIComponent(data.clientId)}`),
+        ])
+        const sets = setsRes.ok ? await setsRes.json() : []
+        const settings = settingsRes.ok ? await settingsRes.json() : {}
+        if (!cancelled) {
+          setSharedSets(Array.isArray(sets) ? sets : [])
+          setDefaultSharedSetId(settings.defaultSharedSetId || null)
+        }
+      } catch {
+        if (!cancelled) {
+          setSharedSets([])
+          setDefaultSharedSetId(null)
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [data?.clientId])
+
   const items = useMemo(() => {
     const list = data?.items || []
     return [...list].sort((a, b) => Number(a.id) - Number(b.id))
   }, [data?.items])
 
   const blockItems = useMemo(() => items.filter((it) => it.decision === 'block'), [items])
+  const listBlockItems = useMemo(
+    () => blockItems.filter((it) => (it.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST'),
+    [blockItems],
+  )
+  const nonListBlockItems = useMemo(
+    () => blockItems.filter((it) => (it.destination || 'NEGATIVE_LIST') !== 'NEGATIVE_LIST'),
+    [blockItems],
+  )
   const clientBlockItems = useMemo(
     () => items.filter((it) => clientDecisionForDisplay(it) === 'block'),
     [items],
@@ -147,6 +236,16 @@ export default function StrategistConfirmPage() {
   const canReject = status === 'client_submitted' || status === 'pending_client'
   const actionsLocked = actionPending !== '' || patchingItemId !== null
 
+  const effectiveListId = useMemo(
+    () => finalizeListId || computeDefaultFinalizeListId(listBlockItems, defaultSharedSetId, sharedSets),
+    [finalizeListId, listBlockItems, defaultSharedSetId, sharedSets],
+  )
+
+  const snapshottedListIds = useMemo(() => {
+    const ids = listBlockItems.map(it => it.sharedSetId).filter(Boolean).map(String)
+    return [...new Set(ids)]
+  }, [listBlockItems])
+
   useEffect(() => {
     if (focusedItemId == null) return
     if (!items.some((it) => Number(it.id) === Number(focusedItemId))) {
@@ -156,8 +255,22 @@ export default function StrategistConfirmPage() {
 
   async function patchItemDecision(itemId, decision) {
     if (!canFinalize) return
+    const current = items.find((it) => Number(it.id) === Number(itemId))
+    if (current?.decision === decision) return
+
     setPatchingItemId(itemId)
     setActionError('')
+    const previousData = data
+    setData((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        items: prev.items.map((it) =>
+          Number(it.id) === Number(itemId) ? { ...it, decision } : it,
+        ),
+      }
+    })
+
     try {
       const r = await authedFetch(`/api/review-requests/${id}/items/${itemId}/decision`, {
         method: 'PATCH',
@@ -166,25 +279,70 @@ export default function StrategistConfirmPage() {
       })
       const body = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(body?.error || body?.details || `Update failed (${r.status})`)
-      await reload()
+      setSavedItemId(itemId)
+      window.setTimeout(() => {
+        setSavedItemId((prev) => (prev === itemId ? null : prev))
+      }, 1500)
     } catch (err) {
+      setData(previousData)
       setActionError(err.message || 'Could not update decision.')
     } finally {
       setPatchingItemId(null)
     }
   }
 
-  async function finalize() {
-    if (!canFinalize) return
+  async function finalizeNoNegatives() {
+    if (!canFinalize || blockItems.length > 0) return
     const confirmMsg =
-      blockItems.length > 0
-        ? `Finalize and submit ${blockItems.length} blocked keyword${blockItems.length === 1 ? '' : 's'} to Google Ads?`
-        : 'Finalize this review? No terms were marked to block — nothing new will be added to Google Ads (this just closes the review).'
+      'Finalize this review? No terms were marked to block — nothing new will be added to Google Ads (this just closes the review).'
     if (!window.confirm(confirmMsg)) return
     setActionPending('finalize')
     setActionError('')
     try {
       const r = await authedFetch(`/api/review-requests/${id}/finalize`, { method: 'POST' })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(body?.details || body?.error || `Finalize failed (${r.status})`)
+      setActionResult({ kind: 'finalized', body })
+      await reload()
+    } catch (err) {
+      setActionError(err.message || 'Finalize failed.')
+    } finally {
+      setActionPending('')
+    }
+  }
+
+  function openFinalizeModal() {
+    if (!canFinalize) return
+    if (blockItems.length === 0) {
+      void finalizeNoNegatives()
+      return
+    }
+    setFinalizeModalError('')
+    setFinalizeListId(computeDefaultFinalizeListId(listBlockItems, defaultSharedSetId, sharedSets))
+    setShowFinalizeModal(true)
+  }
+
+  function closeFinalizeModal() {
+    setShowFinalizeModal(false)
+    setFinalizeModalError('')
+  }
+
+  async function confirmFinalize() {
+    if (!canFinalize || blockItems.length === 0) return
+    if (listBlockItems.length > 0 && !finalizeListId) {
+      setFinalizeModalError('Please select a negative keyword list.')
+      return
+    }
+    closeFinalizeModal()
+    setActionPending('finalize')
+    setActionError('')
+    try {
+      const payload = listBlockItems.length > 0 ? { sharedSetId: finalizeListId } : {}
+      const r = await authedFetch(`/api/review-requests/${id}/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
       const body = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(body?.details || body?.error || `Finalize failed (${r.status})`)
       setActionResult({ kind: 'finalized', body })
@@ -245,6 +403,10 @@ export default function StrategistConfirmPage() {
 
   const submittedDateStr = formatSubmittedDate(data?.submittedAt)
   const showSubmittedBanner = canFinalize && submittedDateStr
+  const effectiveListName = resolveListName(effectiveListId, sharedSets)
+  const selectedListName = resolveListName(finalizeListId, sharedSets)
+  const snapshottedListName =
+    snapshottedListIds.length === 1 ? resolveListName(snapshottedListIds[0], sharedSets) : ''
 
   const instruction =
     status === 'client_submitted'
@@ -300,6 +462,27 @@ export default function StrategistConfirmPage() {
         </div>
       ) : null}
 
+      {canFinalize && blockItems.length > 0 && listBlockItems.length > 0 ? (
+        <div className="review-agency-dest-banner" role="status">
+          <span>
+            Submitting <strong>{listBlockItems.length}</strong> list negative
+            {listBlockItems.length === 1 ? '' : 's'} to{' '}
+            <strong>{effectiveListName || 'a keyword list'}</strong>
+            {nonListBlockItems.length > 0
+              ? ` (+ ${nonListBlockItems.length} at campaign/ad group level)`
+              : ''}
+          </span>
+          <button
+            type="button"
+            className="review-agency-dest-banner-link"
+            onClick={openFinalizeModal}
+            disabled={actionsLocked}
+          >
+            Change list
+          </button>
+        </div>
+      ) : null}
+
       {canFinalize && blockItems.length === 0 ? (
         <p className="review-agency-status-note" style={{ marginTop: 12 }}>
           Only terms marked <strong>Add Negative to Google Ads</strong> are pushed to Google Ads. If you still want
@@ -310,7 +493,9 @@ export default function StrategistConfirmPage() {
       {actionError ? <div className="alert alert-danger mt-3" role="alert">{actionError}</div> : null}
       {actionResult?.kind === 'finalized' ? (
         <div className="alert alert-success mt-3" role="alert">
-          Submitted to Google Ads — {actionResult.body?.summary || `${actionResult.body?.blockCount || 0} blocked`}.
+          {actionResult.body?.blockCount > 0
+            ? `Added ${actionResult.body.blockCount} negative${actionResult.body.blockCount === 1 ? '' : 's'} to Google Ads${actionResult.body?.summary ? ` — ${actionResult.body.summary}` : ''}.`
+            : `Review finalized. ${actionResult.body?.summary || 'No new negatives were added.'}`}
         </div>
       ) : null}
       {actionResult?.kind === 'rejected' ? (
@@ -362,6 +547,9 @@ export default function StrategistConfirmPage() {
                     <div className="review-agency-row-meta">
                       <span>{matchTypeLabel(it.matchType)}</span>
                       <span className="review-agency-chip">{sourceChipLabel(it)}</span>
+                      <span className="review-agency-chip review-agency-chip--dest">
+                        {destLabelWithList(it, sharedSets)}
+                      </span>
                     </div>
                     <div className="review-agency-badge-stack">
                       {clientDec === 'block' ? (
@@ -391,20 +579,26 @@ export default function StrategistConfirmPage() {
                         <span className="text-muted small" style={{ alignSelf: 'center' }}>
                           Saving…
                         </span>
+                      ) : savedItemId === it.id ? (
+                        <span className="review-agency-saved-note" style={{ alignSelf: 'center' }}>
+                          Saved
+                        </span>
                       ) : (
                         <>
                           <button
                             type="button"
-                            className="review-agency-action-btn"
+                            className={`review-agency-action-btn${dec === 'keep' ? ' is-selected is-selected--keep' : ''}`}
                             disabled={actionsLocked}
+                            aria-pressed={dec === 'keep'}
                             onClick={() => patchItemDecision(it.id, 'keep')}
                           >
                             Don&apos;t add
                           </button>
                           <button
                             type="button"
-                            className="review-agency-action-btn"
+                            className={`review-agency-action-btn${dec === 'block' ? ' is-selected is-selected--block' : ''}`}
                             disabled={actionsLocked}
+                            aria-pressed={dec === 'block'}
                             onClick={() => patchItemDecision(it.id, 'block')}
                           >
                             Add Negative to Google Ads
@@ -431,7 +625,7 @@ export default function StrategistConfirmPage() {
           type="button"
           className="review-agency-footer-finalize"
           disabled={!canFinalize || actionsLocked}
-          onClick={finalize}
+          onClick={openFinalizeModal}
         >
           {actionPending === 'finalize'
             ? 'Submitting to Google Ads…'
@@ -451,6 +645,79 @@ export default function StrategistConfirmPage() {
           Back to dashboard
         </button>
       </div>
+
+      {showFinalizeModal ? (
+        <div className="unified-modal-overlay" onClick={closeFinalizeModal}>
+          <div className="unified-modal" onClick={e => e.stopPropagation()}>
+            <div className="unified-modal-header">
+              <h3>Confirm destination</h3>
+              <button type="button" className="unified-modal-close" onClick={closeFinalizeModal}>×</button>
+            </div>
+            <div className="unified-modal-body">
+              <p className="unified-modal-desc">
+                Add <strong>{blockItems.length}</strong> negative{blockItems.length === 1 ? '' : 's'} to Google Ads.
+              </p>
+
+              {nonListBlockItems.length > 0 ? (
+                <div className="review-agency-modal-note">
+                  <strong>{nonListBlockItems.length}</strong> keyword{nonListBlockItems.length === 1 ? '' : 's'}{' '}
+                  will go to their snapshotted campaign/ad group destinations (not editable here):
+                  <ul className="review-agency-modal-dest-list">
+                    {[...new Set(nonListBlockItems.map(it => destLabelWithList(it, sharedSets)))].map(label => (
+                      <li key={label}>{label}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {listBlockItems.length > 0 ? (
+                <div className="unified-modal-field">
+                  <label className="unified-modal-label" htmlFor="finalize-list-select">
+                    Negative keyword list ({listBlockItems.length} keyword{listBlockItems.length === 1 ? '' : 's'})
+                  </label>
+                  <select
+                    id="finalize-list-select"
+                    className="form-select form-select-sm"
+                    value={finalizeListId}
+                    onChange={e => {
+                      setFinalizeListId(e.target.value)
+                      setFinalizeModalError('')
+                    }}
+                  >
+                    <option value="">Select a list…</option>
+                    {sharedSets.map(s => (
+                      <option key={s.id} value={String(s.id)}>{s.name}</option>
+                    ))}
+                  </select>
+                  {finalizeListId && String(finalizeListId) === String(defaultSharedSetId) ? (
+                    <div className="review-agency-modal-hint">Account default</div>
+                  ) : null}
+                  {snapshottedListName &&
+                  finalizeListId &&
+                  snapshottedListIds.length === 1 &&
+                  String(finalizeListId) !== String(snapshottedListIds[0]) ? (
+                    <div className="review-agency-modal-hint">
+                      Review was created with {snapshottedListName}; you are submitting to {selectedListName}.
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {finalizeModalError ? (
+                <div className="alert alert-danger py-2 small mb-0 mt-2" role="alert">{finalizeModalError}</div>
+              ) : null}
+            </div>
+            <div className="unified-modal-footer">
+              <button type="button" className="btn btn-success" onClick={confirmFinalize}>
+                Confirm &amp; submit to Google Ads
+              </button>
+              <button type="button" className="btn btn-outline-secondary" onClick={closeFinalizeModal}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

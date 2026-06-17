@@ -1157,6 +1157,157 @@ async function submitItemsToGoogleAds(clientId, items) {
     return { submittedKeywords, summaryParts };
 }
 
+/** Fetch enabled negative keyword shared sets owned by the client (excludes manager-owned lists). */
+async function fetchClientSharedSets(clientId) {
+    const customer = client.Customer({
+        customer_id: clientId,
+        login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+        refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN,
+    });
+
+    const sharedSetFields = `
+                shared_set.id,
+                shared_set.name,
+                shared_set.resource_name,
+                shared_set.member_count,
+                shared_set.status`;
+    const whereClause = `
+                shared_set.type = NEGATIVE_KEYWORDS
+                AND shared_set.status = ENABLED`;
+
+    const managerCustomer = client.Customer({
+        customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+        login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
+        refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN,
+    });
+
+    const [ownedResponse, managerResponse] = await Promise.all([
+        customer.query(`SELECT ${sharedSetFields} FROM shared_set WHERE ${whereClause}`),
+        managerCustomer.query(`SELECT shared_set.id FROM shared_set WHERE ${whereClause}`).catch(() => []),
+    ]);
+
+    const managerSetIds = new Set(managerResponse.map(r => String(r.shared_set.id)));
+    const seen = new Set();
+    return ownedResponse
+        .filter(row => {
+            const id = String(row.shared_set.id);
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return !managerSetIds.has(id);
+        })
+        .map(row => ({
+            id: String(row.shared_set.id),
+            name: row.shared_set.name,
+            memberCount: row.shared_set.member_count,
+            resourceName: row.shared_set.resource_name,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildSharedSetNameById(sharedSets) {
+    return Object.fromEntries((sharedSets || []).map(s => [String(s.id), s.name]));
+}
+
+function attachSharedSetNames(items, nameById) {
+    return (items || []).map((it) => {
+        if ((it.destination || 'NEGATIVE_LIST') !== 'NEGATIVE_LIST' || !it.sharedSetId) return it;
+        return {
+            ...it,
+            sharedSetName: nameById[String(it.sharedSetId)] || null,
+        };
+    });
+}
+
+function buildSubmissionDestinationSummary(items, nameById = {}) {
+    const parts = [];
+    const listItems = items.filter(i => (i.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST');
+    const campaignItems = items.filter(i => i.destination === 'CAMPAIGN');
+    const adGroupItems = items.filter(i => i.destination === 'ADGROUP');
+
+    if (listItems.length > 0) {
+        const byList = {};
+        for (const item of listItems) {
+            const sid = String(item.sharedSetId || '');
+            (byList[sid] ||= []).push(item);
+        }
+        for (const [sid, group] of Object.entries(byList)) {
+            const name = nameById[sid] || group[0]?.sharedSetName || sid || 'keyword list';
+            parts.push(`${group.length} to ${name}`);
+        }
+    }
+    if (campaignItems.length > 0) {
+        const byCampaign = {};
+        for (const item of campaignItems) {
+            const key = item.campaignName || item.campaignId || 'campaign';
+            (byCampaign[key] ||= []).push(item);
+        }
+        for (const [label, group] of Object.entries(byCampaign)) {
+            parts.push(`${group.length} to campaign ${label}`);
+        }
+    }
+    if (adGroupItems.length > 0) {
+        const byAdGroup = {};
+        for (const item of adGroupItems) {
+            const key = item.adGroupName || item.adGroupId || 'ad group';
+            (byAdGroup[key] ||= []).push(item);
+        }
+        for (const [label, group] of Object.entries(byAdGroup)) {
+            parts.push(`${group.length} to ad group ${label}`);
+        }
+    }
+    return parts.join(' · ');
+}
+
+function buildHistoryDestLabel(items, nameById = {}) {
+    const destParts = [];
+    const listKeywords = items.filter(i => (i.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST');
+    const campaignKeywords = items.filter(i => i.destination === 'CAMPAIGN');
+    const adGroupKeywords = items.filter(i => i.destination === 'ADGROUP');
+
+    if (listKeywords.length > 0) {
+        const listNames = [...new Set(listKeywords.map(i => nameById[String(i.sharedSetId)] || i.sharedSetId))];
+        destParts.push(`List: ${listNames.join(', ')}`);
+    }
+    if (campaignKeywords.length > 0) {
+        const campaignNames = [...new Set(campaignKeywords.map(i => i.campaignName || i.campaignId))];
+        destParts.push(`Campaign: ${campaignNames.join(', ')}`);
+    }
+    if (adGroupKeywords.length > 0) {
+        const agNames = [...new Set(adGroupKeywords.map(i => i.adGroupName || i.adGroupId))];
+        destParts.push(`Ad group: ${agNames.join(', ')}`);
+    }
+    return destParts.join(' · ');
+}
+
+function buildSubmissionDestinations(items, nameById = {}) {
+    const destinations = [];
+    const listItems = items.filter(i => (i.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST');
+    if (listItems.length > 0) {
+        const byList = {};
+        for (const item of listItems) {
+            const sid = String(item.sharedSetId || '');
+            (byList[sid] ||= []).push(item);
+        }
+        for (const [sid, group] of Object.entries(byList)) {
+            destinations.push({
+                type: 'NEGATIVE_LIST',
+                sharedSetId: sid,
+                name: nameById[sid] || group[0]?.sharedSetName || sid,
+                count: group.length,
+            });
+        }
+    }
+    const campaignCount = items.filter(i => i.destination === 'CAMPAIGN').length;
+    if (campaignCount > 0) {
+        destinations.push({ type: 'CAMPAIGN', count: campaignCount });
+    }
+    const adGroupCount = items.filter(i => i.destination === 'ADGROUP').length;
+    if (adGroupCount > 0) {
+        destinations.push({ type: 'ADGROUP', count: adGroupCount });
+    }
+    return destinations;
+}
+
 /** Human-readable destination for submission history exports. */
 function formatSubmissionAppliedTo(item) {
     const dest = item.destination || 'NEGATIVE_LIST';
@@ -1417,6 +1568,7 @@ app.patch('/api/review-requests/:id/items/:itemId/decision', async (req, res) =>
 /** Strategist finalizes: submits "block" decisions to Google Ads, marks approved. */
 app.post('/api/review-requests/:id/finalize', async (req, res) => {
     const { id } = req.params;
+    const overrideSharedSetId = req.body?.sharedSetId != null ? String(req.body.sharedSetId) : null;
     try {
         const data = await loadReviewRequestForStrategist(id);
         if (!data) return res.status(404).json({ error: 'Review request not found' });
@@ -1426,8 +1578,24 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
                 error: `Cannot finalize: current status is "${request.status}"`,
             });
         }
-        const blockItems = items.filter((it) => it.decision === 'block');
-        const summary = await submitItemsToGoogleAds(request.client_id, blockItems);
+        let blockItems = items.filter((it) => it.decision === 'block');
+        if (overrideSharedSetId) {
+            blockItems = blockItems.map((it) => {
+                if ((it.destination || 'NEGATIVE_LIST') === 'NEGATIVE_LIST') {
+                    return { ...it, sharedSetId: overrideSharedSetId };
+                }
+                return it;
+            });
+        }
+
+        const sharedSets = await fetchClientSharedSets(request.client_id).catch(() => []);
+        const nameById = buildSharedSetNameById(sharedSets);
+        const blockItemsWithNames = attachSharedSetNames(blockItems, nameById);
+
+        await submitItemsToGoogleAds(request.client_id, blockItemsWithNames);
+        const enrichedSummary = buildSubmissionDestinationSummary(blockItemsWithNames, nameById);
+        const historyDestLabel = buildHistoryDestLabel(blockItemsWithNames, nameById);
+        const destinations = buildSubmissionDestinations(blockItemsWithNames, nameById);
 
         const matchTypeLabel = (() => {
             const types = [...new Set(blockItems.map((i) => i.matchType))];
@@ -1436,8 +1604,8 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
             }
             return types.length > 0 ? 'Mixed match types' : '';
         })();
-        if (blockItems.length > 0) {
-            const allSubmitted = blockItems.map((i) => ({
+        if (blockItemsWithNames.length > 0) {
+            const allSubmitted = blockItemsWithNames.map((i) => ({
                 keyword: i.keyword,
                 matchType: i.matchType,
                 appliedTo: formatSubmissionAppliedTo(i),
@@ -1452,7 +1620,7 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
                 [
                     request.client_id,
                     allSubmitted.length,
-                    `Review request · ${request.client_name || ''}`.trim(),
+                    historyDestLabel || `Review request · ${request.client_name || ''}`.trim(),
                     matchTypeLabel,
                     JSON.stringify(allSubmitted),
                     req.user?.email || null,
@@ -1477,7 +1645,8 @@ app.post('/api/review-requests/:id/finalize', async (req, res) => {
             success: true,
             blockCount: blockItems.length,
             keepCount: items.length - blockItems.length,
-            summary: summary.summaryParts.join(' · '),
+            summary: enrichedSummary,
+            destinations,
         });
     } catch (err) {
         console.error('finalize error:', err);
@@ -2192,56 +2361,8 @@ app.get('/api/shared-sets', async (req, res) => {
         const { clientId } = req.query;
         if (!clientId) return res.status(400).json({ error: 'Client ID is required' });
 
-        const customer = client.Customer({
-            customer_id: clientId,
-            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
-            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
-        });
-
-        const sharedSetFields = `
-                shared_set.id,
-                shared_set.name,
-                shared_set.resource_name,
-                shared_set.member_count,
-                shared_set.status`;
-        const whereClause = `
-                shared_set.type = NEGATIVE_KEYWORDS
-                AND shared_set.status = ENABLED`;
-
-        // Query client lists AND manager's own lists in parallel so we can exclude
-        // any list that exists in the manager account (user cannot write to those)
-        const managerCustomer = client.Customer({
-            customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
-            login_customer_id: process.env.GOOGLE_ADS_MANAGER_ID,
-            refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN
-        });
-
-        const [ownedResponse, managerResponse] = await Promise.all([
-            customer.query(`SELECT ${sharedSetFields} FROM shared_set WHERE ${whereClause}`),
-            managerCustomer.query(`SELECT shared_set.id FROM shared_set WHERE ${whereClause}`).catch(() => [])
-        ]);
-
-        // Build a set of IDs that belong to the manager account
-        const managerSetIds = new Set(managerResponse.map(r => String(r.shared_set.id)));
-        console.log('[shared-sets] manager set IDs:', [...managerSetIds]);
-
-        const seen = new Set();
-        const sharedSets = ownedResponse
-            .filter(row => {
-                const id = String(row.shared_set.id);
-                if (seen.has(id)) return false;
-                seen.add(id);
-                // Exclude any list that also exists in the manager account
-                return !managerSetIds.has(id);
-            })
-            .map(row => ({
-                id: String(row.shared_set.id),
-                name: row.shared_set.name,
-                memberCount: row.shared_set.member_count,
-                resourceName: row.shared_set.resource_name
-            }))
-            .sort((a, b) => a.name.localeCompare(b.name));
-
+        const sharedSets = await fetchClientSharedSets(clientId);
+        console.log('[shared-sets] returned', sharedSets.length, 'lists for client', clientId);
         res.json(sharedSets);
     } catch (error) {
         console.error('Error fetching shared sets:', error);
