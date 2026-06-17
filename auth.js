@@ -226,13 +226,30 @@ function requireSuperUser(req, res, next) {
     next();
 }
 
-// Create user in database (called after Cognito registration)
+// Create user in database (called after Cognito registration).
+// On email conflict, refresh cognito_sub and reset to pending unless the row is an
+// already-approved super user (bootstrap-super-user.sh inserts that row before Cognito signup).
 async function createUserInDB(email, name, cognitoSub, dbPool) {
     try {
         const result = await dbPool.query(
-            `INSERT INTO users (email, name, cognito_sub, status, created_at) 
-             VALUES ($1, $2, $3, 'pending', NOW()) 
-             ON CONFLICT (email) DO NOTHING 
+            `INSERT INTO users (email, name, cognito_sub, status, created_at)
+             VALUES ($1, $2, $3, 'pending', NOW())
+             ON CONFLICT (email) DO UPDATE SET
+               name = COALESCE(NULLIF(EXCLUDED.name, ''), users.name),
+               cognito_sub = EXCLUDED.cognito_sub,
+               status = CASE
+                 WHEN users.is_super_user AND users.status = 'approved' THEN users.status
+                 ELSE 'pending'
+               END,
+               approved_by = CASE
+                 WHEN users.is_super_user AND users.status = 'approved' THEN users.approved_by
+                 ELSE NULL
+               END,
+               approved_at = CASE
+                 WHEN users.is_super_user AND users.status = 'approved' THEN users.approved_at
+                 ELSE NULL
+               END,
+               updated_at = NOW()
              RETURNING *`,
             [email, name || '', cognitoSub]
         );

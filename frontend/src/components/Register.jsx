@@ -40,12 +40,19 @@ const Register = ({ onSwitchToLogin, onRegistrationSuccess }) => {
         }),
       });
 
-      const data = await response.json();
+      const text = await response.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        setError('Server returned an invalid response. Check that the API is running.');
+        return;
+      }
 
       if (response.ok) {
         onRegistrationSuccess(formData.email, data.message);
       } else {
-        setError(data.error || 'Registration failed');
+        setError(data.error || data.details || 'Registration failed');
       }
     } catch (err) {
       setError('Network error. Please try again.');

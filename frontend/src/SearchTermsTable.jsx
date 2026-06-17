@@ -18,18 +18,21 @@ const ORIGIN_POPOVER_WIDTH = 300
 const NEG_WHERE_WIDTH = 320
 const ORIGIN_POPOVER_GAP = 8
 const ORIGIN_VIEW_MARGIN = 8
-const ROWS_PER_PAGE_OPTIONS = [5, 10, 25, 'all']
-const ROWS_PER_PAGE_STORAGE_KEY = 'searchTermsRowsPerPage'
+const ROWS_PER_PAGE_OPTIONS = [5, 10, 25]
+/** v2: prior key often had 10 stuck from old UI — new key resets default to 5 for existing browsers */
+const ROWS_PER_PAGE_STORAGE_KEY = 'searchTermsRowsPerPage_v2'
 const ROWS_ALL_DISABLE_THRESHOLD = 300
-const ROWS_ALL_CAP = 100
+const DEFAULT_ROWS_PER_PAGE = 5
+const SEARCH_TERMS_VIEW_THEAD_PX = 48
+const SEARCH_TERMS_VIEW_ROW_PX = 46
 
 function readStoredRowsPerPage() {
-  if (typeof window === 'undefined') return 5
+  if (typeof window === 'undefined') return DEFAULT_ROWS_PER_PAGE
   const raw = window.localStorage.getItem(ROWS_PER_PAGE_STORAGE_KEY)
-  if (raw === 'all') return 'all'
+  if (raw === 'all') return 25
   const n = parseInt(raw, 10)
   if (n === 5 || n === 10 || n === 25) return n
-  return 5
+  return DEFAULT_ROWS_PER_PAGE
 }
 
 function clamp(n, min, max) {
@@ -260,7 +263,6 @@ export default function SearchTermsTable({
   const [searchFilter, setSearchFilter] = useState('')
   const [campaignFilter, setCampaignFilter] = useState('')
   const [rowsPerPage, setRowsPerPage] = useState(readStoredRowsPerPage)
-  const [tablePage, setTablePage] = useState(1)
   const [hoveredRow, setHoveredRow] = useState(null)
   const [videoOpen, setVideoOpen] = useState(false)
   const [toolbar, setToolbar] = useState({ visible: false, x: 0, y: 0 })
@@ -461,46 +463,15 @@ export default function SearchTermsTable({
       .filter(Boolean)
   }, [searchTerms, frozenRowIndices, searchFilter, campaignFilter, rowNegatives, pendingNegatives])
 
-  const rowsPerPageOptions = searchTerms.length > ROWS_ALL_DISABLE_THRESHOLD
-    ? ROWS_PER_PAGE_OPTIONS.filter(option => option !== 'all')
-    : ROWS_PER_PAGE_OPTIONS
+  const visibleRows = sortedRows
 
-  const pageSize = rowsPerPage === 'all'
-    ? Math.min(ROWS_ALL_CAP, sortedRows.length)
-    : rowsPerPage
-  const pageCount = pageSize > 0 ? Math.max(1, Math.ceil(sortedRows.length / pageSize)) : 1
-  const safeTablePage = clamp(tablePage, 1, pageCount)
-  const visibleRowStart = sortedRows.length === 0 ? 0 : (safeTablePage - 1) * pageSize + 1
-  const visibleRowEnd = rowsPerPage === 'all'
-    ? sortedRows.length
-    : Math.min(safeTablePage * pageSize, sortedRows.length)
-  const visibleRows = rowsPerPage === 'all'
-    ? sortedRows
-    : sortedRows.slice((safeTablePage - 1) * pageSize, safeTablePage * pageSize)
-
-  useEffect(() => {
-    if (searchTerms.length > ROWS_ALL_DISABLE_THRESHOLD && rowsPerPage === 'all') {
-      setRowsPerPage(25)
-      setTablePage(1)
-      try {
-        window.localStorage.setItem(ROWS_PER_PAGE_STORAGE_KEY, '25')
-      } catch {
-        /* ignore quota / private mode */
-      }
-    }
-  }, [searchTerms.length, rowsPerPage])
-
-  useEffect(() => {
-    setTablePage(1)
-  }, [searchFilter, campaignFilter, rowsPerPage, searchTerms, aiPendingSortSignal])
-
-  useEffect(() => {
-    if (safeTablePage !== tablePage) setTablePage(safeTablePage)
-  }, [safeTablePage, tablePage])
+  const tableScrollMaxHeight = useMemo(() => {
+    const n = rowsPerPage
+    return `${SEARCH_TERMS_VIEW_THEAD_PX + n * SEARCH_TERMS_VIEW_ROW_PX}px`
+  }, [rowsPerPage])
 
   function handleRowsPerPageChange(next) {
     setRowsPerPage(next)
-    setTablePage(1)
     try {
       window.localStorage.setItem(ROWS_PER_PAGE_STORAGE_KEY, String(next))
     } catch {
@@ -675,30 +646,9 @@ export default function SearchTermsTable({
     )
   }
 
-  /** Uncheck removes AI suggestions from Google’s perspective for this row; manual flags stay but are unchecked. */
+  /** Checking selects all pending keywords on the row; unchecking clears selection only (chips / pending negs stay). */
   function handleRowPendingCheckboxChange(pendingPhraseList, checked, ev) {
-    const pt = pointFromEvent(ev)
-    if (!checked) {
-      const aiKeywords = []
-      const manualKeywords = []
-      for (const phrase of pendingPhraseList) {
-        const { keyword } = parseNegativePhrase(phrase)
-        if (phrase.startsWith('ai:')) aiKeywords.push(keyword)
-        else if (phrase.startsWith('manual:')) manualKeywords.push(keyword)
-      }
-      runPendingUiUpdate(() => {
-        aiKeywords.forEach(kw => onRemoveNegative(kw))
-        if (manualKeywords.length === 0) return
-        const lower = new Set(manualKeywords.map(k => k.toLowerCase()))
-        setPendingNegatives(prev =>
-          prev.map(i =>
-            lower.has(i.keyword.toLowerCase()) && !i.alreadyInGoogle ? { ...i, selected: false } : i
-          )
-        )
-      }, pt)
-      return
-    }
-    selectAllPendingKeywordsInRow(pendingPhraseList, true, ev)
+    selectAllPendingKeywordsInRow(pendingPhraseList, checked, ev)
   }
 
   function handleToggleAll(checked, ev) {
@@ -1000,16 +950,10 @@ export default function SearchTermsTable({
 
   function copyHistoryEntry(entry) {
     const keywords = Array.isArray(entry.keywords) ? entry.keywords : []
-    const qualityBefore = formatHistoryQualityBefore(entry)
-    const qualityAfter = formatHistoryQualityAfter(entry)
-    const text = keywords.map(k => {
-      if (typeof k === 'string') {
-        return [k, 'EXACT', '', qualityBefore, qualityAfter].filter(Boolean).join('\t')
-      }
-      return [k.keyword, k.matchType || 'PHRASE', k.appliedTo || '', qualityBefore, qualityAfter]
-        .filter(Boolean)
-        .join('\t')
-    }).join('\n')
+    const text = keywords
+      .map(k => (typeof k === 'string' ? k : k.keyword))
+      .filter(Boolean)
+      .join('\n')
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
     } else {
@@ -1837,7 +1781,10 @@ export default function SearchTermsTable({
       )}
 
       {/* Main review card: scrollable table + in-card sticky footer + history */}
-      <div className="review-dashboard-card" id="search-terms-section">
+      <div
+        className={`review-dashboard-card search-terms-section--rows-${rowsPerPage}`}
+        id="search-terms-section"
+      >
       <div className="search-terms-panel">
 
         {/* Card header */}
@@ -2045,57 +1992,38 @@ export default function SearchTermsTable({
             {campaignList.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
           <div className="search-terms-rows-options">
-            <span className="search-terms-rows-label" id="search-terms-rows-label">Show rows</span>
+            <span className="search-terms-rows-label" id="search-terms-rows-label">Rows per view</span>
             <div className="search-terms-rows-buttons" role="group" aria-labelledby="search-terms-rows-label">
-              {rowsPerPageOptions.map(option => (
+              {ROWS_PER_PAGE_OPTIONS.map(option => (
                 <button
                   key={option}
                   type="button"
                   className={`search-terms-rows-btn${rowsPerPage === option ? ' is-active' : ''}`}
                   aria-pressed={rowsPerPage === option}
+                  title={
+                    option === 5
+                      ? 'Default: card uses viewport height; table shows ~5 rows before scroll'
+                      : option === 10
+                        ? 'Card max height 800px; table shows ~10 rows before scroll'
+                        : 'Card max height 1000px; table shows ~25 rows before scroll'
+                  }
                   onClick={() => handleRowsPerPageChange(option)}
                 >
-                  {option === 'all' ? 'All' : option}
+                  {option}
                 </button>
               ))}
             </div>
           </div>
-          <span className="search-terms-rows-summary">
-            {sortedRows.length === 0
-              ? 'No matching rows'
-              : rowsPerPage === 'all'
-                ? sortedRows.length > ROWS_ALL_CAP
-                  ? `Showing first ${ROWS_ALL_CAP} of ${sortedRows.length} rows — filter or use 25 per page`
-                  : `Showing all ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`
-                : `Showing ${visibleRowStart}–${visibleRowEnd} of ${sortedRows.length} row${sortedRows.length === 1 ? '' : 's'}`}
-          </span>
-          {rowsPerPage !== 'all' && pageCount > 1 ? (
-            <div className="search-terms-pagination">
-              <button
-                type="button"
-                className="search-terms-pagination-btn"
-                disabled={safeTablePage <= 1}
-                onClick={() => setTablePage(p => Math.max(1, p - 1))}
-              >
-                Previous
-              </button>
-              <span className="search-terms-pagination-status">
-                Page {safeTablePage} of {pageCount}
-              </span>
-              <button
-                type="button"
-                className="search-terms-pagination-btn"
-                disabled={safeTablePage >= pageCount}
-                onClick={() => setTablePage(p => Math.min(pageCount, p + 1))}
-              >
-                Next
-              </button>
-            </div>
-          ) : null}
+
         </div>
 
         {/* Table */}
-        <div ref={tableWrapperRef} className="table-wrapper" aria-busy={isUpdatePending || undefined}>
+        <div
+          ref={tableWrapperRef}
+          className="table-wrapper"
+          style={{ maxHeight: tableScrollMaxHeight }}
+          aria-busy={isUpdatePending || undefined}
+        >
           <table ref={tableRef} className="table table-hover table-sm mb-0 search-terms-table unified-table">
             <thead>
               <tr>

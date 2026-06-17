@@ -532,6 +532,7 @@ function NegativeKeywordsPage({
   setWebsiteUrl,
   aiStats,
   aiLoading,
+  aiScanProgress,
   searchTerms,
   campaigns,
   adGroupsByCampaign,
@@ -824,14 +825,6 @@ function NegativeKeywordsPage({
           </div>
         )}
 
-        {!loading && searchTerms.length > 0 && aiLoading && (
-          <div className="alert alert-info py-2 px-3 mb-2 small" role="status">
-            AI scan is running in the background. You can review search terms while suggestions load.
-            {' '}The scanner reviews up to <strong>{AI_SEARCH_TERMS_PROMPT_CAP}</strong> queries with the
-            most clicks; lower-click rows stay in the table for manual review.
-          </div>
-        )}
-
         {showNoTermsEmpty ? (
           <div className="negative-kw-empty-terms" role="region" aria-label="No search terms">
             <div className="negative-kw-empty-terms-inner">
@@ -859,7 +852,34 @@ function NegativeKeywordsPage({
           </div>
         ) : null}
 
-        {!loading && searchTerms.length > 0 && (
+        {!loading && searchTerms.length > 0 && aiLoading && (
+          <div
+            className="search-terms-ai-scan-standalone"
+            role="status"
+            aria-live="polite"
+            aria-busy="true"
+          >
+            <div className="search-terms-ai-scan-standalone-inner">
+              <div className="review-dashboard-card ai-scan-overlay-card">
+                <div className="ai-scan-ph-header">
+                  <h2 className="ai-scan-ph-title">
+                    Review your search terms{clientName ? ` — ${clientName}` : ''}
+                  </h2>
+                  <p className="ai-scan-ph-sub">Hang tight while AI finishes scanning your site.</p>
+                </div>
+                <div className="ai-scan-overlay-card-progress">
+                  <AiScanProgressIndicator
+                    loading={aiLoading}
+                    progress={aiScanProgress}
+                    variant="panel"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!loading && searchTerms.length > 0 && !aiLoading && (
           <SearchTermsTable
             searchTerms={searchTerms}
             rowNegatives={rowNegatives}
@@ -2543,6 +2563,7 @@ function AuthenticatedApp({ user, onLogout }) {
           setWebsiteUrl={setWebsiteUrl}
           aiStats={aiStatsForScanner}
           aiLoading={aiLoading}
+          aiScanProgress={aiScanProgress}
           searchTerms={searchTerms}
           campaigns={campaigns}
           adGroupsByCampaign={adGroupsByCampaign}
@@ -2606,6 +2627,7 @@ function AuthenticatedApp({ user, onLogout }) {
           setWebsiteUrl={setWebsiteUrl}
           aiStats={aiStatsForScanner}
           aiLoading={aiLoading}
+          aiScanProgress={aiScanProgress}
           searchTerms={searchTerms}
           campaigns={campaigns}
           adGroupsByCampaign={adGroupsByCampaign}
@@ -2671,7 +2693,10 @@ function AuthenticatedApp({ user, onLogout }) {
         )
       } />
     </Routes>
-      <AiScanProgressIndicator loading={aiLoading} progress={aiScanProgress} />
+      <AiScanProgressIndicator
+        loading={aiLoading && searchTerms.length === 0}
+        progress={aiScanProgress}
+      />
     </>
   )
 }

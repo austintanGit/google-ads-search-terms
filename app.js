@@ -512,8 +512,10 @@ app.post('/api/auth/register', async (req, res) => {
     } catch (error) {
         console.error('Registration error:', error);
         
-        if (error.name === 'UsernameExistsException') {
-            res.status(400).json({ error: 'An account with this email already exists' });
+        if (error.name === 'UsernameExistsException' || error.name === 'AliasExistsException') {
+            res.status(400).json({
+                error: 'An account with this email already exists in Cognito. Delete the user in the AWS Cognito console (correct user pool), then try again.'
+            });
         } else if (error.name === 'InvalidPasswordException') {
             res.status(400).json({ error: 'Password does not meet requirements' });
         } else {

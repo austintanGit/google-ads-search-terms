@@ -1801,6 +1801,43 @@ body {
   transition: width 0.35s ease;
 }
 
+/* Embedded in table overlay — same bar/labels, light surface */
+.ai-scan-progress-panel {
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-header {
+  margin-bottom: 8px;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-icon {
+  color: #1a73e8;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-title {
+  flex: 1;
+  color: #111827;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-percent {
+  color: #1a73e8;
+  font-size: 0.8125rem;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-label {
+  color: #4b5563;
+  margin-bottom: 12px;
+}
+
+.ai-scan-progress-panel .ai-scan-progress-track {
+  height: 8px;
+  background: #e5e7eb;
+}
+
 .submit-success-modal {
   position: relative;
   width: min(520px, calc(100vw - 32px));
@@ -3162,6 +3199,7 @@ body {
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .search-terms-rows-label {
@@ -3206,40 +3244,6 @@ body {
   color: #5f6368;
 }
 
-.search-terms-pagination {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
-
-.search-terms-pagination-status {
-  font-size: 0.8125rem;
-  color: #5f6368;
-  white-space: nowrap;
-}
-
-.search-terms-pagination-btn {
-  padding: 4px 10px;
-  border: 1px solid #d8d2c8;
-  border-radius: 8px;
-  background: #fff;
-  color: #3c4043;
-  font-size: 0.8125rem;
-  font-weight: 500;
-}
-
-.search-terms-pagination-btn:hover:not(:disabled) {
-  border-color: #c4c7c5;
-  background: #f8f9fa;
-}
-
-.search-terms-pagination-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
 @media (min-width: 720px) {
   .search-terms-filters {
     padding: 8px 14px;
@@ -3262,12 +3266,6 @@ body {
 
   .search-terms-rows-summary {
     flex: 1 1 100%;
-  }
-
-  .search-terms-pagination {
-    margin-left: 0;
-    width: 100%;
-    justify-content: flex-end;
   }
 }
 
@@ -4702,6 +4700,23 @@ body {
   overflow: hidden;
 }
 
+/* Search terms card — default cap; row preset classes override */
+#search-terms-section.review-dashboard-card {
+  max-height: 1000px;
+}
+
+#search-terms-section.review-dashboard-card.search-terms-section--rows-5 {
+  max-height: calc(100vh - 132px);
+}
+
+#search-terms-section.review-dashboard-card.search-terms-section--rows-10 {
+  max-height: 1040px;
+}
+
+#search-terms-section.review-dashboard-card.search-terms-section--rows-25 {
+  max-height: 1800px;
+}
+
 .review-dashboard-card .search-terms-panel {
   flex: 1 1 auto;
   min-height: 0;
@@ -5373,6 +5388,76 @@ body {
 .search-terms-panel {
   border-left: 4px solid #1a73e8;
   padding: 0;
+}
+
+/* AI scan in progress — centers card on page (no dimmed backdrop) */
+.search-terms-ai-scan-standalone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: min(72vh, 720px);
+  padding: 24px 16px;
+  margin: 0 0 16px;
+  background: transparent;
+  border-radius: 0;
+}
+
+.search-terms-ai-scan-standalone-inner {
+  width: 100%;
+  max-width: 720px;
+}
+
+.review-dashboard-card.ai-scan-overlay-card {
+  min-height: min(320px, 48vh);
+  max-height: min(480px, 72vh);
+  display: flex;
+  flex-direction: column;
+  justify-content: stretch;
+  background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+  border: 1px solid #334155;
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-ph-header {
+  border-bottom-color: #334155;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-ph-title {
+  color: #f8fafc;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-ph-sub {
+  color: #94a3b8;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-progress-panel .ai-scan-progress-title {
+  color: #f8fafc;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-progress-panel .ai-scan-progress-percent {
+  color: #93c5fd;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-progress-panel .ai-scan-progress-label {
+  color: #cbd5e1;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-progress-panel .ai-scan-progress-icon {
+  color: #60a5fa;
+}
+
+.review-dashboard-card.ai-scan-overlay-card .ai-scan-progress-panel .ai-scan-progress-track {
+  background: #334155;
+}
+
+.ai-scan-overlay-card-progress {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 8px 22px 28px;
 }
 
 /* AI scan in progress — replaces table until recommendations return */
